@@ -1,0 +1,144 @@
+# Master Data Dictionary
+
+Schema baseline: AI Video Automation V2. Field definitions are stored as JSON under schemas/master and schemas/relation. No sample production rows are included.
+
+## Table index
+
+| Table | Type | Primary Key |
+|---|---|---|
+| UNIVERSE_MASTER | master | Universe_ID |
+| ERA_MASTER | master | Era_ID |
+| SERIES_MASTER | master | Series_ID |
+| CHARACTER_MASTER | master | Character_ID |
+| CHARACTER_RELATIONSHIP | master | Relationship_ID |
+| LOCATION_MASTER | master | Location_ID |
+| WARDROBE_MASTER | master | Wardrobe_ID |
+| PROP_MASTER | master | Prop_ID |
+| REFERENCE_ASSET_MASTER | master | Reference_Asset_ID |
+| REFERENCE_ENTITY_MAP | master | Reference_Entity_Map_ID |
+| REFERENCE_PROVIDER_MAP | master | Reference_Provider_Map_ID |
+| VISUAL_STYLE_MASTER | master | Visual_Style_ID |
+| CAMERA_PROFILE_MASTER | master | Camera_Profile_ID |
+| LIGHTING_MASTER | master | Lighting_ID |
+| VOICE_MASTER | master | Voice_ID |
+| PROMPT_TEMPLATE_MASTER | master | Prompt_Template_ID |
+| PROVIDER_MASTER | master | Provider_ID |
+| MODEL_MASTER | master | Model_ID |
+| MODEL_CAPABILITY_MAP | master | Model_Capability_ID |
+| SCENE_REFERENCE_MAP | relation | Scene_Reference_ID |
+
+## Table definitions
+
+### UNIVERSE_MASTER
+
+Reusable story world / universe.
+
+Primary key: Universe_ID. Fields: Universe_ID (STRING, required), Universe_Name (STRING, required), Universe_Description (STRING), World_Rules (STRING), Default_Era_ID (STRING, ACTIVE FK to ERA_MASTER.Era_ID), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### ERA_MASTER
+
+Historical and visual context shared by reusable entities.
+
+Primary key: Era_ID. Fields: Era_ID (STRING, required), Era_Name (STRING, required), Era_Description (STRING), Country_Context (STRING), Start_Period (STRING), End_Period (STRING), Visual_Context (STRING), Wardrobe_Context (STRING), Architecture_Context (STRING), Negative_Constraints (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### SERIES_MASTER
+
+Reusable series-level configuration.
+
+Primary key: Series_ID. Fields: Series_ID (STRING, required), Series_Name (STRING, required), Universe_ID (STRING, ACTIVE FK to UNIVERSE_MASTER.Universe_ID), Genre (STRING), Story_Tone (STRING), Era_ID (STRING, ACTIVE FK to ERA_MASTER.Era_ID), Default_Visual_Style_ID (STRING, ACTIVE FK to VISUAL_STYLE_MASTER.Visual_Style_ID), Default_Camera_Profile_ID (STRING, ACTIVE FK to CAMERA_PROFILE_MASTER.Camera_Profile_ID), Default_Aspect_Ratio (STRING), Default_Scene_Duration_Sec (DECIMAL), Target_Duration_Min (DECIMAL), Primary_Language (STRING), Series_Status (STRING), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### CHARACTER_MASTER
+
+Reusable character identity, personality, speech, and continuity rules.
+
+Primary key: Character_ID. Fields: Character_ID (STRING, required), Series_ID (STRING, ACTIVE FK to SERIES_MASTER.Series_ID), Character_Name (STRING, required), Character_Alias (STRING), Character_Role (STRING), Gender_Profile (STRING), Age_Range (STRING), Nationality_Style (STRING), Face_Description (STRING), Hair_Description (STRING), Body_Description (STRING), Skin_Tone (STRING), Distinctive_Features (STRING), Personality (STRING), Behavior_Profile (STRING), Speaking_Style (STRING), Default_Wardrobe_ID (STRING, ACTIVE FK to WARDROBE_MASTER.Wardrobe_ID), Default_Voice_ID (STRING, ACTIVE FK to VOICE_MASTER.Voice_ID), Prompt_Identity_Text (STRING), Continuity_Rules (STRING), Negative_Constraints (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### CHARACTER_RELATIONSHIP
+
+Normalized relationship between two characters; episode references are deferred.
+
+Primary key: Relationship_ID. Fields: Relationship_ID (STRING, required), Series_ID (STRING, ACTIVE FK to SERIES_MASTER.Series_ID), Character_ID_A (STRING, ACTIVE FK to CHARACTER_MASTER.Character_ID), Character_ID_B (STRING, ACTIVE FK to CHARACTER_MASTER.Character_ID), Relationship_Type (STRING, required), Relationship_Description (STRING), Current_State (STRING), Start_Episode_ID (STRING, DEFERRED FK to EPISODE_MASTER.Episode_ID), End_Episode_ID (STRING, DEFERRED FK to EPISODE_MASTER.Episode_ID), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### LOCATION_MASTER
+
+Reusable locations and visual continuity.
+
+Primary key: Location_ID. Fields: Location_ID (STRING, required), Series_ID (STRING, ACTIVE FK to SERIES_MASTER.Series_ID), Location_Name (STRING, required), Location_Type (STRING), Era_ID (STRING, ACTIVE FK to ERA_MASTER.Era_ID), Location_Description (STRING), Architecture_Description (STRING), Environment_Description (STRING), Interior_Description (STRING), Exterior_Description (STRING), Default_Time_Of_Day (STRING), Default_Lighting_ID (STRING, ACTIVE FK to LIGHTING_MASTER.Lighting_ID), Default_Camera_Profile_ID (STRING, ACTIVE FK to CAMERA_PROFILE_MASTER.Camera_Profile_ID), Prompt_Location_Text (STRING), Continuity_Rules (STRING), Negative_Constraints (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### WARDROBE_MASTER
+
+Reusable character wardrobe definitions.
+
+Primary key: Wardrobe_ID. Fields: Wardrobe_ID (STRING, required), Character_ID (STRING, ACTIVE FK to CHARACTER_MASTER.Character_ID), Wardrobe_Name (STRING, required), Wardrobe_Type (STRING), Description (STRING), Top_Description (STRING), Bottom_Description (STRING), Accessory_Description (STRING), Footwear_Description (STRING), Primary_Color (STRING), Secondary_Color (STRING), Material_Texture (STRING), Era_ID (STRING, ACTIVE FK to ERA_MASTER.Era_ID), Usage_Context (STRING), Prompt_Wardrobe_Text (STRING), Continuity_Rules (STRING), Negative_Constraints (STRING), Is_Default (BOOLEAN), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### PROP_MASTER
+
+Reusable story props and continuity rules.
+
+Primary key: Prop_ID. Fields: Prop_ID (STRING, required), Series_ID (STRING, ACTIVE FK to SERIES_MASTER.Series_ID), Prop_Name (STRING, required), Prop_Type (STRING), Prop_Description (STRING), Owner_Character_ID (STRING, ACTIVE FK to CHARACTER_MASTER.Character_ID), Era_ID (STRING, ACTIVE FK to ERA_MASTER.Era_ID), Continuity_Required (BOOLEAN), Prompt_Prop_Text (STRING), Negative_Constraints (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### REFERENCE_ASSET_MASTER
+
+Canonical registry for reusable reference files; Google Drive owns the actual file.
+
+Primary key: Reference_Asset_ID. Fields: Reference_Asset_ID (STRING, required), Reference_Type (STRING), Asset_Name (STRING, required), Asset_Description (STRING), Drive_File_ID (STRING), Drive_URL (URL), Mime_Type (STRING), Width (INTEGER), Height (INTEGER), Aspect_Ratio (STRING), Version (STRING), Reference_Quality_Status (STRING), Background_Type (STRING), Checksum (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### REFERENCE_ENTITY_MAP
+
+Connect canonical reference assets to reusable entities. Entity_ID is polymorphic.
+
+Primary key: Reference_Entity_Map_ID. Fields: Reference_Entity_Map_ID (STRING, required), Reference_Asset_ID (STRING, ACTIVE FK to REFERENCE_ASSET_MASTER.Reference_Asset_ID), Entity_Type (STRING, required), Entity_ID (STRING, required), Reference_Role (STRING, required), Is_Primary (BOOLEAN), Priority (INTEGER), Usage_Instruction_Default (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### REFERENCE_PROVIDER_MAP
+
+Track provider-specific synchronization separately from canonical assets.
+
+Primary key: Reference_Provider_Map_ID. Fields: Reference_Provider_Map_ID (STRING, required), Reference_Asset_ID (STRING, ACTIVE FK to REFERENCE_ASSET_MASTER.Reference_Asset_ID), Provider_ID (STRING, ACTIVE FK to PROVIDER_MASTER.Provider_ID), Provider_Project_ID (STRING), Provider_Asset_ID (STRING), Provider_Asset_Name (STRING), Sync_Status (STRING), Last_Synced_At (TIMESTAMP), Sync_Error (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### VISUAL_STYLE_MASTER
+
+Reusable visual style definitions.
+
+Primary key: Visual_Style_ID. Fields: Visual_Style_ID (STRING, required), Style_Name (STRING, required), Style_Description (STRING), Realism_Level (STRING), Color_Profile (STRING), Default_Lighting_ID (STRING, ACTIVE FK to LIGHTING_MASTER.Lighting_ID), Texture_Profile (STRING), Cinematic_Keywords (STRING), Negative_Style (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### CAMERA_PROFILE_MASTER
+
+Reusable camera language profiles.
+
+Primary key: Camera_Profile_ID. Fields: Camera_Profile_ID (STRING, required), Profile_Name (STRING, required), Default_Shot_Type (STRING), Default_Angle (STRING), Default_Movement (STRING), Default_Lens (STRING), Composition_Rule (STRING), Depth_Of_Field (STRING), Prompt_Camera_Text (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### LIGHTING_MASTER
+
+Reusable lighting definitions.
+
+Primary key: Lighting_ID. Fields: Lighting_ID (STRING, required), Lighting_Name (STRING, required), Lighting_Description (STRING), Time_Of_Day (STRING), Mood (STRING), Prompt_Lighting_Text (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### VOICE_MASTER
+
+Reusable voice definition; contains no API keys.
+
+Primary key: Voice_ID. Fields: Voice_ID (STRING, required), Provider_ID (STRING, ACTIVE FK to PROVIDER_MASTER.Provider_ID), Provider_Voice_ID (STRING), Voice_Name (STRING, required), Language (STRING), Gender_Profile (STRING), Voice_Description (STRING), Speaking_Rate (DECIMAL), Stability (DECIMAL), Similarity (DECIMAL), Style (DECIMAL), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### PROMPT_TEMPLATE_MASTER
+
+Versioned prompt templates; technical generation settings remain structured.
+
+Primary key: Prompt_Template_ID. Fields: Prompt_Template_ID (STRING, required), Template_Name (STRING, required), Provider_ID (STRING, ACTIVE FK to PROVIDER_MASTER.Provider_ID), Model_ID (STRING, ACTIVE FK to MODEL_MASTER.Model_ID), Content_Type (STRING), Generation_Mode (STRING), Template_Version (STRING), System_Prompt (STRING), Prompt_Template (STRING), Negative_Template (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### PROVIDER_MASTER
+
+Verified or explicitly intended generation providers; never store secrets.
+
+Primary key: Provider_ID. Fields: Provider_ID (STRING, required), Provider_Name (STRING, required), Provider_Type (STRING), Execution_Mode (STRING), Billing_Mode (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### MODEL_MASTER
+
+Provider model catalog. Capabilities belong in MODEL_CAPABILITY_MAP.
+
+Primary key: Model_ID. Fields: Model_ID (STRING, required), Provider_ID (STRING, ACTIVE FK to PROVIDER_MASTER.Provider_ID), Model_Name (STRING, required), Model_Version (STRING), Generation_Type (STRING), Default_Duration_Sec (DECIMAL), Default_Aspect_Ratio (STRING), Default_Resolution (STRING), Status (STRING, required), Capability_Source (URL), Capabilities_Last_Verified_At (TIMESTAMP), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### MODEL_CAPABILITY_MAP
+
+Extensible verified model capabilities; mode-specific combinations are serialized to preserve relationships.
+
+Primary key: Model_Capability_ID. Fields: Model_Capability_ID (STRING, required), Model_ID (STRING, ACTIVE FK to MODEL_MASTER.Model_ID), Capability_Type (STRING, required), Capability_Value (STRING, required), Unit (STRING), Status (STRING, required), Source (URL), Verified_At (TIMESTAMP), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+### SCENE_REFERENCE_MAP
+
+Relation table schema only. Scene_ID is deferred until SCENES exists; no scene records are created.
+
+Primary key: Scene_Reference_ID. Fields: Scene_Reference_ID (STRING, required), Scene_ID (STRING, DEFERRED FK to SCENES.Scene_ID), Reference_Asset_ID (STRING, ACTIVE FK to REFERENCE_ASSET_MASTER.Reference_Asset_ID), Reference_Role (STRING), Usage_Instruction (STRING), Sort_Order (INTEGER), Is_Required (BOOLEAN), Is_Primary (BOOLEAN), Prompt_Mention_Name (STRING), Validation_Status (STRING), Validation_Message (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+
+## Shared rules
+
+- Stable ID text keys are generated by application or n8n logic, never spreadsheet formulas.
+- Timestamps use ISO 8601 UTC. Boolean cells use native TRUE/FALSE values.
+- Active foreign keys are documented and validated by scripts; Sheets does not provide SQL referential integrity.
+- Deferred foreign keys remain blank until the referenced future table exists.
+- REFERENCE_ENTITY_MAP.Entity_ID is polymorphic. Resolve it through Entity_Type. For an active Entity_Type + Entity_ID + Reference_Role, allow at most one Is_Primary=TRUE row.
+- Google Drive owns actual reference files. Provider mappings are separate.
+- Prompt_* values are curated canonical fragments, not automatic copies of raw descriptions.
+- No credentials, tokens, passwords, API keys, or private keys belong in the database.
+- Cost design is documented but unpopulated until verified rates exist. Future fields: Cost_Unit, Cost_Rate, Currency, Resolution, Effective_From, Effective_To, Cost_Last_Verified_At.
+
