@@ -9,7 +9,7 @@
 
 ## Data model
 
-- The database contains 19 Master tables. `SCENE_REFERENCE_MAP` is prepared as a relation schema only.
+- The database contains 23 Master tables. `SCENE_REFERENCE_MAP` is prepared as a relation schema only.
 - Active foreign keys are documented and validation-script checked. Episode and scene keys are deferred. Sheets is not treated as a relational database.
 - `REFERENCE_ENTITY_MAP.Entity_ID` is polymorphic and resolved from `Entity_Type`.
 - `MODEL_CAPABILITY_MAP` stores verified capabilities as extensible rows. No changing prices are hard-coded.
@@ -22,7 +22,7 @@
 
 ## Google Drive source of truth
 
-The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/spreadsheets/d/1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q/edit), stored in `AI Automation/00_DATABASE`. It has exactly 19 master tabs; `SCENE_REFERENCE_MAP` remains schema-only.
+The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/spreadsheets/d/1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q/edit), stored in `AI Automation/00_DATABASE`. It has exactly 23 master tabs; `SCENE_REFERENCE_MAP` remains schema-only.
 
 ## Future flow
 

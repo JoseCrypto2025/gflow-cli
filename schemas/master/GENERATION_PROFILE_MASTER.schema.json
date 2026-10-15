@@ -1,0 +1,255 @@
+{
+  "table_name": "GENERATION_PROFILE_MASTER",
+  "table_type": "master",
+  "purpose": "Reusable provider-neutral generation preset for future scenes or jobs.",
+  "primary_key": "Generation_Profile_ID",
+  "fields": [
+    {
+      "field_name": "Generation_Profile_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": true,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Stable generation profile ID.",
+      "example": "GPR_0001",
+      "validation_rule": "Must match ^GPR_[0-9]{4}$ and be unique."
+    },
+    {
+      "field_name": "Profile_Name",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Profile name.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Profile_Version",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Profile version.",
+      "example": "1.0",
+      "validation_rule": null
+    },
+    {
+      "field_name": "Purpose",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Use case used to distinguish defaults.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Environment",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "DEV",
+        "TEST",
+        "PROD"
+      ],
+      "description": "Target environment.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Provider_Account_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "PROVIDER_ACCOUNT_MASTER.Provider_Account_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Provider account resolved by the adapter.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Model_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "MODEL_MASTER.Model_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Selected model.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Generation_Mode",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "TEXT_TO_VIDEO",
+        "FIRST_FRAME_TO_VIDEO",
+        "FIRST_LAST_FRAME_TO_VIDEO",
+        "INGREDIENTS_TO_VIDEO",
+        "EXTEND_VIDEO",
+        "VIDEO_TO_VIDEO"
+      ],
+      "description": "Canonical generation mode.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Prompt_Template_ID",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": "PROMPT_TEMPLATE_MASTER.Prompt_Template_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Optional reusable prompt template.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Default_Aspect_Ratio",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Must be explicitly supported by selected model and mode.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Default_Duration_Sec",
+      "data_type": "DECIMAL",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Must be explicitly supported by selected model and mode.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Default_Resolution",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Must be explicitly supported by selected model.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Default_Output_Count",
+      "data_type": "INTEGER",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional positive output count.",
+      "example": null,
+      "validation_rule": "Must be a positive integer when populated."
+    },
+    {
+      "field_name": "Audio_Mode",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "NONE",
+        "NATIVE",
+        "EXTERNAL_TTS"
+      ],
+      "description": "Audio handling preset.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Quality_Tier",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional provider-neutral quality tier.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Is_Default",
+      "data_type": "BOOLEAN",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Default for this purpose and environment.",
+      "example": null,
+      "validation_rule": "At most one ACTIVE default per Purpose + Environment."
+    },
+    {
+      "field_name": "Status",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "ACTIVE",
+        "HOLD",
+        "DEPRECATED"
+      ],
+      "description": "Lifecycle status.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Created_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Creation timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Updated_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Last update timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # Master Data Dictionary
 
-Schema baseline: AI Video Automation V2. Field definitions are stored as JSON under schemas/master and schemas/relation. No sample production rows are included.
+Schema baseline: AI Video Automation Master Foundation V2.1. The database has 23 Master tables and one relation schema (SCENE_REFERENCE_MAP). Field definitions are JSON under schemas/master and schemas/relation. No fake production rows or unverified cost rows are included. The spreadsheet timezone is Asia/Bangkok; canonical database timestamps remain ISO 8601 UTC.
 
 ## Table index
 
@@ -129,6 +129,41 @@ Primary key: Model_Capability_ID. Fields: Model_Capability_ID (STRING, required)
 Relation table schema only. Scene_ID is deferred until SCENES exists; no scene records are created.
 
 Primary key: Scene_Reference_ID. Fields: Scene_Reference_ID (STRING, required), Scene_ID (STRING, DEFERRED FK to SCENES.Scene_ID), Reference_Asset_ID (STRING, ACTIVE FK to REFERENCE_ASSET_MASTER.Reference_Asset_ID), Reference_Role (STRING), Usage_Instruction (STRING), Sort_Order (INTEGER), Is_Required (BOOLEAN), Is_Primary (BOOLEAN), Prompt_Mention_Name (STRING), Validation_Status (STRING), Validation_Message (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+
+## Multi-provider tables (V2.1)
+
+### PROVIDER_ACCOUNT_MASTER
+
+Concrete provider project, workspace, or runtime identity. Auth_Profile_Key is only a logical secret reference such as GFLOW_DEV_AUTH; credentials never belong in Sheets.
+
+Primary key: Provider_Account_ID (PVA_0001). Provider_ID references PROVIDER_MASTER.Provider_ID. Environment: DEV, TEST, PROD. Is_Default is a checkbox; at most one ACTIVE default is allowed per Provider_ID + Environment. Execution_Target may be WEB_UI, API, CLI, or MCP. Fields: Provider_Account_ID, Provider_ID, Account_Name, Environment, Provider_Project_ID, Provider_Workspace_ID, Region, Execution_Target, Auth_Profile_Key, Base_URL, Is_Default, Status, Created_At, Updated_At.
+
+### MODEL_PARAMETER_MAP
+
+Maps canonical automation parameters to semantic adapter keys, keeping scenes and orchestration independent of provider naming. Browser selectors, XPath, and coordinates belong in Worker/adapter code, never this table.
+
+Primary key: Model_Parameter_ID (MPM_000001). Model_ID references MODEL_MASTER.Model_ID. Active rows are unique by Model_ID + Generation_Mode + Canonical_Parameter. Allowed_Values_JSON must be a JSON array when populated; Default_Value_JSON must be valid JSON. Fields: Model_Parameter_ID, Model_ID, Generation_Mode, Canonical_Parameter, Adapter_Parameter_Key, Parameter_Data_Type, Allowed_Values_JSON, Default_Value_JSON, Is_Required, Unit, Mapping_Notes, Source, Verified_At, Status, Created_At, Updated_At.
+
+### GENERATION_PROFILE_MASTER
+
+Reusable provider-neutral preset for future jobs/scenes. Future scene data should refer to Generation_Profile_ID rather than provider-specific model or project fields.
+
+Primary key: Generation_Profile_ID (GPR_0001). Provider_Account_ID, Model_ID, and optional Prompt_Template_ID are foreign keys. The model provider must match the selected provider account; the profile environment must match the account environment. Generation_Mode must be supported in MODEL_CAPABILITY_MAP. Populated duration, aspect ratio, and resolution must be explicitly supported by active model capability data. Active defaults are unique by Purpose + Environment. Fields: Generation_Profile_ID, Profile_Name, Profile_Version, Purpose, Environment, Provider_Account_ID, Model_ID, Generation_Mode, Prompt_Template_ID, Default_Aspect_Ratio, Default_Duration_Sec, Default_Resolution, Default_Output_Count, Audio_Mode, Quality_Tier, Is_Default, Status, Created_At, Updated_At.
+
+### PROVIDER_COST_MASTER
+
+Effective-dated provider, account, or model pricing. No rows are added until rates are verified. Rate changes create new rows; historical values are retained.
+
+Primary key: Provider_Cost_ID (PCT_000001). Provider_ID is required; Provider_Account_ID and Model_ID are optional foreign keys. Each cost row requires Cost_Rate, Effective_From, Source, and Verified_At. Currency is an uppercase three-letter currency code and is required except for CREDIT units. Effective_To, when present, must be later than Effective_From. Fields: Provider_Cost_ID, Provider_ID, Provider_Account_ID, Model_ID, Billing_Plan_Name, Generation_Mode, Quality_Tier, Resolution, Cost_Unit, Cost_Rate, Currency, Effective_From, Effective_To, Source, Verified_At, Status, Created_At, Updated_At.
+
+## Provider-neutral generation rules
+
+- Provider-specific account/project resolution belongs in PROVIDER_ACCOUNT_MASTER and provider adapters.
+- MODEL_PARAMETER_MAP translates canonical parameters to semantic adapter keys; UI selectors are not database values.
+- GENERATION_PROFILE_MASTER binds an account, same-provider model, supported mode, and optional prompt template.
+- MODEL_CAPABILITY_MAP remains authoritative for supported modes and settings; profiles cannot override it.
+- PROVIDER_COST_MASTER contains source-verified effective-dated rates only. Never hard-code prices into Worker/n8n behavior.
+- Google Sheets displays dates in Asia/Bangkok. Database timestamps remain ISO 8601 UTC, for example 2026-10-15T14:01:04Z.
 
 ## Shared rules
 

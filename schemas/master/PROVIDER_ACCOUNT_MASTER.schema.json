@@ -1,0 +1,189 @@
+{
+  "table_name": "PROVIDER_ACCOUNT_MASTER",
+  "table_type": "master",
+  "purpose": "Concrete provider account, project, workspace, or runtime identity. Store only logical auth references, never secrets.",
+  "primary_key": "Provider_Account_ID",
+  "fields": [
+    {
+      "field_name": "Provider_Account_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": true,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Stable provider account ID.",
+      "example": "PVA_0001",
+      "validation_rule": "Must match ^PVA_[0-9]{4}$ and be unique."
+    },
+    {
+      "field_name": "Provider_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "PROVIDER_MASTER.Provider_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Owning provider.",
+      "example": "PRV_0001",
+      "validation_rule": null
+    },
+    {
+      "field_name": "Account_Name",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Human-readable account or environment name.",
+      "example": "Google Flow development",
+      "validation_rule": null
+    },
+    {
+      "field_name": "Environment",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "DEV",
+        "TEST",
+        "PROD"
+      ],
+      "description": "Deployment environment.",
+      "example": "DEV",
+      "validation_rule": null
+    },
+    {
+      "field_name": "Provider_Project_ID",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Provider-side project identifier; not a credential.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Provider_Workspace_ID",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Provider-side workspace identifier; not a credential.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Region",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Provider account region, if applicable.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Execution_Target",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "WEB_UI",
+        "API",
+        "CLI",
+        "MCP"
+      ],
+      "description": "Execution surface or adapter target.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Auth_Profile_Key",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Logical secret/auth profile name only. Never store passwords, tokens, API keys, OAuth tokens, cookies, browser sessions, or private keys.",
+      "example": "GFLOW_DEV_AUTH",
+      "validation_rule": "Use a logical identifier matching ^[A-Z][A-Z0-9_]*$; secret material is prohibited."
+    },
+    {
+      "field_name": "Base_URL",
+      "data_type": "URL",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Provider endpoint URL, if applicable.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Is_Default",
+      "data_type": "BOOLEAN",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Default account for this provider and environment.",
+      "example": "FALSE",
+      "validation_rule": "At most one ACTIVE default per Provider_ID + Environment."
+    },
+    {
+      "field_name": "Status",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "ACTIVE",
+        "HOLD",
+        "DEPRECATED"
+      ],
+      "description": "Lifecycle status.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Created_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Creation timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Updated_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Last update timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    }
+  ]
+}

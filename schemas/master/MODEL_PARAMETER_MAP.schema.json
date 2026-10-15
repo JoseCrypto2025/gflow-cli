@@ -1,0 +1,229 @@
+{
+  "table_name": "MODEL_PARAMETER_MAP",
+  "table_type": "master",
+  "purpose": "Maps canonical automation parameters to semantic provider/model adapter keys.",
+  "primary_key": "Model_Parameter_ID",
+  "fields": [
+    {
+      "field_name": "Model_Parameter_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": true,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Stable mapping ID.",
+      "example": "MPM_000001",
+      "validation_rule": "Must match ^MPM_[0-9]{6}$ and be unique."
+    },
+    {
+      "field_name": "Model_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "MODEL_MASTER.Model_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Mapped model.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Generation_Mode",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "TEXT_TO_VIDEO",
+        "FIRST_FRAME_TO_VIDEO",
+        "FIRST_LAST_FRAME_TO_VIDEO",
+        "INGREDIENTS_TO_VIDEO",
+        "EXTEND_VIDEO",
+        "VIDEO_TO_VIDEO"
+      ],
+      "description": "Mode to which this mapping applies.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Canonical_Parameter",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "DURATION_SEC",
+        "ASPECT_RATIO",
+        "RESOLUTION",
+        "OUTPUT_COUNT",
+        "AUDIO_ENABLED",
+        "REFERENCE_ASSETS",
+        "START_FRAME",
+        "END_FRAME",
+        "SEED",
+        "QUALITY_TIER"
+      ],
+      "description": "Provider-neutral parameter.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Adapter_Parameter_Key",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Semantic adapter key; never a browser selector, XPath, or UI coordinate.",
+      "example": "veo.durationSeconds",
+      "validation_rule": null
+    },
+    {
+      "field_name": "Parameter_Data_Type",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "STRING",
+        "INTEGER",
+        "NUMBER",
+        "BOOLEAN",
+        "ARRAY",
+        "OBJECT"
+      ],
+      "description": "JSON-compatible parameter type.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Allowed_Values_JSON",
+      "data_type": "JSON",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional JSON array of allowed values.",
+      "example": null,
+      "validation_rule": "Must parse as a JSON array when populated."
+    },
+    {
+      "field_name": "Default_Value_JSON",
+      "data_type": "JSON",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional JSON default value.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Is_Required",
+      "data_type": "BOOLEAN",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Whether the adapter requires this parameter.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Unit",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Unit for numeric parameters, if applicable.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Mapping_Notes",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Notes without secrets or UI selectors.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Source",
+      "data_type": "URL",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Documentation or verification source.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Verified_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Verification timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Status",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "ACTIVE",
+        "HOLD",
+        "DEPRECATED"
+      ],
+      "description": "Lifecycle status.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Created_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Creation timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Updated_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Last update timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    }
+  ]
+}

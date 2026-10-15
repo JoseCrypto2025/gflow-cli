@@ -1,0 +1,242 @@
+{
+  "table_name": "PROVIDER_COST_MASTER",
+  "table_type": "master",
+  "purpose": "Effective-dated provider/model pricing and credit cost backed by verified sources.",
+  "primary_key": "Provider_Cost_ID",
+  "fields": [
+    {
+      "field_name": "Provider_Cost_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": true,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Stable provider cost ID.",
+      "example": "PCT_000001",
+      "validation_rule": "Must match ^PCT_[0-9]{6}$ and be unique."
+    },
+    {
+      "field_name": "Provider_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "PROVIDER_MASTER.Provider_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Provider whose rate is recorded.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Provider_Account_ID",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": "PROVIDER_ACCOUNT_MASTER.Provider_Account_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Optional account/plan context.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Model_ID",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": "MODEL_MASTER.Model_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Optional model-specific rate.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Billing_Plan_Name",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Plan or tier associated with the rate.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Generation_Mode",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "TEXT_TO_VIDEO",
+        "FIRST_FRAME_TO_VIDEO",
+        "FIRST_LAST_FRAME_TO_VIDEO",
+        "INGREDIENTS_TO_VIDEO",
+        "EXTEND_VIDEO",
+        "VIDEO_TO_VIDEO"
+      ],
+      "description": "Optional mode-specific rate.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Quality_Tier",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional quality tier.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Resolution",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional resolution context.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Cost_Unit",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "GENERATION",
+        "SECOND",
+        "MINUTE",
+        "CREDIT",
+        "TOKEN",
+        "CHARACTER"
+      ],
+      "description": "Billing unit.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Cost_Rate",
+      "data_type": "NUMBER",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Verified non-negative rate; do not populate unverified prices.",
+      "example": null,
+      "validation_rule": "Must be numeric and >= 0."
+    },
+    {
+      "field_name": "Currency",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "ISO 4217 currency code; may be blank only when Cost_Unit is CREDIT.",
+      "example": null,
+      "validation_rule": "Use an uppercase three-letter currency code when populated; may be blank only for CREDIT units."
+    },
+    {
+      "field_name": "Effective_From",
+      "data_type": "TIMESTAMP",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Effective start in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Effective_To",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional effective end in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Source",
+      "data_type": "URL",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Verifiable pricing source.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Verified_At",
+      "data_type": "TIMESTAMP",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Verification timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Status",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "ACTIVE",
+        "HOLD",
+        "DEPRECATED"
+      ],
+      "description": "Lifecycle status; preserve historical rate rows.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Created_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Creation timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Updated_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Last update timestamp in ISO 8601 UTC.",
+      "example": null,
+      "validation_rule": null
+    }
+  ]
+}

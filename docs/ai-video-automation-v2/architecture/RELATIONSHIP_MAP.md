@@ -18,6 +18,10 @@ Active foreign keys require application/script validation. Deferred foreign keys
 - PROMPT_TEMPLATE_MASTER: Provider_ID to PROVIDER_MASTER.Provider_ID; Model_ID to MODEL_MASTER.Model_ID
 - MODEL_MASTER: Provider_ID to PROVIDER_MASTER.Provider_ID
 - MODEL_CAPABILITY_MAP: Model_ID to MODEL_MASTER.Model_ID
+- PROVIDER_ACCOUNT_MASTER: Provider_ID to PROVIDER_MASTER.Provider_ID
+- MODEL_PARAMETER_MAP: Model_ID to MODEL_MASTER.Model_ID
+- GENERATION_PROFILE_MASTER: Provider_Account_ID to PROVIDER_ACCOUNT_MASTER.Provider_Account_ID; Model_ID to MODEL_MASTER.Model_ID; Prompt_Template_ID to PROMPT_TEMPLATE_MASTER.Prompt_Template_ID
+- PROVIDER_COST_MASTER: Provider_ID to PROVIDER_MASTER.Provider_ID; optional Provider_Account_ID to PROVIDER_ACCOUNT_MASTER.Provider_Account_ID; optional Model_ID to MODEL_MASTER.Model_ID
 - SCENE_REFERENCE_MAP: Reference_Asset_ID to REFERENCE_ASSET_MASTER.Reference_Asset_ID
 
 ## Deferred relationships
@@ -35,3 +39,10 @@ Active foreign keys require application/script validation. Deferred foreign keys
 - REFERENCE_ENTITY_MAP links assets to reusable entities.
 - REFERENCE_PROVIDER_MAP records provider project/asset synchronization.
 - Reference IDs are not duplicated on CHARACTER, LOCATION, WARDROBE, or PROP rows.
+
+
+## Multi-provider resolution (V2.1)
+
+PROVIDER_MASTER has one-to-many accounts and models. A provider account identifies an environment/project/workspace without secret material. MODEL_PARAMETER_MAP maps canonical automation parameters to semantic adapter keys. GENERATION_PROFILE_MASTER binds one account, a model from the same provider, a supported mode, and an optional prompt template. Future scenes/jobs reference the profile instead of embedding provider, model, project, or UI-specific fields.
+
+PROVIDER_COST_MASTER records source-verified effective-dated rates at provider, account, or model level. Retain historical rows when pricing changes. Auth_Profile_Key contains only a logical secret reference.

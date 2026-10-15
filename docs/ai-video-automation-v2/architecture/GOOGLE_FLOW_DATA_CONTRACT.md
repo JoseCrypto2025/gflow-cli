@@ -35,3 +35,9 @@ Capabilities below reflect official Google Flow Help, checked 2026-10-15: https:
 ## Runtime compatibility
 
 Resolve WHO (subject/character), WHAT (action/emotion/dialogue), WHERE (location/environment), HOW IT LOOKS (style/lighting/camera), and HOW IT IS GENERATED (provider/model/mode/references/frames/ratio/duration/resolution/output configuration). Resolve supported combinations through MODEL_MASTER and MODEL_CAPABILITY_MAP before execution. A Flow help page does not prove a public API or stable automation interface exists.
+
+## Adapter boundary for V2.1
+
+Provider-specific behavior stays behind a provider adapter. Google Flow, direct APIs, and future providers may differ in model names, parameter keys, account/project concepts, and billing units. PROVIDER_ACCOUNT_MASTER, MODEL_PARAMETER_MAP, GENERATION_PROFILE_MASTER, and PROVIDER_COST_MASTER hold normalized configuration and verified reference data; they do not store secrets or implement runtime automation. Authentication material stays in the worker's secure secret store and is referenced only by Auth_Profile_Key.
+
+Scenes and jobs must not encode Google Flow model names, project IDs, or UI fields. No generation was performed for this data contract; no Flow credits or paid API calls were used.
