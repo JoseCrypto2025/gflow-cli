@@ -41,3 +41,7 @@ Resolve WHO (subject/character), WHAT (action/emotion/dialogue), WHERE (location
 Provider-specific behavior stays behind a provider adapter. Google Flow, direct APIs, and future providers may differ in model names, parameter keys, account/project concepts, and billing units. PROVIDER_ACCOUNT_MASTER, MODEL_PARAMETER_MAP, GENERATION_PROFILE_MASTER, and PROVIDER_COST_MASTER hold normalized configuration and verified reference data; they do not store secrets or implement runtime automation. Authentication material stays in the worker's secure secret store and is referenced only by Auth_Profile_Key.
 
 Scenes and jobs must not encode Google Flow model names, project IDs, or UI fields. No generation was performed for this data contract; no Flow credits or paid API calls were used.
+
+## V2 scene boundary
+
+EPISODE_MASTER, SCRIPT_MASTER, and SCENES store creative intent and editorial approval only. A future production job resolves `Generation_Profile_ID` to provider account, model, generation mode, parameter map, and capability data. Provider-specific identifiers and controls do not belong in SCENES. Phase C adds only a no-I/O router contract; provider execution is disabled.

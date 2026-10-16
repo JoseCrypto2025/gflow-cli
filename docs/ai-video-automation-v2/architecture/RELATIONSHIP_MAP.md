@@ -22,12 +22,16 @@ Active foreign keys require application/script validation. Deferred foreign keys
 - MODEL_PARAMETER_MAP: Model_ID to MODEL_MASTER.Model_ID
 - GENERATION_PROFILE_MASTER: Provider_Account_ID to PROVIDER_ACCOUNT_MASTER.Provider_Account_ID; Model_ID to MODEL_MASTER.Model_ID; Prompt_Template_ID to PROMPT_TEMPLATE_MASTER.Prompt_Template_ID
 - PROVIDER_COST_MASTER: Provider_ID to PROVIDER_MASTER.Provider_ID; optional Provider_Account_ID to PROVIDER_ACCOUNT_MASTER.Provider_Account_ID; optional Model_ID to MODEL_MASTER.Model_ID
-- SCENE_REFERENCE_MAP: Reference_Asset_ID to REFERENCE_ASSET_MASTER.Reference_Asset_ID
+- EPISODE_MASTER: Series_ID to SERIES_MASTER.Series_ID; optional Previous_Episode_ID to EPISODE_MASTER.Episode_ID
+- SCRIPT_MASTER: Episode_ID to EPISODE_MASTER.Episode_ID; optional Supersedes_Script_ID to SCRIPT_MASTER.Script_ID
+- SCENES: Script_ID to SCRIPT_MASTER.Script_ID; optional Location_ID, Visual_Style_ID, Camera_Profile_ID, Lighting_ID, and Continuity_Source_Scene_ID to their corresponding tables
+- SCENE_CHARACTER_MAP: Scene_ID to SCENES.Scene_ID; Character_ID to CHARACTER_MASTER.Character_ID; optional Wardrobe_ID to WARDROBE_MASTER.Wardrobe_ID
+- SCENE_DIALOGUE_LINES: Scene_ID to SCENES.Scene_ID; optional Character_ID (conditional) to CHARACTER_MASTER.Character_ID; optional Voice_ID_Override to VOICE_MASTER.Voice_ID
+- SCENE_REFERENCE_MAP: Scene_ID to SCENES.Scene_ID; Reference_Asset_ID to REFERENCE_ASSET_MASTER.Reference_Asset_ID
 
 ## Deferred relationships
 
-- CHARACTER_RELATIONSHIP.Start_Episode_ID and End_Episode_ID to EPISODE_MASTER.Episode_ID.
-- SCENE_REFERENCE_MAP.Scene_ID to SCENES.Scene_ID. No episode or scene rows are created.
+- None for the Phase B schemas. No episode, script, or scene content rows are created.
 
 ## Polymorphic relationship
 
@@ -39,6 +43,18 @@ Active foreign keys require application/script validation. Deferred foreign keys
 - REFERENCE_ENTITY_MAP links assets to reusable entities.
 - REFERENCE_PROVIDER_MAP records provider project/asset synchronization.
 - Reference IDs are not duplicated on CHARACTER, LOCATION, WARDROBE, or PROP rows.
+
+## Creative-value inheritance
+
+- Visual style: SCENES.Visual_Style_ID overrides SERIES_MASTER.Default_Visual_Style_ID.
+- Camera: SCENES.Camera_Profile_ID overrides LOCATION_MASTER.Default_Camera_Profile_ID, then SERIES_MASTER.Default_Camera_Profile_ID.
+- Lighting: SCENES.Lighting_ID overrides LOCATION_MASTER.Default_Lighting_ID, then VISUAL_STYLE_MASTER.Default_Lighting_ID.
+- Aspect ratio: SCENES.Aspect_Ratio_Override overrides SERIES_MASTER.Default_Aspect_Ratio.
+- Language: SCRIPT_MASTER.Dialogue_Language overrides EPISODE_MASTER.Primary_Language, then SERIES_MASTER.Primary_Language.
+- Wardrobe: SCENE_CHARACTER_MAP.Wardrobe_ID overrides CHARACTER_MASTER.Default_Wardrobe_ID.
+- Voice: SCENE_DIALOGUE_LINES.Voice_ID_Override overrides CHARACTER_MASTER.Default_Voice_ID.
+
+These are resolution rules, not copied values. Provider profile and execution state remain outside creative Scene columns.
 
 
 ## Multi-provider resolution (V2.1)

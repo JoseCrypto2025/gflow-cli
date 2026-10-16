@@ -9,8 +9,8 @@
 
 ## Data model
 
-- The database contains 23 Master tables. `SCENE_REFERENCE_MAP` is prepared as a relation schema only.
-- Active foreign keys are documented and validation-script checked. Episode and scene keys are deferred. Sheets is not treated as a relational database.
+- The spreadsheet has 23 Master tables, 3 transaction tables, and 3 relation tables (29 tabs total). `EPISODE_MASTER`, `SCRIPT_MASTER`, and `SCENES` are creative transaction data; the three `SCENE_*` relation tabs normalize scene relationships.
+- Active foreign keys are documented and validated. `SCENE_REFERENCE_MAP.Scene_ID` is active. Sheets is not treated as a relational database.
 - `REFERENCE_ENTITY_MAP.Entity_ID` is polymorphic and resolved from `Entity_Type`.
 - `MODEL_CAPABILITY_MAP` stores verified capabilities as extensible rows. No changing prices are hard-coded.
 - Prompt fields are curated fragments and are not copied from descriptions by default.
@@ -22,12 +22,12 @@
 
 ## Google Drive source of truth
 
-The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/spreadsheets/d/1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q/edit), stored in `AI Automation/00_DATABASE`. It has exactly 23 master tabs; `SCENE_REFERENCE_MAP` remains schema-only.
+The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/spreadsheets/d/1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q/edit), stored in `AI Automation/00_DATABASE`. It has 29 tabs: 23 master, 3 transaction, and 3 relation. The six Phase B tabs have headers and validation only; no sample rows were added.
 
 ## Future flow
 
-Google Sheets -> n8n VPS -> Flow Worker -> provider -> temporary VPS asset -> verify -> upload to Drive -> update Sheets -> clean VPS temp. No production workflow or deployment is implemented in this phase.
+Google Sheets -> future orchestration -> V2 worker -> provider adapter -> temporary VPS asset -> verify remote upload -> update Sheets -> clean VPS temp. This repository phase defines contracts only; no production workflow or deployment is implemented.
 
 ## Next phase
 
-EPISODE_MASTER, SCRIPT_MASTER, SCENES, PRODUCTION_JOBS, SCENE_JOBS, TTS_JOBS, FINAL_OUTPUT, POST_QUEUE, POST_RESULTS, and ANALYTICS.
+Production job, scene job, TTS job, final output, posting, and analytics schemas remain future work. The Phase B episode/script/scene design is complete but contains no real story data.

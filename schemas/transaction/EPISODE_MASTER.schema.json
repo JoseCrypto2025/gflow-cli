@@ -1,0 +1,251 @@
+{
+  "table_name": "EPISODE_MASTER",
+  "table_type": "transaction",
+  "purpose": "One row per episode. Creative and editorial state only; production execution state belongs to future jobs.",
+  "primary_key": "Episode_ID",
+  "unique_constraints": [
+    [
+      "Series_ID",
+      "Episode_No"
+    ]
+  ],
+  "fields": [
+    {
+      "field_name": "Episode_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": true,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Stable Episode identifier.",
+      "example": "EPI_000001",
+      "validation_rule": "Must match ^EPI_[0-9]{6}$ and be unique."
+    },
+    {
+      "field_name": "Series_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "SERIES_MASTER.Series_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Series ID",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Episode_No",
+      "data_type": "INTEGER",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Episode number within a series.",
+      "example": null,
+      "validation_rule": "Positive integer; unique with Series_ID."
+    },
+    {
+      "field_name": "Episode_Title",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Episode Title",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Episode_Synopsis",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Episode Synopsis",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Episode_Objective",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Episode Objective",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Opening_Hook",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Opening Hook",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Main_Conflict",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Main Conflict",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Ending_Hook",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Ending Hook",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Story_Arc_Summary",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Story Arc Summary",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Previous_Episode_ID",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": "EPISODE_MASTER.Episode_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Previous Episode ID",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Continuity_From_Previous",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Continuity From Previous",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Target_Duration_Sec",
+      "data_type": "DECIMAL",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Target Duration Sec",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Primary_Language",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Primary Language",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Editorial_Priority",
+      "data_type": "INTEGER",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Editorial Priority",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Episode_Status",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "DRAFT",
+        "PLANNED",
+        "SCRIPTING",
+        "SCRIPT_APPROVED",
+        "SCENE_PLANNING",
+        "READY_FOR_PRODUCTION",
+        "HOLD",
+        "ARCHIVED"
+      ],
+      "description": "Episode Status",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Approved_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Approved At",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Created_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Created At",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Updated_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Updated At",
+      "example": null,
+      "validation_rule": null
+    }
+  ]
+}

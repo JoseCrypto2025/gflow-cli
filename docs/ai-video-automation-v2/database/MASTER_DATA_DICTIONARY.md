@@ -1,6 +1,6 @@
 # Master Data Dictionary
 
-Schema baseline: AI Video Automation Master Foundation V2.1. The database has 23 Master tables and one relation schema (SCENE_REFERENCE_MAP). Field definitions are JSON under schemas/master and schemas/relation. No fake production rows or unverified cost rows are included. The spreadsheet timezone is Asia/Bangkok; canonical database timestamps remain ISO 8601 UTC.
+Schema baseline: AI Video Automation Master Foundation V2 plus Phase B. The spreadsheet has 23 Master, 3 transaction, and 3 relation tabs. Field definitions are JSON under schemas/master, schemas/transaction, and schemas/relation. No fake production rows or unverified cost rows are included. Spreadsheet timezone is Asia/Bangkok; canonical timestamps remain ISO 8601 UTC.
 
 ## Table index
 
@@ -25,6 +25,15 @@ Schema baseline: AI Video Automation Master Foundation V2.1. The database has 23
 | PROVIDER_MASTER | master | Provider_ID |
 | MODEL_MASTER | master | Model_ID |
 | MODEL_CAPABILITY_MAP | master | Model_Capability_ID |
+| PROVIDER_ACCOUNT_MASTER | master | Provider_Account_ID |
+| MODEL_PARAMETER_MAP | master | Model_Parameter_ID |
+| GENERATION_PROFILE_MASTER | master | Generation_Profile_ID |
+| PROVIDER_COST_MASTER | master | Provider_Cost_ID |
+| EPISODE_MASTER | transaction | Episode_ID |
+| SCRIPT_MASTER | transaction | Script_ID |
+| SCENES | transaction | Scene_ID |
+| SCENE_CHARACTER_MAP | relation | Scene_Character_ID |
+| SCENE_DIALOGUE_LINES | relation | Dialogue_Line_ID |
 | SCENE_REFERENCE_MAP | relation | Scene_Reference_ID |
 
 ## Table definitions
@@ -126,9 +135,31 @@ Extensible verified model capabilities; mode-specific combinations are serialize
 Primary key: Model_Capability_ID. Fields: Model_Capability_ID (STRING, required), Model_ID (STRING, ACTIVE FK to MODEL_MASTER.Model_ID), Capability_Type (STRING, required), Capability_Value (STRING, required), Unit (STRING), Status (STRING, required), Source (URL), Verified_At (TIMESTAMP), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
 ### SCENE_REFERENCE_MAP
 
-Relation table schema only. Scene_ID is deferred until SCENES exists; no scene records are created.
+Scene-to-reference relation. Scene_ID and Reference_Asset_ID are active foreign keys; no scene records are created.
 
 Primary key: Scene_Reference_ID. Fields: Scene_Reference_ID (STRING, required), Scene_ID (STRING, DEFERRED FK to SCENES.Scene_ID), Reference_Asset_ID (STRING, ACTIVE FK to REFERENCE_ASSET_MASTER.Reference_Asset_ID), Reference_Role (STRING), Usage_Instruction (STRING), Sort_Order (INTEGER), Is_Required (BOOLEAN), Is_Primary (BOOLEAN), Prompt_Mention_Name (STRING), Validation_Status (STRING), Validation_Message (STRING), Status (STRING, required), Created_At (TIMESTAMP), Updated_At (TIMESTAMP).
+
+## Transaction and scene relation tables (Phase B)
+
+### EPISODE_MASTER
+
+One creative episode per row. Primary key Episode_ID (`EPI_000001`); Series_ID references SERIES_MASTER; optional Previous_Episode_ID references EPISODE_MASTER. Series_ID + Episode_No is unique. Editorial status is DRAFT, PLANNED, SCRIPTING, SCRIPT_APPROVED, SCENE_PLANNING, READY_FOR_PRODUCTION, HOLD, or ARCHIVED. Fields: Episode_ID, Series_ID, Episode_No, Episode_Title, Episode_Synopsis, Episode_Objective, Opening_Hook, Main_Conflict, Ending_Hook, Story_Arc_Summary, Previous_Episode_ID, Continuity_From_Previous, Target_Duration_Sec, Primary_Language, Editorial_Priority, Episode_Status, Approved_At, Created_At, Updated_At.
+
+### SCRIPT_MASTER
+
+Versioned episode script. Primary key Script_ID (`SCR_000001`); Episode_ID references EPISODE_MASTER; optional Supersedes_Script_ID references SCRIPT_MASTER. Episode_ID + Script_Version is unique; at most one APPROVED script per episode. Fields: Script_ID, Episode_ID, Script_Version, Script_Title, Full_Script, Narrative_Direction, Estimated_Duration_Sec, Dialogue_Language, Generation_Source, Generation_Prompt_Version, Script_Checksum_SHA256, Supersedes_Script_ID, Script_Status, Review_Notes, Approved_At, Created_At, Updated_At.
+
+### SCENES
+
+One creative visual shot per row; excludes provider, job, and generated-asset state. Primary key Scene_ID (`SCN_000001`); Script_ID references SCRIPT_MASTER; Script_ID + Scene_No is unique. Fields: Scene_ID, Script_ID, Scene_No, Narrative_Beat_No, Scene_Title, Scene_Type, Scene_Purpose, Scene_Summary, Action_Description, Location_ID, Environment_Override, Time_Of_Day_Override, Scene_Mood, Visual_Style_ID, Camera_Profile_ID, Lighting_ID, Duration_Target_Sec, Aspect_Ratio_Override, Dialogue_Mode, Audio_Direction, Continuity_Source_Scene_ID, Scene_Start_State, Scene_End_State, Continuity_Notes, Negative_Constraints_Override, Scene_Definition_Status, Created_At, Updated_At.
+
+### SCENE_CHARACTER_MAP
+
+Links scene participants to CHARACTER_MASTER and optional WARDROBE_MASTER. Primary key Scene_Character_ID (`SCM_000001`); Scene_ID + Character_ID is unique. Fields: Scene_Character_ID, Scene_ID, Character_ID, Wardrobe_ID, Character_Role_In_Scene, Action_Instruction, Emotion_Instruction, Position_Instruction, Appearance_Override, Continuity_Override, Sort_Order, Status, Created_At, Updated_At.
+
+### SCENE_DIALOGUE_LINES
+
+Ordered dialogue or narration. Primary key Dialogue_Line_ID (`SDL_000001`); Scene_ID + Line_No is unique. Character_ID is required for CHARACTER speakers and blank for NARRATOR/SYSTEM. Fields: Dialogue_Line_ID, Scene_ID, Line_No, Speaker_Type, Character_ID, Dialogue_Text, Emotion, Speaking_Style_Override, Voice_ID_Override, Pause_After_Ms, Status, Created_At, Updated_At.
 
 ## Multi-provider tables (V2.1)
 
