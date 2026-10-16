@@ -72,3 +72,13 @@ PROVIDER_COST_MASTER records source-verified effective-dated rates at provider, 
 - SCENE_JOBS.Production_Job_ID → PRODUCTION_JOBS.Production_Job_ID; Scene_Prompt_ID → SCENE_PROMPT_VERSION.Scene_Prompt_ID
 - TTS_JOBS.Production_Job_ID → PRODUCTION_JOBS.Production_Job_ID; Dialogue_Line_ID → SCENE_DIALOGUE_LINES.Dialogue_Line_ID; Resolved_Voice_ID → VOICE_MASTER.Voice_ID; Provider_Account_ID → PROVIDER_ACCOUNT_MASTER.Provider_Account_ID; Model_ID → MODEL_MASTER.Model_ID
 - FINAL_OUTPUT.Production_Job_ID → PRODUCTION_JOBS.Production_Job_ID
+
+## Phase E resolution
+
+SCENES -> SCRIPT_MASTER -> EPISODE_MASTER -> SERIES_MASTER supplies creative
+context. The compiler resolves Generation_Profile_ID -> Provider Account /
+Model / Prompt Template, then capability and parameter mappings. Scene
+references resolve through explicit SCENE_REFERENCE_MAP first and eligible
+REFERENCE_ENTITY_MAP fallbacks second. Phase E writes no relation or job rows.
+Aspect ratio resolves only from Scene override then Series default. See
+[Prompt Builder Architecture](PROMPT_BUILDER_ARCHITECTURE.md).

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from .errors import CatalogResolutionError
 
@@ -77,17 +79,72 @@ class MasterCatalog(Protocol):
 
 
 def _values(capabilities: list[CapabilityRecord], kind: str, mode: str) -> set[str]:
-    return {
-        cap.capability_value
-        for cap in capabilities
-        if cap.status == "ACTIVE"
-        and cap.capability_type == kind
-        and (cap.generation_mode is None or cap.generation_mode == mode)
+    """Extract enumerated values from scalar rows or verified JSON capability bundles."""
+    values: set[str] = set()
+    bundle_keys = {
+        "DURATION_SEC": "duration_sec",
+        "ASPECT_RATIO": "aspect_ratios",
+        "RESOLUTION": "resolutions",
+        "OUTPUT_COUNT": "output_counts",
     }
+    for cap in capabilities:
+        if cap.status != "ACTIVE" or (cap.generation_mode and cap.generation_mode != mode):
+            continue
+        if cap.capability_type == kind:
+            try:
+                parsed = cast(object, json.loads(cap.capability_value))
+            except (json.JSONDecodeError, TypeError):
+                parsed = cap.capability_value
+            if kind == "GENERATION_MODE" and isinstance(parsed, dict):
+                parsed_map = cast(Mapping[str, object], parsed)
+                if (
+                    parsed_map.get("supported") is not False
+                    and str(parsed_map.get("mode", "")).upper() == mode
+                ):
+                    values.add(mode)
+                continue
+            if isinstance(parsed, list):
+                values.update(str(value) for value in cast(list[object], parsed))
+            elif isinstance(parsed, dict):
+                parsed_map = cast(Mapping[str, object], parsed)
+                listed = parsed_map.get("values", parsed_map.get("supported_values"))
+                if isinstance(listed, list):
+                    values.update(str(value) for value in cast(list[object], listed))
+            elif isinstance(parsed, str) and parsed:
+                values.add(parsed)
+            elif isinstance(parsed, (int, float, bool)):
+                values.add(str(parsed))
+        if cap.capability_type == "GENERATION_MODE":
+            try:
+                bundle = cast(object, json.loads(cap.capability_value))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(bundle, dict):
+                continue
+            bundle_map = cast(Mapping[str, object], bundle)
+            if (
+                str(bundle_map.get("mode", "")).upper() not in {"", mode}
+                or bundle_map.get("supported") is False
+            ):
+                continue
+            key = bundle_keys.get(kind)
+            candidate = bundle_map.get(key) if key else None
+            if isinstance(candidate, list):
+                values.update(str(value) for value in cast(list[object], candidate))
+            elif isinstance(candidate, dict):
+                candidate_map = cast(Mapping[str, object], candidate)
+                listed = candidate_map.get("values", candidate_map.get("supported_values"))
+                if isinstance(listed, list):
+                    values.update(str(value) for value in cast(list[object], listed))
+    return values
 
 
 def resolve_profile(
-    catalog: MasterCatalog, profile_id: str, environment: str
+    catalog: MasterCatalog,
+    profile_id: str,
+    environment: str,
+    *,
+    allow_unenumerable_capabilities: bool = False,
 ) -> tuple[ProfileRecord, ProviderRecord, AccountRecord, ModelRecord]:
     profile = catalog.profile(profile_id)
     if profile is None or profile.status != "ACTIVE":
@@ -148,7 +205,7 @@ def resolve_profile(
                 raise CatalogResolutionError(
                     f"profile {kind.lower()} is not supported by the model"
                 )
-        if value is not None and not allowed:
+        if value is not None and not allowed and not allow_unenumerable_capabilities:
             raise CatalogResolutionError(
                 f"profile sets {kind.lower()} without verified capability data"
             )

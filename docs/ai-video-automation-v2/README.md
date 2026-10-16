@@ -41,3 +41,15 @@ The `v2_runtime` package defines environment configuration, per-job temp workspa
 ## Production Execution Data V1
 
 Five transaction schemas define immutable scene prompt versions, production runs, scene and TTS attempts, and versioned final artifacts. See `database/PRODUCTION_EXECUTION_DATA_DICTIONARY.md` for the operational contract. New tabs remain header-only; provider adapters, prompt execution, posting, and analytics are out of scope.
+
+## Phase E: Prompt Builder and Preflight
+
+The provider-neutral compiler accepts Scene_ID, explicit Generation_Profile_ID,
+and runtime environment. It resolves creative context and inheritance, validates
+profile/model capabilities and parameters, resolves Drive-backed references,
+renders the approved template vocabulary, and returns deterministic hashes plus
+a machine-readable PASS or HOLD result. A PASS may yield an in-memory
+SCENE_PROMPT_VERSION candidate with status VALIDATED; it does not approve or
+persist the candidate. See [Prompt Builder Architecture](architecture/PROMPT_BUILDER_ARCHITECTURE.md)
+and [Preflight Contract](architecture/PREFLIGHT_CONTRACT.md). The live Sheet
+remains unchanged and the phase ends before provider execution.

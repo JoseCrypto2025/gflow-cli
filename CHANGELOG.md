@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Provider-neutral V2 prompt building and preflight foundation.** Added a deterministic,
+  read-only Phase E compiler for resolving approved generation profiles, validating scene
+  inputs and references, rendering whitelisted prompt templates, and producing hashes and
+  validation-only payloads. This does not execute provider jobs or change the CLI surface.
+
 ## [0.85.0] — 2026-10-14
 
 ### Added

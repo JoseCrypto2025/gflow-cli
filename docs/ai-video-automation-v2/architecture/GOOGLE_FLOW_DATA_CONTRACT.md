@@ -49,3 +49,15 @@ EPISODE_MASTER, SCRIPT_MASTER, and SCENES store creative intent and editorial ap
 ## Production Execution Data V1 boundary
 
 Provider-neutral jobs contain no Google Flow/Veo-specific configuration. A prompt version pins Generation_Profile_ID and provider resolution stays behind Master data and a future adapter. A Production Job can reach COMPLETED only with a primary FINAL_VIDEO that is READY, PASS-validated, and remotely verified. No provider implementation or call is included.
+
+## Phase E handoff boundary
+
+The Google Flow Adapter in a future phase receives an explicitly approved
+Scene Prompt identity, compiled prompt text, structured resolved generation
+parameters, and structured reference descriptors. It does not perform Story or
+Master lookup, Character identity generation, Wardrobe fallback, Location or
+Scene continuity inheritance, template compilation, or model-capability
+business validation; Phase E owns those steps. Phase E does not click Generate,
+upload assets, call paid APIs, or verify authentication/credits/provider health.
+See [Prompt Builder Architecture](PROMPT_BUILDER_ARCHITECTURE.md) and
+[Preflight Contract](PREFLIGHT_CONTRACT.md).

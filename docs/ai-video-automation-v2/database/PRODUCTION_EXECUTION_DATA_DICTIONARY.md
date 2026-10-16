@@ -168,4 +168,10 @@ READY output requires PASS and Remote_Verified=TRUE. Production COMPLETED requir
 
 Source_Context_SHA256 covers canonical UTF-8 JSON with stable key order and normalized strings for Scene, character/reference maps, prompt-relevant dialogue, resolved Character, Wardrobe, Location, Visual Style, Camera Profile, and Lighting data, Generation Profile, Prompt Template, and reference asset identities/versions. Prompt_SHA256 covers canonical compiled prompt representation. Scene_Set_SHA256 covers the ordered Scene_No list of Scene_ID + approved Scene_Prompt_ID. Input_Text_SHA256 hashes exact normalized dialogue sent to TTS. Assembly_Manifest_SHA256 covers ordered successful scene outputs, TTS outputs, applicable subtitle inputs, and assembly settings/config version; detailed manifest files belong in Drive Reports/Job Artifacts.
 
+Phase E builds a SCENE_PROMPT_VERSION-compatible candidate in memory after
+successful preflight. The candidate is VALIDATED, not APPROVED, and is never
+written to the live sheet by the compiler. See
+../architecture/PROMPT_BUILDER_ARCHITECTURE.md and
+../architecture/PREFLIGHT_CONTRACT.md for the compile/readiness contract.
+
 Job tables do not duplicate series/episode/scene/provider/model/prompt-template descriptions and contain no persistent local paths. Posting is separate; analytics is later. This checkpoint creates no provider adapters, Prompt Builder, generation calls, audio, or video.

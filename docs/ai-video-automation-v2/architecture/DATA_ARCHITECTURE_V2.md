@@ -28,6 +28,18 @@ The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/s
 
 Google Sheets -> future orchestration -> V2 worker -> provider adapter -> temporary VPS asset -> verify remote upload -> update Sheets -> clean VPS temp. This repository phase defines contracts only; no production workflow or deployment is implemented.
 
+## Phase E prompt and preflight boundary
+
+Phase E resolves a locked GENERATED_VIDEO Scene plus an explicit
+Generation_Profile_ID into a provider-neutral, capability-validated prompt and
+structured adapter parameters. The result is PASS (ready for a future adapter
+handoff, subject to future live authentication/health checks) or HOLD. An
+optional in-memory SCENE_PROMPT_VERSION candidate is VALIDATED, never
+APPROVED, and no live table is written. See
+[Prompt Builder Architecture](PROMPT_BUILDER_ARCHITECTURE.md) and
+[Preflight Contract](PREFLIGHT_CONTRACT.md). The current locked reference-role
+schema cannot represent source video, so EXTEND_VIDEO and VIDEO_TO_VIDEO hold.
+
 ## Next phase
 
 Posting and analytics remain future work; the five Production Execution Data V1 transaction tables are defined and header-only. The Phase B episode/script/scene design is complete but contains no real story data.
