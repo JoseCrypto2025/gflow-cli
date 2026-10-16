@@ -13,6 +13,7 @@ from gflow_cli.v2_runtime.catalog import (
     CapabilityRecord,
     ModelRecord,
     ProfileRecord,
+    PromptTemplateRecord,
     ProviderRecord,
     resolve_profile,
 )
@@ -45,15 +46,23 @@ class Catalog:
         "DEV",
         "test",
         "ACTIVE",
-        "16:9",
-        8,
-        "720p",
+        prompt_template_id="PTM_0001",
+        default_aspect_ratio="16:9",
+        default_duration_sec=8,
+        default_resolution="720p",
+        default_output_count=1,
+        audio_mode="NATIVE",
+        quality_tier="STANDARD",
     )
+    prompt_row = PromptTemplateRecord("PTM_0001", "ACTIVE", "PRV_0001", "MDL_0001", "TEXT_TO_VIDEO")
     caps = [
         CapabilityRecord("GENERATION_MODE", "TEXT_TO_VIDEO"),
         CapabilityRecord("ASPECT_RATIO", "16:9", "TEXT_TO_VIDEO"),
         CapabilityRecord("DURATION_SEC", "8", "TEXT_TO_VIDEO"),
         CapabilityRecord("RESOLUTION", "720p", "TEXT_TO_VIDEO"),
+        CapabilityRecord("OUTPUT_COUNT", "1", "TEXT_TO_VIDEO"),
+        CapabilityRecord("AUDIO_MODE", "NATIVE", "TEXT_TO_VIDEO"),
+        CapabilityRecord("QUALITY_TIER", "STANDARD", "TEXT_TO_VIDEO"),
     ]
 
     def provider(self, provider_id: str) -> ProviderRecord | None:
@@ -67,6 +76,9 @@ class Catalog:
 
     def profile(self, profile_id: str) -> ProfileRecord | None:
         return self.profile_row
+
+    def prompt_template(self, prompt_template_id: str) -> PromptTemplateRecord | None:
+        return self.prompt_row
 
     def capabilities(self, model_id: str) -> list[CapabilityRecord]:
         return self.caps
@@ -217,6 +229,15 @@ def test_profile_resolution_checks_provider_and_model_capabilities() -> None:
         "GPR_0001", "PVA_0001", "MDL_0002", "TEXT_TO_VIDEO", "DEV", "test", "ACTIVE"
     )
     catalog.model_row = ModelRecord("MDL_0002", "PRV_0002", "ACTIVE")
+    with pytest.raises(CatalogResolutionError):
+        resolve_profile(catalog, "GPR_0001", "DEV")
+
+
+def test_profile_resolution_rejects_prompt_template_mismatch() -> None:
+    catalog = Catalog()
+    catalog.prompt_row = PromptTemplateRecord(
+        "PTM_0001", "ACTIVE", "PRV_0002", "MDL_0001", "TEXT_TO_VIDEO"
+    )
     with pytest.raises(CatalogResolutionError):
         resolve_profile(catalog, "GPR_0001", "DEV")
 

@@ -39,6 +39,15 @@ class CapabilityRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PromptTemplateRecord:
+    prompt_template_id: str
+    status: str
+    provider_id: str | None = None
+    model_id: str | None = None
+    generation_mode: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ProfileRecord:
     generation_profile_id: str
     provider_account_id: str
@@ -47,9 +56,13 @@ class ProfileRecord:
     environment: str
     purpose: str
     status: str
+    prompt_template_id: str | None = None
     default_aspect_ratio: str | None = None
     default_duration_sec: float | None = None
     default_resolution: str | None = None
+    default_output_count: int | None = None
+    audio_mode: str | None = None
+    quality_tier: str | None = None
 
 
 class MasterCatalog(Protocol):
@@ -59,6 +72,7 @@ class MasterCatalog(Protocol):
     def account(self, account_id: str) -> AccountRecord | None: ...
     def model(self, model_id: str) -> ModelRecord | None: ...
     def profile(self, profile_id: str) -> ProfileRecord | None: ...
+    def prompt_template(self, prompt_template_id: str) -> PromptTemplateRecord | None: ...
     def capabilities(self, model_id: str) -> list[CapabilityRecord]: ...
 
 
@@ -96,6 +110,16 @@ def resolve_profile(
     provider = catalog.provider(model.provider_id)
     if provider is None or provider.status != "ACTIVE":
         raise CatalogResolutionError("profile provider is missing or inactive")
+    if profile.prompt_template_id:
+        prompt = catalog.prompt_template(profile.prompt_template_id)
+        if prompt is None or prompt.status != "ACTIVE":
+            raise CatalogResolutionError("profile prompt template is missing or inactive")
+        if prompt.provider_id and prompt.provider_id != provider.provider_id:
+            raise CatalogResolutionError("profile prompt template belongs to another provider")
+        if prompt.model_id and prompt.model_id != model.model_id:
+            raise CatalogResolutionError("profile prompt template belongs to another model")
+        if prompt.generation_mode and prompt.generation_mode != profile.generation_mode:
+            raise CatalogResolutionError("profile prompt template uses a different generation mode")
     capabilities = catalog.capabilities(model.model_id)
     modes = _values(capabilities, "GENERATION_MODE", profile.generation_mode)
     if profile.generation_mode not in modes:
@@ -107,12 +131,18 @@ def resolve_profile(
             str(profile.default_duration_sec) if profile.default_duration_sec is not None else None,
         ),
         ("RESOLUTION", profile.default_resolution),
+        (
+            "OUTPUT_COUNT",
+            str(profile.default_output_count) if profile.default_output_count is not None else None,
+        ),
+        ("AUDIO_MODE", profile.audio_mode),
+        ("QUALITY_TIER", profile.quality_tier),
     )
     for kind, value in checks:
         allowed = _values(capabilities, kind, profile.generation_mode)
         if value is not None and allowed:
             matches = value in allowed
-            if kind == "DURATION_SEC":
+            if kind in {"DURATION_SEC", "OUTPUT_COUNT"}:
                 matches = any(float(value) == float(candidate) for candidate in allowed)
             if not matches:
                 raise CatalogResolutionError(

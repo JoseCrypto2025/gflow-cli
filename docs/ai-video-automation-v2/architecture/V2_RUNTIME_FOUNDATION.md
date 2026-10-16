@@ -45,7 +45,7 @@ Deployment is intended to flow from local development to Git commit, GitHub, the
 
 ## Provider resolution
 
-The read-only `MasterCatalog` protocol resolves `Generation_Profile_ID`, provider account, model, mode, and active capabilities. Resolution fails closed on inactive/missing data, environment/provider mismatch, unsupported mode, or profile settings not explicitly supported by capability rows. Routing uses `PROVIDER_MASTER.Provider_Type` as the service type and a registered adapter. Adapter parameter keys are semantic; browser selectors remain worker code. Contract adapters cannot execute generation.
+The read-only `MasterCatalog` protocol resolves `Generation_Profile_ID`, provider account, model, optional prompt template, mode, and active capabilities. Resolution fails closed on inactive/missing data, environment/provider mismatch, unsupported mode, a prompt template from another provider/model/mode, or aspect ratio, duration, resolution, output count, audio mode, and quality settings not explicitly supported by capability rows. Routing uses `PROVIDER_MASTER.Provider_Type` as the service type and a registered adapter. Adapter parameter keys are semantic; browser selectors remain worker code. Contract adapters cannot execute generation.
 
 The service registry distinguishes `VIDEO_GENERATION`, `IMAGE_GENERATION`, and `TTS`. Google Flow, FAL, and future Phaya implementations would register under video generation when selected by verified Master data; ElevenLabs-like speech providers would register under TTS. No literal provider route or credential is hard-coded into a scene/job.
 
