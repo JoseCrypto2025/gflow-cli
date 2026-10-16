@@ -62,3 +62,13 @@ These are resolution rules, not copied values. Provider profile and execution st
 PROVIDER_MASTER has one-to-many accounts and models. A provider account identifies an environment/project/workspace without secret material. MODEL_PARAMETER_MAP maps canonical automation parameters to semantic adapter keys. GENERATION_PROFILE_MASTER binds one account, a model from the same provider, a supported mode, and an optional prompt template. Future scenes/jobs reference the profile instead of embedding provider, model, project, or UI-specific fields.
 
 PROVIDER_COST_MASTER records source-verified effective-dated rates at provider, account, or model level. Retain historical rows when pricing changes. Auth_Profile_Key contains only a logical secret reference.
+
+## Production execution chain
+
+`SERIES_MASTER` → `EPISODE_MASTER` → `SCRIPT_MASTER` → `SCENES` → `SCENE_PROMPT_VERSION` → `PRODUCTION_JOBS` → `SCENE_JOBS` → `FINAL_OUTPUT`. `SCENE_PROMPT_VERSION` resolves `GENERATION_PROFILE_MASTER` → `MODEL_MASTER` and `PROVIDER_ACCOUNT_MASTER` → `PROVIDER_MASTER`; `PRODUCTION_JOBS` does not own provider configuration. `SCENES` → `SCENE_DIALOGUE_LINES` → `TTS_JOBS` feeds audio into later assembly and `FINAL_OUTPUT`. All new-schema foreign keys are active.
+
+- SCENE_PROMPT_VERSION.Scene_ID → SCENES.Scene_ID; Generation_Profile_ID → GENERATION_PROFILE_MASTER.Generation_Profile_ID
+- PRODUCTION_JOBS.Script_ID → SCRIPT_MASTER.Script_ID
+- SCENE_JOBS.Production_Job_ID → PRODUCTION_JOBS.Production_Job_ID; Scene_Prompt_ID → SCENE_PROMPT_VERSION.Scene_Prompt_ID
+- TTS_JOBS.Production_Job_ID → PRODUCTION_JOBS.Production_Job_ID; Dialogue_Line_ID → SCENE_DIALOGUE_LINES.Dialogue_Line_ID; Resolved_Voice_ID → VOICE_MASTER.Voice_ID; Provider_Account_ID → PROVIDER_ACCOUNT_MASTER.Provider_Account_ID; Model_ID → MODEL_MASTER.Model_ID
+- FINAL_OUTPUT.Production_Job_ID → PRODUCTION_JOBS.Production_Job_ID

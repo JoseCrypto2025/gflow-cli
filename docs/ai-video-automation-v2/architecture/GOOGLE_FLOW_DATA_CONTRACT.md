@@ -45,3 +45,7 @@ Scenes and jobs must not encode Google Flow model names, project IDs, or UI fiel
 ## V2 scene boundary
 
 EPISODE_MASTER, SCRIPT_MASTER, and SCENES store creative intent and editorial approval only. A future production job resolves `Generation_Profile_ID` to provider account, model, generation mode, parameter map, and capability data. Provider-specific identifiers and controls do not belong in SCENES. Phase C adds only a no-I/O router contract; provider execution is disabled.
+
+## Production Execution Data V1 boundary
+
+Provider-neutral jobs contain no Google Flow/Veo-specific configuration. A prompt version pins Generation_Profile_ID and provider resolution stays behind Master data and a future adapter. A Production Job can reach COMPLETED only with a primary FINAL_VIDEO that is READY, PASS-validated, and remotely verified. No provider implementation or call is included.

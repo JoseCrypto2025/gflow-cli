@@ -9,7 +9,7 @@
 
 ## Data model
 
-- The spreadsheet has 23 Master tables, 3 transaction tables, and 3 relation tables (29 tabs total). `EPISODE_MASTER`, `SCRIPT_MASTER`, and `SCENES` are creative transaction data; the three `SCENE_*` relation tabs normalize scene relationships.
+- The spreadsheet has 23 Master tables, 8 transaction tables, and 3 relation tables (34 tabs total). `EPISODE_MASTER`, `SCRIPT_MASTER`, and `SCENES` are creative transaction data; the three `SCENE_*` relation tabs normalize scene relationships.
 - Active foreign keys are documented and validated. `SCENE_REFERENCE_MAP.Scene_ID` is active. Sheets is not treated as a relational database.
 - `REFERENCE_ENTITY_MAP.Entity_ID` is polymorphic and resolved from `Entity_Type`.
 - `MODEL_CAPABILITY_MAP` stores verified capabilities as extensible rows. No changing prices are hard-coded.
@@ -22,7 +22,7 @@
 
 ## Google Drive source of truth
 
-The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/spreadsheets/d/1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q/edit), stored in `AI Automation/00_DATABASE`. It has 29 tabs: 23 master, 3 transaction, and 3 relation. The six Phase B tabs have headers and validation only; no sample rows were added.
+The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/spreadsheets/d/1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q/edit), stored in `AI Automation/00_DATABASE`. It has 34 tabs: 23 Master, 8 transaction, and 3 relation. All 11 transaction tabs have no production rows; the five new tabs contain schema headers and unchecked checkbox defaults only.
 
 ## Future flow
 
@@ -30,4 +30,4 @@ Google Sheets -> future orchestration -> V2 worker -> provider adapter -> tempor
 
 ## Next phase
 
-Production job, scene job, TTS job, final output, posting, and analytics schemas remain future work. The Phase B episode/script/scene design is complete but contains no real story data.
+Posting and analytics remain future work; the five Production Execution Data V1 transaction tables are defined and header-only. The Phase B episode/script/scene design is complete but contains no real story data.

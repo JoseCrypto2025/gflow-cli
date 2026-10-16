@@ -1,0 +1,189 @@
+{
+  "table_name": "SCENE_PROMPT_VERSION",
+  "table_type": "transaction",
+  "purpose": "One compiled prompt version for one Scene and Generation Profile.",
+  "primary_key": "Scene_Prompt_ID",
+  "unique_constraints": [
+    [
+      "Scene_ID",
+      "Prompt_Version"
+    ]
+  ],
+  "fields": [
+    {
+      "field_name": "Scene_Prompt_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": true,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Scene Prompt ID",
+      "example": null,
+      "validation_rule": "Must match ^SPV_[0-9]{6}$ and be unique."
+    },
+    {
+      "field_name": "Scene_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "SCENES.Scene_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Scene ID",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Prompt_Version",
+      "data_type": "INTEGER",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Prompt Version",
+      "example": null,
+      "validation_rule": "Positive integer; unique with Scene_ID."
+    },
+    {
+      "field_name": "Generation_Profile_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "GENERATION_PROFILE_MASTER.Generation_Profile_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Generation Profile ID",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Compiled_Prompt_Text",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Compiled prompt; required from COMPILED onward.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Compiled_Negative_Prompt",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Compiled Negative Prompt",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Compiler_Version",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Compiler Version",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Source_Context_SHA256",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Source Context SHA256",
+      "example": null,
+      "validation_rule": "When populated, 64 hexadecimal characters."
+    },
+    {
+      "field_name": "Prompt_SHA256",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Prompt SHA256",
+      "example": null,
+      "validation_rule": "When populated, 64 hexadecimal characters."
+    },
+    {
+      "field_name": "Prompt_Status",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "DRAFT",
+        "COMPILED",
+        "VALIDATED",
+        "APPROVED",
+        "SUPERSEDED",
+        "REJECTED"
+      ],
+      "description": "Prompt Status",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Validation_Message",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Validation Message",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Approved_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Required when APPROVED.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Created_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Created At",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Updated_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Updated At",
+      "example": null,
+      "validation_rule": null
+    }
+  ]
+}

@@ -1,0 +1,223 @@
+{
+  "table_name": "PRODUCTION_JOBS",
+  "table_type": "transaction",
+  "purpose": "One production run for exactly one Script Version.",
+  "primary_key": "Production_Job_ID",
+  "unique_constraints": [
+    [
+      "Script_ID",
+      "Production_Run_No"
+    ],
+    [
+      "Request_Idempotency_Key"
+    ]
+  ],
+  "fields": [
+    {
+      "field_name": "Production_Job_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": true,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Production Job ID",
+      "example": null,
+      "validation_rule": "Must match ^PRD_[0-9]{6}$ and be unique."
+    },
+    {
+      "field_name": "Script_ID",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": "SCRIPT_MASTER.Script_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Script ID",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Production_Run_No",
+      "data_type": "INTEGER",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Production Run No",
+      "example": null,
+      "validation_rule": "Positive integer; unique with Script_ID."
+    },
+    {
+      "field_name": "Execution_Environment",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "DEV",
+        "TEST",
+        "PROD"
+      ],
+      "description": "Execution Environment",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Request_Idempotency_Key",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Request Idempotency Key",
+      "example": null,
+      "validation_rule": "Globally unique."
+    },
+    {
+      "field_name": "Queue_Priority",
+      "data_type": "INTEGER",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Queue Priority",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Scene_Set_SHA256",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Scene Set SHA256",
+      "example": null,
+      "validation_rule": "When populated, 64 hexadecimal characters."
+    },
+    {
+      "field_name": "Job_Status",
+      "data_type": "STRING",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": [
+        "REQUESTED",
+        "VALIDATING",
+        "READY",
+        "QUEUED",
+        "RUNNING",
+        "HOLD",
+        "FAILED",
+        "COMPLETED",
+        "CANCELLED"
+      ],
+      "description": "Job Status",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Hold_Reason_Code",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Required for HOLD.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Error_Code",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Required for FAILED.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Error_Message",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Failure details; required for FAILED.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Requested_At",
+      "data_type": "TIMESTAMP",
+      "required": true,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Requested At",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Started_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Required for RUNNING, COMPLETED, or FAILED.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Completed_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Required for COMPLETED, FAILED, or CANCELLED.",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Created_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Created At",
+      "example": null,
+      "validation_rule": null
+    },
+    {
+      "field_name": "Updated_At",
+      "data_type": "TIMESTAMP",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Updated At",
+      "example": null,
+      "validation_rule": null
+    }
+  ]
+}

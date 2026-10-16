@@ -4,17 +4,17 @@ This documentation set describes the source-controlled data foundation for the a
 
 ## Source of truth
 
-The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/spreadsheets/d/1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q/edit) in the Google Drive `AI Automation/00_DATABASE` folder. It contains 23 master tabs, 3 transaction tabs, and 3 relation tabs. All six Phase B tabs are blank except for schema headers.
+The native database is [AI_VIDEO_AUTOMATION_MASTER_V2](https://docs.google.com/spreadsheets/d/1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q/edit) in the Google Drive `AI Automation/00_DATABASE` folder. It contains 23 Master tabs, 8 transaction tabs, and 3 relation tabs (34 total). The eleven transaction tabs contain no production data; the five new tabs have schema headers and unchecked checkbox defaults only.
 
 ## Contents
 
 - `../../schemas/master/`: 23 JSON Schemas for the master tables.
-- `../../schemas/transaction/`: EPISODE_MASTER, SCRIPT_MASTER, and SCENES.
+- `../../schemas/transaction/`: EPISODE_MASTER, SCRIPT_MASTER, SCENES, SCENE_PROMPT_VERSION, PRODUCTION_JOBS, SCENE_JOBS, TTS_JOBS, and FINAL_OUTPUT.
 - `../../schemas/relation/`: SCENE_CHARACTER_MAP, SCENE_DIALOGUE_LINES, and SCENE_REFERENCE_MAP.
 - `database/MASTER_DATA_DICTIONARY.md`: keys, field types, FK status, and constraints.
 - `architecture/`: ownership, relationship, provider contract, and Git baseline notes.
 - `../../scripts/validation/validate_master_data.py`: read-only Master CSV validation.
-- `../../scripts/validation/validate_v2_data_architecture.py`: schema bundle and CSV validator for all 29 tables.
+- `../../scripts/validation/validate_v2_data_architecture.py`: schema bundle and CSV validator for all 34 tables.
 - `../../src/gflow_cli/v2_runtime/`: isolated, no-provider-I/O V2 runtime foundations.
 
 ## Data guardrails
@@ -37,3 +37,7 @@ EPISODE_MASTER, SCRIPT_MASTER, and SCENES are transaction tables. SCENE_CHARACTE
 ## Phase C: runtime foundation
 
 The `v2_runtime` package defines environment configuration, per-job temp workspaces, logical asset references, verification, disk admission checks, catalog-based profile validation, and adapter boundaries. It does not start a worker or listener, authenticate to Drive, call a provider, or generate media. See [runtime foundation](architecture/V2_RUNTIME_FOUNDATION.md), [gap report](architecture/GFLOW_V2_ARCHITECTURE_GAP_REPORT.md), and [legacy compatibility contract](architecture/LEGACY_API_COMPATIBILITY.md).
+
+## Production Execution Data V1
+
+Five transaction schemas define immutable scene prompt versions, production runs, scene and TTS attempts, and versioned final artifacts. See `database/PRODUCTION_EXECUTION_DATA_DICTIONARY.md` for the operational contract. New tabs remain header-only; provider adapters, prompt execution, posting, and analytics are out of scope.
