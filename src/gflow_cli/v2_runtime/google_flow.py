@@ -7,12 +7,13 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from gflow_cli.api.transports._common import flow_host_kind
 from gflow_cli.errors import ProfileLockedError
 from gflow_cli.profile_lease import ProfileLease
 
+from .agent_recovery import AgentSettingsRecoveryJournal, RecoveryJournalError
 from .errors import FlowPresubmitError, FlowSubmissionDisabledError
 from .phase_e import PreflightResult, sha256_json
 
@@ -100,6 +101,13 @@ class FlowPreparationPort(Protocol):
     async def readback(self) -> FlowReadback: ...
 
 
+class AgentSettingsTransactionPort(FlowPreparationPort, Protocol):
+    """Additional non-submitting surface needed for shared Agent defaults."""
+
+    async def snapshot_settings(self) -> Mapping[str, object]: ...
+    async def restore_settings(self, settings: Mapping[str, object]) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class FlowPresubmitResult:
     state: str
@@ -113,7 +121,7 @@ class FlowPresubmitResult:
     generate_enabled: bool
 
 
-_SUPPORTED_SURFACES = frozenset({"LABS_CLASSIC", "FLOW_MIGRATED"})
+_SUPPORTED_SURFACES = frozenset({"LABS_CLASSIC", "FLOW_MIGRATED", "CLASSIC", "AGENT_ONLY"})
 _EXPECTED_SETTINGS = (
     "model_id",
     "generation_mode",
@@ -181,7 +189,13 @@ class GoogleFlowProviderAdapter:
         if lane.locked():
             raise FlowPresubmitError("FLOW_LANE_BUSY", "Flow account/project lane is occupied")
         async with lane:
-            profile_dir = request.runtime_state_root / "browser-state" / request.provider_account_id
+            # Live ports expose their repository-resolved auth profile so the
+            # one-lane lease protects the actual persistent browser state.
+            profile_dir = getattr(port, "profile_dir", None)
+            if not isinstance(profile_dir, Path):
+                profile_dir = (
+                    request.runtime_state_root / "browser-state" / request.provider_account_id
+                )
             try:
                 async with ProfileLease(profile_dir):
                     return await self._prepare_locked(request, port, settings, expected_refs)
@@ -222,6 +236,187 @@ class GoogleFlowProviderAdapter:
         surface = await port.inspect_surface()
         if surface not in _SUPPORTED_SURFACES:
             raise FlowPresubmitError("FLOW_SURFACE_CHANGED", "Flow editor surface is unknown")
+
+        if surface == "AGENT_ONLY":
+            return await self._prepare_agent_only_transaction(request, port, settings, references)
+
+        return await self._prepare_after_surface(request, port, settings, references, surface)
+
+    async def _prepare_agent_only_transaction(
+        self,
+        request: FlowPresubmitRequest,
+        port: FlowPreparationPort,
+        settings: Mapping[str, object],
+        references: tuple[ProviderReferenceBinding, ...],
+    ) -> FlowPresubmitResult:
+        snapshot = getattr(port, "snapshot_settings", None)
+        restore = getattr(port, "restore_settings", None)
+        if not callable(snapshot) or not callable(restore):
+            raise FlowPresubmitError(
+                "FLOW_RECOVERY_UNAVAILABLE",
+                "Agent-only preparation requires a settings snapshot and restore port",
+            )
+        transaction_port = cast(AgentSettingsTransactionPort, port)
+
+        journal = AgentSettingsRecoveryJournal(
+            request.runtime_state_root,
+            request.provider_account_id,
+            request.provider_project_id,
+        )
+        recovered_previous = False
+        try:
+            journal.require_clean_or_missing()
+        except RecoveryJournalError:
+            await self._recover_agent_settings(request, port, journal)
+            try:
+                journal.require_clean_or_missing()
+            except RecoveryJournalError as still_dirty:
+                raise FlowPresubmitError(
+                    "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED",
+                    "previous Agent settings could not be verified clean",
+                ) from still_dirty
+            recovered_previous = True
+
+        if recovered_previous:
+            # Recovery may have navigated to a prior project's URL. Re-select and
+            # classify this request's explicitly configured project before work.
+            project = await port.select_project(request.provider_project_id)
+            if project.project_id != request.provider_project_id:
+                raise FlowPresubmitError(
+                    "FLOW_PROJECT_MISMATCH", "request project differs after recovery"
+                )
+            if await port.inspect_surface() != "AGENT_ONLY":
+                raise FlowPresubmitError(
+                    "FLOW_SURFACE_CHANGED", "request project is not on the Agent-only surface"
+                )
+
+        try:
+            original: dict[str, object] = dict(await transaction_port.snapshot_settings())
+            correlation_id = request.prompt_version.scene_prompt_id
+            journal.begin(
+                correlation_id=correlation_id,
+                original_settings=original,
+                intended_settings=dict(settings),
+            )
+        except RecoveryJournalError as exc:
+            raise FlowPresubmitError(
+                "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED",
+                "Agent settings recovery journal could not be safely started",
+            ) from exc
+
+        result: FlowPresubmitResult | None = None
+        operation_error: BaseException | None = None
+        try:
+            result = await self._prepare_after_surface(
+                request, port, settings, references, "AGENT_ONLY"
+            )
+        except BaseException as exc:
+            operation_error = exc
+
+        try:
+            journal.set_state("RESTORING")
+            await asyncio.shield(transaction_port.restore_settings(original))
+            final = await asyncio.shield(port.readback())
+            if final.account_id != request.provider_account_id:
+                raise FlowPresubmitError(
+                    "FLOW_ACCOUNT_MISMATCH", "account changed during Agent settings restore"
+                )
+            if final.project_id != request.provider_project_id:
+                raise FlowPresubmitError(
+                    "FLOW_PROJECT_MISMATCH", "project changed during Agent settings restore"
+                )
+            if final.session_status != "FLOW_SESSION_READY":
+                raise FlowPresubmitError(
+                    final.session_status, "Flow session changed during Agent settings restore"
+                )
+            self._compare_mapping(original, final.settings, "FLOW_SETTING_RESTORE_MISMATCH")
+            journal.set_state("CLEAN")
+        except BaseException as restore_error:
+            raise FlowPresubmitError(
+                "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED",
+                "Agent defaults could not be restored and verified",
+            ) from restore_error
+
+        if operation_error is not None:
+            raise operation_error
+        if result is None:  # defensive: the operation must either return or raise
+            raise FlowPresubmitError(
+                "FLOW_PRESUBMIT_FAILED", "Agent-only preparation returned no result"
+            )
+        return result
+
+    async def _recover_agent_settings(
+        self,
+        request: FlowPresubmitRequest,
+        port: FlowPreparationPort,
+        journal: AgentSettingsRecoveryJournal,
+    ) -> None:
+        """Recover the exact prior project before accepting new account work."""
+        restore = getattr(port, "restore_settings", None)
+        if not callable(restore):
+            raise FlowPresubmitError(
+                "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED",
+                "dirty Agent settings journal has no recovery-capable port",
+            )
+        transaction_port = cast(AgentSettingsTransactionPort, port)
+        try:
+            record = journal.read()
+            if record is None or record.state == "CLEAN":
+                return
+            if record.provider_project_id != request.provider_project_id:
+                raise FlowPresubmitError(
+                    "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED",
+                    "dirty Agent journal belongs to a different pinned project",
+                )
+            session = await port.inspect_session()
+            if session.status != "FLOW_SESSION_READY":
+                raise FlowPresubmitError(session.status, "Flow session is not ready for recovery")
+            if session.account_id != request.provider_account_id:
+                raise FlowPresubmitError("FLOW_ACCOUNT_MISMATCH", "recovery account differs")
+            project = await port.select_project(record.provider_project_id)
+            if project.project_id != record.provider_project_id:
+                raise FlowPresubmitError("FLOW_PROJECT_MISMATCH", "recovery project differs")
+            if await port.inspect_surface() != "AGENT_ONLY":
+                raise FlowPresubmitError(
+                    "FLOW_SURFACE_CHANGED", "recovery surface is not Agent-only"
+                )
+            journal.set_state("RESTORING")
+            await asyncio.shield(transaction_port.restore_settings(record.original_settings))
+            readback = await asyncio.shield(port.readback())
+            if (
+                readback.session_status != "FLOW_SESSION_READY"
+                or readback.account_id != request.provider_account_id
+                or readback.project_id != record.provider_project_id
+            ):
+                raise FlowPresubmitError(
+                    "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED",
+                    "Flow identity did not verify after settings recovery",
+                )
+            self._compare_mapping(
+                record.original_settings,
+                readback.settings,
+                "FLOW_SETTING_RESTORE_MISMATCH",
+            )
+            journal.set_state("CLEAN")
+        except (RecoveryJournalError, FlowPresubmitError) as exc:
+            raise FlowPresubmitError(
+                "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED",
+                "prior Agent defaults remain unverified",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — credentials/browser detail is not surfaced
+            raise FlowPresubmitError(
+                "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED",
+                "prior Agent defaults remain unverified",
+            ) from exc
+
+    async def _prepare_after_surface(
+        self,
+        request: FlowPresubmitRequest,
+        port: FlowPreparationPort,
+        settings: Mapping[str, object],
+        references: tuple[ProviderReferenceBinding, ...],
+        surface: str,
+    ) -> FlowPresubmitResult:
 
         negative_supported = await port.supports_negative_prompt()
         if request.prompt_version.compiled_negative_prompt and not negative_supported:

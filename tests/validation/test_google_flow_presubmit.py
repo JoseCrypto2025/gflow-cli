@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import gflow_cli.v2_runtime.google_flow as flow
+from gflow_cli.v2_runtime.agent_recovery import AgentSettingsRecoveryJournal
 from gflow_cli.v2_runtime.errors import FlowPresubmitError, FlowSubmissionDisabledError
 from gflow_cli.v2_runtime.google_flow import (
     FlowPresubmitRequest,
@@ -111,6 +112,35 @@ class FakePort:
         )
 
 
+class FakeAgentPort(FakePort):
+    def __init__(self) -> None:
+        super().__init__()
+        self.surface = "AGENT_ONLY"
+        self.original_settings: dict[str, object] = {
+            "model_id": "MDL_0001",
+            "generation_mode": "TEXT_TO_VIDEO",
+            "duration_sec": 8,
+            "aspect_ratio": "16:9",
+            "resolution": "720p",
+            "output_count": 1,
+            "audio_mode": "NATIVE",
+            "quality_tier": "STANDARD",
+            "confirm_before_generating": "Always",
+        }
+        self.applied = dict(self.original_settings)
+        self.restore_fails = False
+
+    async def snapshot_settings(self) -> dict[str, object]:
+        self.calls.append("snapshot_settings")
+        return dict(self.applied)
+
+    async def restore_settings(self, settings: dict[str, object]) -> None:
+        self.calls.append("restore_settings")
+        if self.restore_fails:
+            raise RuntimeError("restore failed")
+        self.applied = dict(settings)
+
+
 def request_for(
     tmp_path: Path, *, references: tuple[ProviderReferenceBinding, ...] = ()
 ) -> FlowPresubmitRequest:
@@ -189,6 +219,110 @@ async def test_valid_approved_request_reaches_presubmit_ready_without_submission
     with pytest.raises(FlowSubmissionDisabledError) as exc:
         GoogleFlowProviderAdapter.assert_submission_disabled()
     assert exc.value.code == "FLOW_SUBMISSION_DISABLED"
+
+
+@pytest.mark.asyncio
+async def test_agent_only_settings_are_journaled_restored_and_marked_clean(
+    tmp_path: Path,
+) -> None:
+    port = FakeAgentPort()
+    request = request_for(tmp_path)
+    outcome = await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
+    journal = AgentSettingsRecoveryJournal(
+        request.runtime_state_root, request.provider_account_id, request.provider_project_id
+    )
+
+    assert outcome.state == "FLOW_PRESUBMIT_READY"
+    assert port.calls.index("snapshot_settings") < port.calls.index("apply_settings")
+    assert port.calls.index("apply_settings") < port.calls.index("restore_settings")
+    assert port.applied == port.original_settings
+    assert journal.read() is not None
+    assert journal.read().state == "CLEAN"
+    assert "FLOW_SUBMISSION_ENABLED" not in dir(port)
+
+
+@pytest.mark.asyncio
+async def test_agent_only_hold_restores_settings_and_cleans_journal(tmp_path: Path) -> None:
+    port = FakeAgentPort()
+    port.generate_present = False
+    request = request_for(tmp_path)
+
+    with pytest.raises(FlowPresubmitError) as exc:
+        await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
+
+    journal = AgentSettingsRecoveryJournal(
+        request.runtime_state_root, request.provider_account_id, request.provider_project_id
+    )
+    assert exc.value.code == "FLOW_GENERATE_CONTROL_MISSING"
+    assert port.applied == port.original_settings
+    assert journal.read() is not None and journal.read().state == "CLEAN"
+
+
+@pytest.mark.asyncio
+async def test_agent_only_restore_failure_leaves_recovery_journal_blocking(
+    tmp_path: Path,
+) -> None:
+    port = FakeAgentPort()
+    port.restore_fails = True
+    request = request_for(tmp_path)
+
+    with pytest.raises(FlowPresubmitError) as exc:
+        await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
+
+    journal = AgentSettingsRecoveryJournal(
+        request.runtime_state_root, request.provider_account_id, request.provider_project_id
+    )
+    assert exc.value.code == "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED"
+    assert journal.read() is not None and journal.read().state == "RESTORING"
+
+
+@pytest.mark.asyncio
+async def test_agent_only_startup_recovers_dirty_defaults_before_new_work(
+    tmp_path: Path,
+) -> None:
+    port = FakeAgentPort()
+    request = request_for(tmp_path)
+    original = dict(port.original_settings)
+    dirty = {**original, "aspect_ratio": "9:16"}
+    journal = AgentSettingsRecoveryJournal(
+        request.runtime_state_root, request.provider_account_id, request.provider_project_id
+    )
+    journal.begin(
+        correlation_id="prior-run-1",
+        original_settings=original,
+        intended_settings=dirty,
+    )
+    port.applied = dirty
+
+    outcome = await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
+
+    assert outcome.state == "FLOW_PRESUBMIT_READY"
+    assert port.calls.index("restore_settings") < port.calls.index("snapshot_settings")
+    assert port.applied == original
+    assert journal.read() is not None and journal.read().state == "CLEAN"
+
+
+@pytest.mark.asyncio
+async def test_agent_only_dirty_journal_for_other_project_blocks_without_navigation(
+    tmp_path: Path,
+) -> None:
+    port = FakeAgentPort()
+    request = request_for(tmp_path)
+    journal = AgentSettingsRecoveryJournal(
+        request.runtime_state_root, request.provider_account_id, "prior-project"
+    )
+    journal.begin(
+        correlation_id="prior-run-1",
+        original_settings=dict(port.original_settings),
+        intended_settings={**port.original_settings, "aspect_ratio": "9:16"},
+    )
+
+    with pytest.raises(FlowPresubmitError) as exc:
+        await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
+
+    assert exc.value.code == "FLOW_ACCOUNT_STATE_RECOVERY_REQUIRED"
+    assert "restore_settings" not in port.calls
+    assert journal.read() is not None and journal.read().state == "DIRTY"
 
 
 @pytest.mark.parametrize("status", ["VALIDATED", "SUPERSEDED", "HOLD"])

@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import pytest
+
+from gflow_cli.v2_runtime.errors import FlowPresubmitError
+from gflow_cli.v2_runtime.live_flow import (
+    GoogleFlowAgentOnlyPort,
+    classify_agent_surface_evidence,
+)
+
+
+def _port() -> GoogleFlowAgentOnlyPort:
+    return GoogleFlowAgentOnlyPort(
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_account_id="PVA_0001",
+        provider_project_id="34e60953-e534-46e9-ac65-993893e61065",
+        project_name="AI Video Automation V2 - TEST",
+        model_display_names={"MDL_0001": "Veo 3.1 - Lite"},
+    )
+
+
+def test_live_port_resolves_repository_owned_profile_and_exposes_no_submit_api() -> None:
+    port = _port()
+
+    assert port.profile_dir.name == "profile_gflow-v2-test"
+    assert port.profile_dir.is_absolute()
+    assert not any(
+        hasattr(port, name)
+        for name in ("submit", "generate", "click_generate", "send_generation_request")
+    )
+
+
+def test_live_port_rejects_personal_or_unmapped_auth_profile_names() -> None:
+    with pytest.raises(ValueError, match="not mapped"):
+        GoogleFlowAgentOnlyPort(
+            auth_profile_key="AVA",
+            provider_account_id="PVA_0001",
+            provider_project_id="34e60953-e534-46e9-ac65-993893e61065",
+            project_name="AI Video Automation V2 - TEST",
+            model_display_names={"MDL_0001": "Veo 3.1 - Lite"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("trigger_present", "trigger_visible", "agent_panel_visible", "mode_chip_present", "expected"),
+    [
+        (True, True, False, True, "CLASSIC"),
+        (True, False, True, False, "AGENT_ONLY"),
+        (True, False, True, True, "UNKNOWN"),
+        (False, False, True, False, "UNKNOWN"),
+        (True, False, False, False, "UNKNOWN"),
+    ],
+)
+def test_surface_resolver_requires_known_classic_or_agent_signature(
+    trigger_present: bool,
+    trigger_visible: bool,
+    agent_panel_visible: bool,
+    mode_chip_present: bool,
+    expected: str,
+) -> None:
+    assert (
+        classify_agent_surface_evidence(
+            trigger_present=trigger_present,
+            trigger_visible=trigger_visible,
+            agent_panel_visible=agent_panel_visible,
+            mode_chip_present=mode_chip_present,
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_port_rejects_unmapped_parameter_before_browser_mutation() -> None:
+    port = _port()
+
+    with pytest.raises(FlowPresubmitError) as exc:
+        await port.apply_settings({"duration_sec": 8})
+
+    assert exc.value.code == "FLOW_AGENT_SETTING_UNSUPPORTED"
+    assert port._context is None
+
+
+@pytest.mark.asyncio
+async def test_agent_port_supports_only_text_to_video_contract() -> None:
+    port = _port()
+
+    with pytest.raises(FlowPresubmitError) as exc:
+        await port.apply_settings({"generation_mode": "FIRST_FRAME_TO_VIDEO"})
+
+    assert exc.value.code == "FLOW_AGENT_MODE_UNSUPPORTED"
+    assert port._context is None
