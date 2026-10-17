@@ -16,7 +16,21 @@ class ServiceType(StrEnum):
     TTS = "TTS"
 
 
+_SERVICE_TYPE_ALIASES = {"VIDEO_GENERATION_PLATFORM": ServiceType.VIDEO_GENERATION}
+
+
+def _service_type(provider_type: str) -> ServiceType | None:
+    """Normalize the existing Master label to the V2 service contract."""
+    if provider_type in _SERVICE_TYPE_ALIASES:
+        return _SERVICE_TYPE_ALIASES[provider_type]
+    try:
+        return ServiceType(provider_type)
+    except ValueError:
+        return None
+
+
 class ProviderAdapter(Protocol):
+    provider_id: str
     provider_type: str
 
     def prepare_request(self, profile_id: str, payload: dict[str, object]) -> dict[str, object]: ...
@@ -40,7 +54,7 @@ class ResolvedRoute:
 
 
 class ProviderRouter:
-    """Resolve all routing from Master data; adapter keys remain semantic."""
+    """Resolve adapters by stable provider identity and verify service type."""
 
     def __init__(
         self, catalog: MasterCatalog, adapters: dict[str, ProviderAdapter], environment: str
@@ -55,16 +69,20 @@ class ProviderRouter:
         profile, provider, account, model = resolve_profile(
             self.catalog, profile_id, self.environment
         )
-        if provider.provider_type != service_type.value:
+        if _service_type(provider.provider_type) != service_type:
             raise CatalogResolutionError(
                 "Provider_Master.Provider_Type does not match requested service type"
             )
-        adapter = self.adapters.get(provider.provider_type)
+        adapter = self.adapters.get(provider.provider_id)
         if adapter is None:
-            raise AdapterUnavailableError(f"no adapter registered for {provider.provider_type}")
-        if adapter.provider_type != provider.provider_type:
+            raise AdapterUnavailableError(f"no adapter registered for {provider.provider_id}")
+        if adapter.provider_id != provider.provider_id:
             raise CatalogResolutionError(
-                "registered adapter type does not match provider master data"
+                "registered adapter identity does not match provider master data"
+            )
+        if _service_type(adapter.provider_type) != service_type:
+            raise CatalogResolutionError(
+                "registered adapter service type does not match requested service type"
             )
         return (
             ResolvedRoute(
@@ -83,8 +101,9 @@ class ProviderRouter:
 class ContractOnlyAdapter:
     """Placeholder adapter that does not contact Google Flow or paid APIs."""
 
-    def __init__(self, provider_type: str) -> None:
-        self.provider_type = provider_type
+    def __init__(self, provider_id: str, provider_type: str | None = None) -> None:
+        self.provider_id = provider_id
+        self.provider_type = provider_type or provider_id
 
     def prepare_request(self, profile_id: str, payload: dict[str, object]) -> dict[str, object]:
         raise AdapterUnavailableError("provider execution is disabled in the V2 foundation")

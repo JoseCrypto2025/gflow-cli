@@ -26,6 +26,7 @@ from gflow_cli.v2_runtime.errors import (
     ConfigurationError,
     UnsafePathError,
 )
+from gflow_cli.v2_runtime.google_flow import GoogleFlowProviderAdapter
 from gflow_cli.v2_runtime.legacy_api import LegacyVideoRequest, plan_legacy_request
 from gflow_cli.v2_runtime.lifecycle import upload_verify_then_cleanup
 from gflow_cli.v2_runtime.providers import ContractOnlyAdapter, ProviderRouter, ServiceType
@@ -244,7 +245,7 @@ def test_profile_resolution_rejects_prompt_template_mismatch() -> None:
 
 def test_router_checks_provider_service_type_and_contract_adapter_never_executes() -> None:
     router = ProviderRouter(
-        Catalog(), {"VIDEO_GENERATION": ContractOnlyAdapter("VIDEO_GENERATION")}, "DEV"
+        Catalog(), {"PRV_0001": ContractOnlyAdapter("PRV_0001", "VIDEO_GENERATION")}, "DEV"
     )
     route, _adapter = router.route("GPR_0001", ServiceType.VIDEO_GENERATION)
     assert route.model_id == "MDL_0001"
@@ -252,6 +253,85 @@ def test_router_checks_provider_service_type_and_contract_adapter_never_executes
         router.route("GPR_0001", ServiceType.TTS)
     with pytest.raises(AdapterUnavailableError):
         ContractOnlyAdapter("VIDEO_GENERATION").prepare_request("GPR_0001", {})
+
+
+def test_router_routes_multiple_providers_of_the_same_service_by_provider_id() -> None:
+    google = Catalog()
+    fal = Catalog()
+    fal.provider_row = ProviderRecord("PRV_FAL", "VIDEO_GENERATION", "ACTIVE")
+    fal.account_row = AccountRecord("PVA_FAL", "PRV_FAL", "DEV", "ACTIVE")
+    fal.model_row = ModelRecord("MDL_FAL", "PRV_FAL", "ACTIVE")
+    fal.profile_row = ProfileRecord(
+        "GPR_FAL",
+        "PVA_FAL",
+        "MDL_FAL",
+        "TEXT_TO_VIDEO",
+        "DEV",
+        "test",
+        "ACTIVE",
+        prompt_template_id="PTM_FAL",
+        default_aspect_ratio="16:9",
+        default_duration_sec=8,
+        default_resolution="720p",
+        default_output_count=1,
+        audio_mode="NATIVE",
+        quality_tier="STANDARD",
+    )
+    fal.prompt_row = PromptTemplateRecord(
+        "PTM_FAL", "ACTIVE", "PRV_FAL", "MDL_FAL", "TEXT_TO_VIDEO"
+    )
+    adapters = {
+        "PRV_0001": ContractOnlyAdapter("PRV_0001", "VIDEO_GENERATION"),
+        "PRV_FAL": ContractOnlyAdapter("PRV_FAL", "VIDEO_GENERATION"),
+    }
+    google_route, google_adapter = ProviderRouter(google, adapters, "DEV").route(
+        "GPR_0001", ServiceType.VIDEO_GENERATION
+    )
+    fal_route, fal_adapter = ProviderRouter(fal, adapters, "DEV").route(
+        "GPR_FAL", ServiceType.VIDEO_GENERATION
+    )
+    assert google_route.provider_id == "PRV_0001" and google_adapter is adapters["PRV_0001"]
+    assert fal_route.provider_id == "PRV_FAL" and fal_adapter is adapters["PRV_FAL"]
+
+
+def test_google_flow_adapter_is_selected_by_its_provider_id_only() -> None:
+    live_sheet_catalog = Catalog()
+    live_sheet_catalog.provider_row = ProviderRecord(
+        "PRV_0001", "VIDEO_GENERATION_PLATFORM", "ACTIVE"
+    )
+    google_adapter = GoogleFlowProviderAdapter("PRV_0001")
+    route, adapter = ProviderRouter(live_sheet_catalog, {"PRV_0001": google_adapter}, "DEV").route(
+        "GPR_0001", ServiceType.VIDEO_GENERATION
+    )
+    assert route.provider_id == "PRV_0001" and adapter is google_adapter
+
+    fal = Catalog()
+    fal.provider_row = ProviderRecord("PRV_FAL", "VIDEO_GENERATION", "ACTIVE")
+    fal.account_row = AccountRecord("PVA_FAL", "PRV_FAL", "DEV", "ACTIVE")
+    fal.model_row = ModelRecord("MDL_FAL", "PRV_FAL", "ACTIVE")
+    fal.profile_row = ProfileRecord(
+        "GPR_FAL",
+        "PVA_FAL",
+        "MDL_FAL",
+        "TEXT_TO_VIDEO",
+        "DEV",
+        "test",
+        "ACTIVE",
+        prompt_template_id="PTM_FAL",
+        default_aspect_ratio="16:9",
+        default_duration_sec=8,
+        default_resolution="720p",
+        default_output_count=1,
+        audio_mode="NATIVE",
+        quality_tier="STANDARD",
+    )
+    fal.prompt_row = PromptTemplateRecord(
+        "PTM_FAL", "ACTIVE", "PRV_FAL", "MDL_FAL", "TEXT_TO_VIDEO"
+    )
+    with pytest.raises(AdapterUnavailableError):
+        ProviderRouter(fal, {"PRV_0001": google_adapter}, "DEV").route(
+            "GPR_FAL", ServiceType.VIDEO_GENERATION
+        )
 
 
 def test_legacy_overlong_duration_requires_explicit_scene_plan() -> None:

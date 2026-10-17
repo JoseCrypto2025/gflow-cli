@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Google Flow V2 presubmit foundation.** Added Provider_ID-based adapter routing and a
+  submission-free, approval-gated Flow preparation contract with exact project, setting,
+  reference, and prompt readbacks. Generation remains disabled.
 - **Provider-neutral V2 prompt building and preflight foundation.** Added a deterministic,
   read-only Phase E compiler for resolving approved generation profiles, validating scene
   inputs and references, rendering whitelisted prompt templates, and producing hashes and

@@ -36,3 +36,20 @@ class CatalogResolutionError(V2RuntimeError):
 
 class AdapterUnavailableError(V2RuntimeError):
     code = "PROVIDER_ADAPTER_UNAVAILABLE"
+
+
+class FlowPresubmitError(V2RuntimeError):
+    """Deterministic hold or failure from the non-submitting Flow presubmit path."""
+
+    code = "FLOW_PRESUBMIT_HOLD"
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class FlowSubmissionDisabledError(FlowPresubmitError):
+    code = "FLOW_SUBMISSION_DISABLED"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(self.code, message)
