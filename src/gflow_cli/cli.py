@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import uuid
+from typing import NoReturn
 
 import click
 import structlog
@@ -401,6 +402,132 @@ def auth_status(profile: str | None) -> None:
         sys.exit(1)
     who = f" as [bold]{escape(status_result.user_email)}[/bold]" if status_result.user_email else ""
     console.print(f"[green]Flow session verified{who}.[/green]")
+
+
+@auth.command("renew")
+@click.option("--profile", default=None, help="Profile to renew. Defaults to the default profile.")
+@click.option("--all", "renew_all", is_flag=True, help="Renew every saved profile, one at a time.")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON instead of text.")
+def auth_renew(profile: str | None, renew_all: bool, as_json: bool) -> None:
+    """Refresh saved sessions headlessly, without signing in again.
+
+    Opens each profile in a hidden browser, loads Flow and labs.google so Google
+    and Flow can rotate their session cookies, then verifies the session like
+    `gflow auth status`. No credits are spent. A session Google has revoked, or
+    an account Flow holds at its public /about page, still needs `gflow auth login`.
+
+    Exits 0 when every renewed profile verifies, 1 otherwise. A profile that
+    another gflow process is using is skipped, not failed.
+    """
+    import json
+
+    from playwright.async_api import Error as PlaywrightError
+
+    from gflow_cli.auth import renew
+    from gflow_cli.auth.verification import FlowSessionOutcome
+    from gflow_cli.errors import ProfileEngineDowngradeError, ProfileLockedError
+
+    def _refuse(message: str, code: int) -> NoReturn:
+        if as_json:
+            click.echo(json.dumps({"status": "error", "error": message}))
+        else:
+            console.print(
+                f"[red]{escape(message)}[/red]" if code == 2 else f"[yellow]{message}[/yellow]"
+            )
+        sys.exit(code)
+
+    if renew_all and profile:
+        _refuse("Use either --profile or --all, not both.", 2)
+    if renew_all:
+        names = [p.name for p in profile_store.list_profiles() if p.cookies_present]
+        if not names:
+            _refuse("No profiles with a saved session.", 1)
+    else:
+        names = [profile or _resolve_or_exit()]
+
+    authenticated = FlowSessionOutcome.AUTHENTICATED.value
+    results: list[dict[str, str | None]] = []
+    for name in names:
+        row: dict[str, str | None] = {"profile": name, "result": "", "email": None, "hint": None}
+        results.append(row)
+        s = auth_mod.status(name)
+        if not (s["exists"] and s["cookies_present"]):
+            row["result"] = FlowSessionOutcome.NO_SESSION.value
+            continue
+        if not as_json:
+            console.print(f"[dim]Renewing {escape(name)}...[/dim]")
+        try:
+            renewal = asyncio.run(renew.renew_profile(auth_mod.profile_dir(name)))
+        except ProfileLockedError:
+            row["result"] = "in_use"
+            continue
+        except ProfileEngineDowngradeError as exc:
+            row["result"] = "engine_downgrade"
+            row["hint"] = exc.remediation_hint
+            continue
+        except PlaywrightError as exc:
+            # The browser never started: the user's own Chrome holds the profile, or
+            # the channel is not installed. One profile's failure must not drop the
+            # rows already collected.
+            row["result"] = "launch_error"
+            row["hint"] = (
+                f"The browser could not start ({type(exc).__name__}). "
+                "Close any Chrome window using this profile and retry."
+            )
+            continue
+        row["email"] = renewal.verdict.user_email
+        row["result"] = renewal.result
+
+    failed = any(r["result"] not in (authenticated, "in_use") for r in results)
+    if as_json:
+        click.echo(json.dumps(results))
+        sys.exit(1 if failed else 0)
+
+    about = "see KNOWN_ISSUES.md, 'Every command lands on flow.google.com/about'"
+    for r in results:
+        name = escape(str(r["profile"]))
+        if r["result"] == authenticated:
+            who = f" as [bold]{escape(r['email'])}[/bold]" if r["email"] else ""
+            console.print(f"[green]{name}: session renewed and verified{who}.[/green]")
+        elif r["result"] == "in_use":
+            console.print(f"[dim]{name}: in use by another gflow process — skipped.[/dim]")
+        elif r["result"] in ("engine_downgrade", "launch_error"):
+            reason = (
+                "profile was written by a newer browser"
+                if r["result"] == "engine_downgrade"
+                else "the browser could not start"
+            )
+            console.print(f"[yellow]{name}: {reason} — skipped.[/yellow]")
+            if r["hint"]:
+                console.print(f"[dim]{escape(r['hint'])}[/dim]")
+        elif r["result"] == "public_landing":
+            console.print(
+                f"[yellow]{name}: not renewed — Flow is holding this account at its public "
+                f"page, waiting for Google to confirm it's you.[/yellow] Run "
+                f'[bold]gflow auth login --profile {name}[/bold] and finish the "Confirm '
+                f"it's you\" step ({about}).",
+            )
+        elif r["result"] in ("labs_stale", "labs_unverified"):
+            reason = (
+                "labs.google did not finish its silent sign-in in time"
+                if r["result"] == "labs_stale"
+                else "labs.google did not return a readable session"
+            )
+            console.print(
+                f"[yellow]{name}: not renewed — {reason}.[/yellow] Retry later; if it "
+                f"persists, run [bold]gflow auth login --profile {name}[/bold].",
+            )
+        elif r["result"] == FlowSessionOutcome.VERIFICATION_ERROR.value:
+            console.print(
+                f"[yellow]{name}: could not verify the session.[/yellow] Check network "
+                "connectivity and retry; re-login is only needed if the session is dead.",
+            )
+        else:
+            console.print(
+                f"[yellow]{name}: session could not be renewed.[/yellow] "
+                f"Run [bold]gflow auth login --profile {name}[/bold].",
+            )
+    sys.exit(1 if failed else 0)
 
 
 @auth.command("list")

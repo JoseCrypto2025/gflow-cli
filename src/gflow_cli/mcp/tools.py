@@ -1280,24 +1280,29 @@ async def gflow_list_tools() -> dict[str, Any]:
     name="gflow_get_credits",
     description=(
         "Read the current Google Flow credit balance for one saved profile or all profiles. "
-        "This is read-only and spends no credits. Set all_profiles=true when choosing an "
-        "account for generation; partial profile failures remain visible in the result."
+        "Spends no credits. Set all_profiles=true when choosing an "
+        "account for generation; partial profile failures remain visible in the result. "
+        "Set refresh=true to renew an expired session (rewrites that profile's saved "
+        "cookies) in a headless browser and ask again "
+        "(slower — one Chrome launch per expired profile; a revoked session still needs "
+        "`gflow auth login`)."
     ),
 )
 @_guarded
 async def gflow_get_credits(
     profile: str = _DEFAULT_PROFILE,
     all_profiles: bool = False,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Inspect current Flow credits through the shared CLI service."""
 
     if all_profiles:
-        return await inspect_all_credit_profiles()
+        return await inspect_all_credit_profiles(refresh=refresh)
     resolved = _resolve_and_validate_profile(profile)
     if isinstance(resolved, dict):
         return resolved
     async with _profile_lock(resolved):
-        return await inspect_credit_profile(resolved)
+        return await inspect_credit_profile(resolved, refresh=refresh)
 
 
 def _character_to_dict(char: Any) -> dict[str, Any]:
