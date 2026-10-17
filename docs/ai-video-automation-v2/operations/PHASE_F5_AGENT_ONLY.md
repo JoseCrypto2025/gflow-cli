@@ -101,5 +101,23 @@ attempt/provider identity, never only card order, title, or filename.
 The Phase F kill switch remains active. The F5 port has no submission method.
 Phase F.5 may inspect Generate presence/enabled state, but it must never click,
 keyboard-submit, invoke a generation RPC, approve credits, download output, or
-create a production/scene job execution attempt. No Phase G work is started by
-this document.
+create a production/scene job execution attempt.
+
+## Overnight checkpoint — 2026-10-18
+
+- D2 is `HOLD` at `UNKNOWN_SUBMISSION_STATE` after one Generate click without
+  attributable acceptance evidence. Do not retry and do not claim D2 PASS.
+- D3 VPS installation is verified for the exact D2-tested application SHA.
+- D4 is `WAITING_FOR_HUMAN_LOGIN`; the isolated production auth profile,
+  production Flow project, and production provider account have not been
+  verified. The production login handoff is documented in
+  `VPS_BROWSER_RUNTIME.md`.
+- D5 has an offline-only production snapshot resolver and invocation wrapper.
+  It calls `prepare_live_flow()` only and is not yet run live.
+- D7 has an offline-only idempotent transaction contract and schema-shaped
+  serializers. The in-memory store is test-only; no live transaction backend
+  exists and no Sheets rows were written.
+
+The checkout contains no Sheet transaction writer or Google Drive storage I/O.
+Offline D5/D7 code must not be reported as live PASS. Do not enter D8, modify
+n8n, or start social posting.

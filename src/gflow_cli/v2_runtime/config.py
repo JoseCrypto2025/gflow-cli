@@ -23,6 +23,15 @@ class RuntimeSettings:
     log_level: str = "INFO"
 
 
+def _validate_disjoint_roots(*roots: tuple[str, Path]) -> None:
+    """Reject overlapping roots so temporary cleanup cannot reach durable state."""
+    resolved = [(name, path.resolve(strict=False)) for name, path in roots]
+    for index, (name, path) in enumerate(resolved):
+        for other_name, other_path in resolved[index + 1 :]:
+            if path == other_path or path in other_path.parents or other_path in path.parents:
+                raise ConfigurationError(f"{name} and {other_name} roots must be disjoint")
+
+
 def load_runtime_settings(env: Mapping[str, str] | None = None) -> RuntimeSettings:
     """Parse V2 settings without reading or resolving any secret values."""
     values = os.environ if env is None else env
@@ -58,6 +67,7 @@ def load_runtime_settings(env: Mapping[str, str] | None = None) -> RuntimeSettin
             raise ConfigurationError(f"{label} root must be an absolute POSIX path")
         if path == Path("/"):
             raise ConfigurationError(f"{label} root cannot be filesystem root")
+    _validate_disjoint_roots(("state", root), ("temp", temp), ("log", logs))
     try:
         min_free = float(values.get("MIN_FREE_DISK_GB", "10"))
         failed_hours = int(values.get("KEEP_FAILED_JOB_HOURS", "72"))

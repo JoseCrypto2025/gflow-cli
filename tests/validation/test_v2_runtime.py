@@ -97,6 +97,28 @@ def test_environment_settings_resolve_development_defaults() -> None:
     assert settings.environment == "development" and settings.min_free_disk_gb == 20
 
 
+@pytest.mark.parametrize(
+    ("state", "temp", "logs"),
+    [
+        ("state", "state", "logs"),
+        ("state", "state/temp", "logs"),
+        ("state", "temp", "temp/logs"),
+    ],
+)
+def test_environment_settings_reject_overlapping_roots(
+    tmp_path: Path, state: str, temp: str, logs: str
+) -> None:
+    with pytest.raises(ConfigurationError, match="roots must be disjoint"):
+        load_runtime_settings(
+            {
+                "RUNTIME_ENV": "development",
+                "RUNTIME_STATE_ROOT": str(tmp_path / state),
+                "TEMP_ROOT": str(tmp_path / temp),
+                "LOG_ROOT": str(tmp_path / logs),
+            }
+        )
+
+
 def test_production_environment_rejects_windows_drive_roots() -> None:
     with pytest.raises(ConfigurationError):
         load_runtime_settings(

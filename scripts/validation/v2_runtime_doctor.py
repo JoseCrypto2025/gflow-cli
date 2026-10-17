@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
+import re
 import shutil
 import socket
 import stat as stat_module
@@ -28,28 +29,49 @@ def _check(name: str, ok: bool, detail: str) -> dict[str, Any]:
     return {"name": name, "status": "PASS" if ok else "FAIL", "detail": detail}
 
 
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+
+
+def _application_sha(root: Path, expected_sha: str) -> tuple[bool, str]:
+    """Verify the installed tree is the explicitly expected, clean application."""
+    expected = expected_sha.strip().lower()
+    if not _SHA_RE.fullmatch(expected):
+        return False, "expected SHA is missing or invalid"
+    code, observed = _run(["git", "-C", str(root), "rev-parse", "HEAD"])
+    if code == 0:
+        status_code, status = _run(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"]
+        )
+        if status_code != 0 or status:
+            return False, "application checkout is dirty or unreadable"
+        observed = observed.lower()
+    else:
+        try:
+            manifest = json.loads((root / ".gflow-v2-build.json").read_text(encoding="utf-8"))
+            observed = str(manifest["commit_sha"]).lower()
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return False, "application SHA is unavailable"
+    if not _SHA_RE.fullmatch(observed) or observed != expected:
+        return False, "installed application SHA does not match expected SHA"
+    return True, observed
+
+
 def run_doctor() -> dict[str, Any]:
     """Inspect the deployment/runtime without reading auth profile contents."""
     checks: list[dict[str, Any]] = []
+    env = os.environ
     root = Path(os.environ.get("GFLOW_APP_ROOT", Path(__file__).resolve().parents[2])).resolve()
     app_src = root / "src"
     if app_src.is_dir() and str(app_src) not in sys.path:
         sys.path.insert(0, str(app_src))
-    code, sha = _run(["git", "-C", str(root), "rev-parse", "HEAD"])
-    if code != 0:
-        try:
-            manifest = json.loads((root / ".gflow-v2-build.json").read_text(encoding="utf-8"))
-            sha = str(manifest["commit_sha"])
-            code = 0
-        except (OSError, KeyError, TypeError, json.JSONDecodeError):
-            sha = "unavailable"
-    checks.append(_check("application_sha", code == 0, sha if code == 0 else "unavailable"))
+    sha_ok, sha_detail = _application_sha(root, env.get("GFLOW_EXPECTED_APP_SHA", ""))
+    checks.append(_check("application_sha", sha_ok, sha_detail))
 
     py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     checks.append(_check("python", sys.version_info >= (3, 11), py))
     uv = shutil.which("uv")
-    uv_version = _run([uv, "--version"])[1] if uv else "uv not found"
-    checks.append(_check("uv", uv is not None, uv_version))
+    uv_code, uv_version = _run([uv, "--version"]) if uv else (1, "uv not found")
+    checks.append(_check("uv", uv is not None and uv_code == 0, uv_version))
 
     try:
         import gflow_cli  # noqa: F401
@@ -88,12 +110,24 @@ def run_doctor() -> dict[str, Any]:
         _check("xvfb", xvfb_code == 0, "xvfb-run -a true" if xvfb_code == 0 else xvfb_detail)
     )
 
-    env = os.environ
     try:
         from gflow_cli.v2_runtime.config import load_runtime_settings
 
         settings = load_runtime_settings(env)
-        checks.append(_check("runtime_configuration", True, settings.environment))
+        prod_ok = (
+            settings.environment == "production"
+            and settings.storage_provider == "google-drive"
+            and settings.runtime_state_root == Path("/var/lib/gflow")
+            and settings.temp_root == Path("/var/tmp/gflow")
+            and settings.log_root == Path("/var/log/gflow")
+        )
+        checks.append(
+            _check(
+                "runtime_configuration",
+                prod_ok,
+                "production roots and Google Drive required" if not prod_ok else "production",
+            )
+        )
     except Exception as exc:
         checks.append(_check("runtime_configuration", False, type(exc).__name__))
     roots = {
@@ -104,14 +138,16 @@ def run_doctor() -> dict[str, Any]:
     required_owner = env.get("GFLOW_SERVICE_USER", "gflow")
     for name, path in roots.items():
         try:
-            stat = path.stat()
+            stat = path.lstat()
             owner = __import__("pwd").getpwuid(stat.st_uid).pw_name
-            safe_mode = (stat.st_mode & 0o022) == 0
+            mode = stat_module.S_IMODE(stat.st_mode)
+            safe_mode = (mode & 0o700) == 0o700 and (mode & 0o022) == 0
+            real_directory = path.is_dir() and not path.is_symlink()
             checks.append(
                 _check(
                     f"{name}_root",
-                    path.is_dir() and owner == required_owner and safe_mode,
-                    f"exists={path.is_dir()}, owner={owner}, mode={stat.st_mode & 0o777:o}",
+                    real_directory and owner == required_owner and safe_mode,
+                    f"exists={real_directory}, owner={owner}, mode={mode:o}",
                 )
             )
         except OSError:
@@ -123,11 +159,14 @@ def run_doctor() -> dict[str, Any]:
         ("recovery_state_path", recovery_root),
     ):
         try:
-            dir_stat = path.stat()
+            dir_stat = path.lstat()
             owner = __import__("pwd").getpwuid(dir_stat.st_uid).pw_name
-            restricted = stat_module.S_IMODE(dir_stat.st_mode) == 0o700
-            parent_ok = path.is_dir() and owner == required_owner and restricted
-            detail = f"exists=true, owner={owner}, mode={stat_module.S_IMODE(dir_stat.st_mode):o}"
+            mode = stat_module.S_IMODE(dir_stat.st_mode)
+            restricted = mode == 0o700
+            parent_ok = (
+                path.is_dir() and not path.is_symlink() and owner == required_owner and restricted
+            )
+            detail = f"exists=true, owner={owner}, mode={mode:o}"
         except OSError:
             parent_ok = False
             detail = "missing or unreadable"

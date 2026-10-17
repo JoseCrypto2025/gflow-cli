@@ -74,6 +74,7 @@ sudo -u gflow env \
   RUNTIME_ENV=production STORAGE_PROVIDER=google-drive \
   RUNTIME_STATE_ROOT=/var/lib/gflow TEMP_ROOT=/var/tmp/gflow \
   LOG_ROOT=/var/log/gflow GFLOW_APP_ROOT=/opt/gflow-v2 \
+  GFLOW_EXPECTED_APP_SHA=86b172ba2987945913cbb8fcc174ac6de6609392 \
   /opt/gflow-v2/.venv/bin/python /opt/gflow-v2-ops/v2_runtime_doctor.py
 ```
 
@@ -81,3 +82,59 @@ The doctor prints bounded status details only. It checks the application SHA,
 Python/uv/imports, the locked Playwright minor, Chrome/Xvfb/FFmpeg/ffprobe,
 runtime ownership and permissions, browser/recovery roots, free disk, and the
 planned loopback port. It never reads browser profile contents or submits work.
+
+The expected SHA must be the exact reviewed application commit; the doctor
+fails if the checkout is dirty, the installed archive manifest does not match,
+or the SHA is absent. It accepts only the production Google Drive runtime and
+the three documented, pairwise-disjoint roots. Root paths must be real writable
+directories owned by the service account, not symlinks.
+
+## D3/D4 checkpoint — 2026-10-18
+
+D3 installation was completed against the current host after a fresh read-only
+audit. The deployed application is the exact D2-tested commit
+`86b172ba2987945913cbb8fcc174ac6de6609392` at `/opt/gflow-v2`; the runtime
+doctor from operations commit `715b3f319efb0581e1da9c146f5e07a3cdb3bd64` was
+installed separately under `/opt/gflow-v2-ops`. Python, the locked Playwright
+1.61 line, Chrome, Xvfb, FFmpeg/ffprobe, roots, free disk, and loopback-port
+checks passed. The doctor was rerun as the service user. No V2 worker or V2
+service was started, and protected containers/listeners were unchanged.
+
+D4 remains `WAITING_FOR_HUMAN_LOGIN`. The independent `gflow-prod` profile has
+not been authenticated, and no PROD project or `PROVIDER_ACCOUNT_MASTER` row
+has been verified or created. The TEST profile and personal browser profiles
+were not copied or reused. D5 stays offline until a human completes login and
+the account/project identity is verified. Do not use the presubmit wrapper with
+an unverified snapshot.
+
+## D5 presubmit wrapper — offline implementation
+
+`scripts/operations/vps_flow_presubmit.py` accepts an input JSON snapshot with
+`spreadsheet_id`, UTC `read_at`, and table-name-to-row-array `tables`. It rejects
+snapshots older than five minutes, the wrong spreadsheet, secret-shaped field
+names, TEST-linked profiles, missing PROD account/project/auth mapping, stale
+approved prompts, and any Phase E mismatch before calling the browser. The
+snapshot must be produced from a fresh read of the approved spreadsheet and
+kept mode 0600. No live snapshot-export adapter is implemented, so a timestamp
+inside the JSON is not proof of a live Sheet read by itself.
+
+The wrapper requires `RUNTIME_ENV=production`, explicit runtime roots, and
+`GFLOW_EXPECTED_GOOGLE_EMAIL`; it calls the F5 `prepare_live_flow()` path only.
+It never performs login or calls Phase G. The report always records
+`generate_clicked=false` and `credits_used=0`. A live D5 run is still waiting
+for D4 verification and a trusted current snapshot source.
+
+## D7 transaction coordinator — offline implementation
+
+`gflow_cli.v2_runtime.production_jobs` provides canonical idempotency digests,
+schema-shaped row serializers, append-only Scene Job attempts, compare-and-
+transition guards, and remote-verification-before-cleanup checks. Its
+in-memory store is test-only. No live Google Sheets transaction writer or
+atomic compare-and-set implementation exists, and no Production Job or Scene
+Job rows were written. D7 live remains dependent on D2, D4, D5, and D6 PASS.
+
+D6 production execution is not generalized offline. The current Phase G executor
+and its credit ledger are explicitly D2-scoped, while D2's post-submit credit
+state remains unresolved. Reusing that TEST-only runner or opening a second
+credit ledger could violate cumulative accounting; keep D6 live on HOLD until
+D2 is reconciled and a reviewed production budget path exists.

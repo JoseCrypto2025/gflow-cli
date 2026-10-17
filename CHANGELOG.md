@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VPS F5 presubmit and offline Scene Job transaction contracts.** Added a
+  production-only snapshot resolver that re-runs Phase E and calls the
+  submission-free F5 adapter, plus test-only idempotent job storage, schema
+  serializers, and guarded Scene Job transitions. No Sheet/Drive live adapter
+  or provider generation path was added.
 - **Google Flow V2 presubmit foundation.** Added Provider_ID-based adapter routing and a
   submission-free, approval-gated Flow preparation contract with exact project, setting,
   reference, and prompt readbacks. Generation remains disabled.
