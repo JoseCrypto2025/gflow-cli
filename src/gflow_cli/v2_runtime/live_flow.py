@@ -239,6 +239,10 @@ class GoogleFlowAgentOnlyPort:
         await self._ensure_page()
         return FlowSessionState("FLOW_SESSION_READY", self.provider_account_id)
 
+    async def active_page(self) -> Page:
+        """Expose the repository-owned page to a separate, bound extension port."""
+        return await self._ensure_page()
+
     async def select_project(self, project_id: str) -> FlowProjectState:
         if project_id != self.provider_project_id:
             raise FlowPresubmitError(

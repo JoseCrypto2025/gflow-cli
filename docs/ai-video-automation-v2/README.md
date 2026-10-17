@@ -53,3 +53,15 @@ SCENE_PROMPT_VERSION candidate with status VALIDATED; it does not approve or
 persist the candidate. See [Prompt Builder Architecture](architecture/PROMPT_BUILDER_ARCHITECTURE.md)
 and [Preflight Contract](architecture/PREFLIGHT_CONTRACT.md). The live Sheet
 remains unchanged and the phase ends before provider execution.
+
+## Phase G: controlled local execution foundation
+
+The new Phase G domain controller is distinct from the submission-free F5
+preparation port. It pins each attempt to a fresh approved prompt, records a
+single Generate action, enforces the Bangkok-day 50-credit ceiling, preserves
+settings recovery, and supplies full media and remote-persistence verification
+gates. The live D2 Flow port composes the isolated TEST profile, Agent-only
+settings controls, migrated batchexecute parser, and exact media recovery path.
+The production Drive storage adapter remains fail-closed; D2 persistence uses
+the connected Drive connector with separate remote download/hash verification. See
+[Phase G D2 controlled execution](architecture/PHASE_G_D2_CONTROLLED_EXECUTION.md).
