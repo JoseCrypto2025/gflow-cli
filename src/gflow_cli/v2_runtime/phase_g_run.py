@@ -57,7 +57,7 @@ def build_phase_g_request(
 ) -> PhaseGExecutionRequest:
     """Re-run Phase E from live-read rows and require one exact APPROVED row."""
     catalog = InMemorySceneCatalog(tables)
-    preflight = preflight_scene(catalog, _SCENE_ID, _PROFILE_ID, "development")
+    preflight = preflight_scene(catalog, _SCENE_ID, _PROFILE_ID, "TEST")
     if preflight.status != "PREFLIGHT_PASS" or not preflight.ready_for_provider_adapter:
         raise PhaseGError("PHASE_E_PREFLIGHT_REQUIRED", "fresh Phase E did not pass")
     current = [

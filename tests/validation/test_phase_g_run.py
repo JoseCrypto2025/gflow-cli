@@ -38,9 +38,16 @@ def _prompt_rows() -> list[dict[str, object]]:
     ]
 
 
-def test_d2_request_builder_fails_closed_on_nonmatching_live_prompt(tmp_path: Path) -> None:
+def _d2_test_tables() -> dict[str, list[dict[str, object]]]:
     tables = _fixtures()
-    preflight = preflight_scene(InMemorySceneCatalog(tables), "SCN_000001", "GPR_0001", "DEV")
+    tables["GENERATION_PROFILE_MASTER"][0]["Environment"] = "TEST"
+    tables["PROVIDER_ACCOUNT_MASTER"][0]["Environment"] = "TEST"
+    return tables
+
+
+def test_d2_request_builder_fails_closed_on_nonmatching_live_prompt(tmp_path: Path) -> None:
+    tables = _d2_test_tables()
+    preflight = preflight_scene(InMemorySceneCatalog(tables), "SCN_000001", "GPR_0001", "TEST")
     prompt = _prompt_rows()[0]
     prompt["Compiled_Prompt_Text"] = preflight.compiled_prompt or ""
     prompt["Compiled_Negative_Prompt"] = preflight.compiled_negative_prompt or ""
@@ -61,7 +68,7 @@ def test_d2_request_builder_requires_exactly_one_approved_prompt(tmp_path: Path)
     prompt["Prompt_Status"] = "SUPERSEDED"
     with pytest.raises(PhaseGError, match="exactly one current APPROVED"):
         build_phase_g_request(
-            _fixtures(),
+            _d2_test_tables(),
             [prompt],
             d2_run_id="D2_test-run-0001",
             runtime_state_root=tmp_path / "state",
