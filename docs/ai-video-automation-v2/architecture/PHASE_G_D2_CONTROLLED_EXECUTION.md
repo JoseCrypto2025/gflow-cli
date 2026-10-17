@@ -24,6 +24,12 @@ attempt ledger. The fresh confirmation ID and quote are recorded before
 approval so a later observer can reconcile that same attempt. A pending
 unrelated job blocks the attempt.
 
+The live Flow port requires an expected account email. It compares that value
+to the repository auth verifier's observed Google identity before the browser
+can reach the D2 generation boundary. The surface check also fails closed when
+the document/browser locale is not English, because the existing V2 controls
+have not been verified for translated labels.
+
 Settings restoration runs on every path. The journal is marked `CLEAN` only
 after exact readback of the original settings. Any restore or readback failure
 leaves recovery required and blocks the next attempt.
@@ -45,9 +51,10 @@ Definitive no-charge outcomes account for zero. If submission outcome becomes
 ambiguous, the quoted charge—or the remaining daily budget when no quote is
 known—is reserved until reconciliation. New provider execution IDs are retained
 as pending acknowledgments instead of being discarded on observation timeout.
-WAF refusal, unresolved attempts,
-already successful D2 output, and persistence failure prevent another
-submission in that ledger.
+WAF refusal, unresolved attempts, already successful D2 output, and every
+recorded Generate action prevent another paid attempt. An already generated
+media ID may be recovered and validated again under the same D2 run ID; this
+recovery path cannot click Generate.
 
 ## Output attribution and media verification
 
@@ -76,11 +83,14 @@ does not expose a resolution control, and native audio remains informational.
 
 `GoogleDriveStorageProvider` remains a fail-closed placeholder. The local
 `persist_and_verify` helper is a separate contract: it uploads to an injected
-storage port, confirms remote existence/size, trusts a supplied SHA-256 only if
-the adapter provides one, otherwise downloads the remote artifact to a separate
-verification path and recomputes SHA-256. The primary local file is removed
-only after the remote hash matches. The connected Drive connector can create
-the D2 artifact file and stream a separate download for hash verification.
+storage port, confirms remote existence/size, always downloads the remote
+artifact to a separate randomly named verification path, and recomputes SHA-256.
+The same `VerifiedRemoteArtifact` evidence type is produced for a connector
+download via `verify_drive_redownload`. Finalization accepts this evidence,
+checks it against the validated local file and ledger, and removes the primary
+local file only after the remote hash matches. The connected Drive connector
+can create the D2 artifact file and stream a separate download for hash
+verification.
 This task-level path is classified `D2_CONNECTOR_DRIVE_PERSISTENCE`; it does
 not mean the production Drive storage adapter is ready.
 
@@ -95,3 +105,11 @@ rotation, CAPTCHA solving, personal Chrome reuse, production n8n changes, VPS
 deployment, or edits to production Sheets. A post-submit timeout is
 `UNKNOWN_SUBMISSION_STATE`; reconcile the same attempt without clicking
 Generate again.
+
+The one-shot live regression is
+[`tests/e2e/test_phase_g_d2_live.py`](../../../tests/e2e/test_phase_g_d2_live.py).
+It is opt-in via `GFLOW_CLI_E2E_RUN_PHASE_G=I_CONFIRM_ONE_D2_GENERATION`, requires
+`GFLOW_CLI_E2E_PROFILE=gflow-v2-test`, a fresh Master snapshot captured within
+15 minutes, the expected account email, and explicit state/temp paths. It runs
+F5, Phase G, and media validation exactly once; Drive persistence remains a
+separate operator step.

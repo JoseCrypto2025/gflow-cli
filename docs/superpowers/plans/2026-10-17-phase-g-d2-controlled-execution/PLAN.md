@@ -2,7 +2,7 @@
 
 **Goal:** Safely execute at most one approved local Flow T2V attempt, attribute its exact asset, validate and persist it, then stop when the D2 contract is proven.
 
-**Architecture:** Keep Phase F/F5 submission-free. A separate Phase G controller owns the one-action ledger and settings recovery transaction; a concrete Flow adapter composes the existing `GoogleFlowAgentOnlyPort`, migrated batchexecute parser, and exact-media recovery helper. The production Drive provider remains fail-closed; D2 persistence uses the explicitly authorized local Drive UI fallback if needed.
+**Architecture:** Keep Phase F/F5 submission-free. A separate Phase G controller owns the one-action ledger and settings recovery transaction; a concrete Flow adapter composes the existing `GoogleFlowAgentOnlyPort`, migrated batchexecute parser, and exact-media recovery helper. The production Drive provider remains fail-closed; D2 persistence uses the connected Drive connector with a separate redownload/hash verification step.
 
 **Predict verdict:** CAUTION — 8/10.
 
@@ -12,7 +12,7 @@
 2. [x] Implement concrete local Flow adapter by composing the isolated repository Flow port and one browser lifecycle.
 3. [x] Add focused coverage for quote/count/cost, exact provider attribution, WAF, ambiguous timeout, settings restoration, and persistence verification.
 4. [x] Add bounded local D2 orchestration from fresh Phase E through F5, one Phase G attempt, exact download, and full media validation.
-5. [ ] Run repository-required hygiene, docs, Ruff, format, Pyright, schema, build, and full offline tests; repair new-code failures.
+5. [x] Run repository-required hygiene, docs, Ruff, format, Pyright, schema, build, and full offline tests; repair new-code failures.
 6. [ ] Inspect diff/secrets and commit/push `automation-v2`; verify local/remote SHA equality and clean tree.
 7. [ ] Re-read current approved Sheet rows, TEST project state, Drive target, and recovery journal; perform at most one gated local D2 T2V attempt and stop on success, WAF, or uncertainty.
 

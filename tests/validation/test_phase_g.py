@@ -25,6 +25,7 @@ from gflow_cli.v2_runtime.phase_g import (
     PhaseGExecutionRequest,
     validate_phase_g_request,
 )
+from gflow_cli.v2_runtime.phase_g_artifacts import VerifiedRemoteArtifact
 from gflow_cli.v2_runtime.phase_g_live_flow import parse_confirmation_quote
 
 
@@ -437,6 +438,21 @@ async def test_phase_g_waf_is_terminal_and_prevents_another_attempt(tmp_path: Pa
     assert journal.read().state == "CLEAN"  # type: ignore[union-attr]
 
 
+def test_phase_g_allows_only_one_generate_action_across_run_ids(tmp_path: Path) -> None:
+    first_request = phase_g_request(tmp_path)
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(first_request)
+    _capture_ledger_baseline(ledger)
+    ledger.mark_generate_action(first_request.d2_run_id)
+
+    second_request = PhaseGExecutionRequest.from_presubmit(
+        request_for(tmp_path), "D2_test-run-0002"
+    )
+    with pytest.raises(PhaseGError) as stopped:
+        ledger.create_attempt(second_request)
+    assert stopped.value.code == "PHASE_G_PAID_ATTEMPT_ALREADY_STARTED"
+
+
 @pytest.mark.asyncio
 async def test_over_budget_quote_is_not_approved_or_accounted(tmp_path: Path) -> None:
     port = FakeGenerationPort()
@@ -490,20 +506,12 @@ def test_d2_success_requires_remote_retrieval_and_matching_sha(tmp_path: Path) -
     with pytest.raises(PhaseGError) as mismatch:
         ledger.mark_artifact_verified(
             request.d2_run_id,
-            local_sha256="a" * 64,
-            remote_sha256="b" * 64,
-            remote_file_id="drive-file-1",
-            remote_filename="d2-run.mp4",
-            remote_size_bytes=1234,
+            evidence=VerifiedRemoteArtifact("drive-file-1", "d2-run.mp4", 1234, "a" * 64, "b" * 64),
         )
     assert mismatch.value.code == "PHASE_G_REMOTE_VERIFICATION_FAILED"
     row = ledger.mark_artifact_verified(
         request.d2_run_id,
-        local_sha256="a" * 64,
-        remote_sha256="a" * 64,
-        remote_file_id="drive-file-1",
-        remote_filename="d2-run.mp4",
-        remote_size_bytes=1234,
+        evidence=VerifiedRemoteArtifact("drive-file-1", "d2-run.mp4", 1234, "a" * 64, "a" * 64),
     )
     assert row["submission_state"] == "D2_SUCCEEDED"
     assert row["remote_verified"] is True
@@ -512,6 +520,42 @@ def test_d2_success_requires_remote_retrieval_and_matching_sha(tmp_path: Path) -
     with pytest.raises(PhaseGError) as stop:
         ledger.create_attempt(next_request)
     assert stop.value.code == "PHASE_G_SUCCESS_ALREADY_PROVEN"
+
+
+def test_failed_artifact_retrieval_recovers_same_media_without_another_submit(
+    tmp_path: Path,
+) -> None:
+    request = phase_g_request(tmp_path)
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(request)
+    _capture_ledger_baseline(ledger)
+    ledger.mark_generate_action(request.d2_run_id)
+    _observe_ledger_confirmation(ledger, confirmation_id="new-confirmation")
+    ledger.approve_gate(
+        request.d2_run_id,
+        video_count=1,
+        credit_cost=10,
+        confirmation_id="new-confirmation",
+    )
+    ledger.record_state(
+        request.d2_run_id,
+        submission_state="GENERATION_SUCCEEDED",
+        provider_media_id="media-exact-1",
+        provider_project_id=request.provider_project_id,
+    )
+    ledger.record_state(
+        request.d2_run_id,
+        submission_state="PERSISTENCE_FAILED",
+        terminal_state="PERSISTENCE_FAILED",
+        provider_media_id="media-exact-1",
+        provider_project_id=request.provider_project_id,
+    )
+
+    recovered = ledger.record_artifact_recovered(request.d2_run_id)
+
+    assert recovered["submission_state"] == "GENERATION_SUCCEEDED"
+    assert recovered["provider_media_id"] == "media-exact-1"
+    assert recovered["generate_action_count"] == 1
 
 
 @pytest.mark.asyncio

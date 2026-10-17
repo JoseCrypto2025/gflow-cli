@@ -22,6 +22,7 @@ from gflow_cli.errors import WafRejectionError
 from .agent_recovery import AgentSettingsRecoveryJournal, RecoveryJournalError
 from .errors import V2RuntimeError
 from .google_flow import FlowPresubmitRequest, build_agent_only_directive
+from .phase_g_artifacts import VerifiedRemoteArtifact
 
 _RUN_ID_RE = re.compile(r"^D2_[A-Za-z0-9_-]{8,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -901,6 +902,26 @@ class D2DailyCreditLedger:
             rows = cast(list[dict[str, object]], payload["attempts"])
             return tuple({key: value for key, value in row.items()} for row in rows)
 
+    def record_artifact_recovered(self, d2_run_id: str) -> Mapping[str, object]:
+        """Resume the same run after its exact stored media ID is revalidated."""
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            attempt = self._attempt(payload, d2_run_id)
+            if attempt.get("submission_state") not in {
+                "PERSISTENCE_FAILED",
+                "MEDIA_VALIDATION_FAILED",
+            } or not attempt.get("provider_media_id"):
+                raise PhaseGError(
+                    "PHASE_G_ARTIFACT_RECOVERY_REQUIRED",
+                    "only an already generated media identity can be recovered",
+                )
+            attempt["submission_state"] = "GENERATION_SUCCEEDED"
+            attempt["terminal_state"] = None
+            attempt["updated_at"] = _utc_now()
+            return dict(attempt)
+
+        return self._mutate(update)
+
     def accounted_today(self) -> Decimal:
         """Sum reserved or definitively spent D2 credits for the Bangkok date."""
         with self._locked_file():
@@ -910,21 +931,18 @@ class D2DailyCreditLedger:
         self,
         d2_run_id: str,
         *,
-        local_sha256: str,
-        remote_sha256: str,
-        remote_file_id: str,
-        remote_filename: str,
-        remote_size_bytes: int,
+        evidence: VerifiedRemoteArtifact,
     ) -> Mapping[str, object]:
         """Complete D2 only after a retrievable remote copy matches the local file."""
         if (
-            not _SHA256_RE.fullmatch(local_sha256)
-            or not _SHA256_RE.fullmatch(remote_sha256)
-            or local_sha256 != remote_sha256
-            or not remote_file_id.strip()
-            or not remote_filename.strip()
-            or isinstance(remote_size_bytes, bool)
-            or remote_size_bytes <= 0
+            not evidence.remote_verified
+            or not _SHA256_RE.fullmatch(evidence.local_sha256)
+            or not _SHA256_RE.fullmatch(evidence.remote_sha256)
+            or evidence.local_sha256 != evidence.remote_sha256
+            or not evidence.remote_file_id.strip()
+            or not evidence.remote_filename.strip()
+            or isinstance(evidence.size_bytes, bool)
+            or evidence.size_bytes <= 0
         ):
             raise PhaseGError(
                 "PHASE_G_REMOTE_VERIFICATION_FAILED",
@@ -944,11 +962,11 @@ class D2DailyCreditLedger:
                     "exact provider media identity is required before artifact completion",
                 )
             attempt.update(
-                remote_file_id=remote_file_id,
-                remote_filename=remote_filename,
-                remote_size_bytes=remote_size_bytes,
-                local_sha256=local_sha256,
-                remote_redownload_sha256=remote_sha256,
+                remote_file_id=evidence.remote_file_id,
+                remote_filename=evidence.remote_filename,
+                remote_size_bytes=evidence.size_bytes,
+                local_sha256=evidence.local_sha256,
+                remote_redownload_sha256=evidence.remote_sha256,
                 remote_verified=True,
                 submission_state="D2_SUCCEEDED",
                 terminal_state="D2_SUCCEEDED",
@@ -992,6 +1010,16 @@ class D2DailyCreditLedger:
                 raise PhaseGError(
                     "PHASE_G_ARTIFACT_RECOVERY_REQUIRED",
                     "validate and persist the generated artifact before another submit",
+                )
+            generate_count = previous.get("generate_action_count", 0)
+            if isinstance(generate_count, bool) or not isinstance(generate_count, int):
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_INVALID", "stored Generate action count is invalid"
+                )
+            if generate_count > 0:
+                raise PhaseGError(
+                    "PHASE_G_PAID_ATTEMPT_ALREADY_STARTED",
+                    "the authorized D2 live attempt has already used its Generate action",
                 )
             if state not in _TERMINAL_STATES:
                 raise PhaseGError("PHASE_G_ATTEMPT_UNRESOLVED", "prior D2 attempt is not terminal")

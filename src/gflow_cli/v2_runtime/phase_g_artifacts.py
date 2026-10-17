@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from .assets import AssetReference
 from .errors import AssetVerificationError
@@ -33,10 +34,19 @@ class ValidatedVideo:
 @dataclass(frozen=True, slots=True)
 class PersistedArtifact:
     reference: AssetReference
+    verification: VerifiedRemoteArtifact
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedRemoteArtifact:
+    """Evidence returned only after a local/remote re-download hash comparison."""
+
+    remote_file_id: str
+    remote_filename: str
     size_bytes: int
-    sha256: str
+    local_sha256: str
     remote_sha256: str
-    remote_verified: bool
+    remote_verified: bool = True
 
 
 class PhaseGStoragePort(Protocol):
@@ -147,7 +157,6 @@ def persist_and_verify(
     """Upload, retrieve into a separate path, hash-verify and only then clean up."""
     if not local_file.is_file() or local_file.is_symlink():
         raise AssetVerificationError("local Phase G artifact is missing or unsafe")
-    local_hash = sha256_file(local_file)
     local_size = local_file.stat().st_size
     reference = storage.upload_asset(local_file, logical_key)
     metadata = storage.get_metadata(reference)
@@ -155,27 +164,64 @@ def persist_and_verify(
         raise AssetVerificationError("uploaded Phase G artifact is not remotely retrievable")
     if metadata.size_bytes is not None and metadata.size_bytes != local_size:
         raise AssetVerificationError("remote Phase G artifact size differs from local file")
-    if metadata.checksum_sha256:
-        remote_hash = metadata.checksum_sha256.lower()
-    else:
-        verification_temp_dir.mkdir(parents=True, exist_ok=True)
-        verify_path = verification_temp_dir / f"{reference.asset_id}.verify"
-        if verify_path.resolve() == local_file.resolve() or verify_path.exists():
-            raise AssetVerificationError("remote verification path is not a separate unused file")
+    verification_root = verification_temp_dir.resolve()
+    verification_root.mkdir(parents=True, exist_ok=True)
+    verify_path = verification_root / f"remote-{uuid4().hex}.verify"
+    if verify_path.resolve() == local_file.resolve() or verify_path.exists():
+        raise AssetVerificationError("remote verification path is not a separate unused file")
+    try:
         downloaded = storage.download_asset(reference, verify_path)
         if downloaded != verify_path or not verify_path.is_file() or verify_path.is_symlink():
             raise AssetVerificationError(
                 "remote verification download did not produce the target file"
             )
-        remote_hash = sha256_file(verify_path)
-        if verify_path.stat().st_size != local_size:
-            raise AssetVerificationError("remote re-download size differs from local file")
-        verify_path.unlink()
-    if remote_hash != local_hash:
-        raise AssetVerificationError("remote Phase G artifact SHA-256 differs from local file")
+        evidence = verify_remote_redownload(
+            local_file,
+            verify_path,
+            remote_file_id=reference.asset_id,
+            remote_filename=logical_key,
+        )
+    finally:
+        if verify_path.is_file() and not verify_path.is_symlink():
+            verify_path.unlink()
     if cleanup_local:
         local_file.unlink()
-    return PersistedArtifact(reference, local_size, local_hash, remote_hash, True)
+    return PersistedArtifact(reference, evidence)
+
+
+def verify_remote_redownload(
+    local_file: Path,
+    remote_download: Path,
+    *,
+    remote_file_id: str,
+    remote_filename: str,
+) -> VerifiedRemoteArtifact:
+    """Build finalization evidence from a separate file downloaded from storage."""
+    if (
+        not local_file.is_file()
+        or local_file.is_symlink()
+        or not remote_download.is_file()
+        or remote_download.is_symlink()
+        or local_file.resolve() == remote_download.resolve()
+        or not remote_file_id.strip()
+        or not remote_filename.strip()
+    ):
+        raise AssetVerificationError("remote verification inputs are missing or unsafe")
+    local_size = local_file.stat().st_size
+    remote_size = remote_download.stat().st_size
+    if local_size <= 0 or remote_size != local_size:
+        raise AssetVerificationError("remote re-download size differs from local file")
+    local_hash = sha256_file(local_file)
+    remote_hash = sha256_file(remote_download)
+    if remote_hash != local_hash:
+        raise AssetVerificationError("remote Phase G artifact SHA-256 differs from local file")
+    return VerifiedRemoteArtifact(
+        remote_file_id,
+        remote_filename,
+        remote_size,
+        local_hash,
+        remote_hash,
+    )
 
 
 def _parse_aspect(value: str) -> float:

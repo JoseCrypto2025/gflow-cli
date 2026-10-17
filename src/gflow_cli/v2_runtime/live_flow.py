@@ -265,6 +265,10 @@ class GoogleFlowAgentOnlyPort:
 
     async def inspect_surface(self) -> str | None:
         page = await self._ensure_page()
+        locale = await page.evaluate("document.documentElement.lang || navigator.language")
+        if not isinstance(locale, str) or not locale.casefold().startswith("en"):
+            self._surface = "UNKNOWN"
+            return self._surface
         trigger = page.locator(READY_ANCHOR).first
         agent_panel = page.locator("flow-agent-panel")
         trigger_present = bool(await trigger.count())

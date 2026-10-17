@@ -10,6 +10,7 @@ from gflow_cli.v2_runtime.errors import AssetVerificationError
 from gflow_cli.v2_runtime.phase_g_artifacts import (
     persist_and_verify,
     validate_video,
+    verify_remote_redownload,
 )
 from gflow_cli.v2_runtime.storage import AssetMetadata
 
@@ -36,9 +37,10 @@ def _synthetic_mp4(path: Path, *, frames: int = 80, width: int = 180, height: in
 
 
 class FakeStorage:
-    def __init__(self, root: Path, *, corrupt: bool = False) -> None:
+    def __init__(self, root: Path, *, corrupt: bool = False, asset_id: str = "drive-id-1") -> None:
         self.root = root
         self.corrupt = corrupt
+        self.asset_id = asset_id
         self.remote = root / "remote.mp4"
 
     def upload_asset(self, source: Path, logical_key: str) -> AssetReference:
@@ -48,7 +50,7 @@ class FakeStorage:
             content = bytearray(self.remote.read_bytes())
             content[-1] ^= 0x01
             self.remote.write_bytes(content)
-        return AssetReference("google-drive", "drive-id-1", logical_key, "drive-id-1")
+        return AssetReference("google-drive", self.asset_id, logical_key, self.asset_id)
 
     def get_metadata(self, reference: AssetReference) -> AssetMetadata:
         if not self.remote.is_file():
@@ -91,8 +93,8 @@ def test_persistence_requires_remote_redownload_hash_before_local_cleanup(
         "d2_run__SCN_000001__SPV_000002__media.mp4",
         verification_temp_dir=tmp_path / "verify",
     )
-    assert persisted.remote_verified is True
-    assert persisted.sha256 == persisted.remote_sha256
+    assert persisted.verification.remote_verified is True
+    assert persisted.verification.local_sha256 == persisted.verification.remote_sha256
     assert not local.exists()
     assert list((tmp_path / "verify").iterdir()) == []
 
@@ -109,3 +111,63 @@ def test_failed_remote_hash_verification_retains_primary_local_artifact(
             verification_temp_dir=tmp_path / "verify",
         )
     assert local.is_file()
+
+
+def test_remote_verification_path_does_not_use_provider_asset_id(tmp_path: Path) -> None:
+    local = _synthetic_mp4(tmp_path / "local.mp4")
+    storage = FakeStorage(tmp_path / "drive", asset_id="../../outside")
+    persisted = persist_and_verify(
+        storage,
+        local,
+        "d2-run.mp4",
+        verification_temp_dir=tmp_path / "verify",
+        cleanup_local=False,
+    )
+    assert persisted.verification.remote_file_id == "../../outside"
+    assert not (tmp_path.parent / "outside.verify").exists()
+    assert list((tmp_path / "verify").iterdir()) == []
+
+
+def test_remote_evidence_requires_separate_matching_redownload(tmp_path: Path) -> None:
+    local = _synthetic_mp4(tmp_path / "local.mp4")
+    remote = tmp_path / "remote.mp4"
+    shutil.copyfile(local, remote)
+    evidence = verify_remote_redownload(
+        local,
+        remote,
+        remote_file_id="drive-id-1",
+        remote_filename="clip.mp4",
+    )
+    assert evidence.remote_verified
+    assert evidence.local_sha256 == evidence.remote_sha256
+    remote.write_bytes(b"different")
+    with pytest.raises(AssetVerificationError, match="size"):
+        verify_remote_redownload(
+            local,
+            remote,
+            remote_file_id="drive-id-1",
+            remote_filename="clip.mp4",
+        )
+
+
+def test_remote_evidence_rejects_same_path_and_symlink(tmp_path: Path) -> None:
+    local = _synthetic_mp4(tmp_path / "local.mp4")
+    with pytest.raises(AssetVerificationError, match="unsafe"):
+        verify_remote_redownload(
+            local,
+            local,
+            remote_file_id="drive-id-1",
+            remote_filename="clip.mp4",
+        )
+    symlink = tmp_path / "remote-link.mp4"
+    try:
+        symlink.symlink_to(local)
+    except OSError:
+        pytest.skip("symlinks are unavailable in this Windows environment")
+    with pytest.raises(AssetVerificationError, match="unsafe"):
+        verify_remote_redownload(
+            local,
+            symlink,
+            remote_file_id="drive-id-1",
+            remote_filename="clip.mp4",
+        )

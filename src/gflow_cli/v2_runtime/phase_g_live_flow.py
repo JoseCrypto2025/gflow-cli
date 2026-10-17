@@ -152,8 +152,13 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._page: Page | None = None
 
     @classmethod
-    async def open(cls, *, expected_email: str | None = None) -> GoogleFlowAgentOnlyGenerationPort:
+    async def open(cls, *, expected_email: str) -> GoogleFlowAgentOnlyGenerationPort:
         """Open only the repository-owned TEST profile; never launch personal Chrome."""
+        if not expected_email.strip() or "@" not in expected_email:
+            raise FlowPresubmitError(
+                "FLOW_EXPECTED_IDENTITY_REQUIRED",
+                "live Phase G requires the explicitly verified TEST account identity",
+            )
         base = await GoogleFlowAgentOnlyPort.open(
             auth_profile_key=_TEST_AUTH_PROFILE,
             provider_account_id="PVA_0001",

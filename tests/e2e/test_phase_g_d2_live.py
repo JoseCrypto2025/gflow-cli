@@ -1,0 +1,114 @@
+"""One-shot Phase G live test, deliberately opt-in and credit-consuming.
+
+After pushing the implementation, export a fresh read-only Master snapshot to
+JSON and set the Phase G environment variables below. The test uses only the
+repository-owned ``gflow-v2-test`` profile and performs at most one Generate
+action. Drive upload and hash verification remain explicit operator steps.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import cast
+from uuid import uuid4
+
+import pytest
+
+from gflow_cli.v2_runtime.phase_g_run import (
+    build_phase_g_request,
+    execute_and_validate,
+    run_fresh_presubmit,
+)
+
+pytestmark = [pytest.mark.e2e, pytest.mark.e2e_video]
+
+_RUN_CONFIRMATION = "GFLOW_CLI_E2E_RUN_PHASE_G"
+_SNAPSHOT = "GFLOW_CLI_E2E_PHASE_G_SNAPSHOT"
+_ACCOUNT_EMAIL = "GFLOW_CLI_E2E_PHASE_G_ACCOUNT_EMAIL"
+_STATE_ROOT = "GFLOW_CLI_E2E_PHASE_G_STATE_ROOT"
+_TEMP_ROOT = "GFLOW_CLI_E2E_PHASE_G_TEMP_ROOT"
+
+
+@pytest.mark.asyncio
+async def test_phase_g_one_approved_test_clip(e2e_profile_dir: Path) -> None:
+    """Run one exact approved D2 request and validate its attributable MP4."""
+    if os.environ.get(_RUN_CONFIRMATION) != "I_CONFIRM_ONE_D2_GENERATION":
+        pytest.skip(f"set {_RUN_CONFIRMATION}=I_CONFIRM_ONE_D2_GENERATION to opt in")
+    if os.environ.get("GFLOW_CLI_E2E_PROFILE", "").strip() != "gflow-v2-test":
+        pytest.skip("Phase G accepts only the dedicated gflow-v2-test profile")
+
+    snapshot_path = _required_path(_SNAPSHOT)
+    state_root = _required_path(_STATE_ROOT)
+    temp_root = _required_path(_TEMP_ROOT)
+    expected_email = os.environ.get(_ACCOUNT_EMAIL, "").strip()
+    if not expected_email or "@" not in expected_email:
+        pytest.skip(f"set {_ACCOUNT_EMAIL} to the verified TEST account identity")
+
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if not isinstance(snapshot, dict):
+        pytest.fail("Phase G snapshot must be a JSON object")
+    captured_at = snapshot.get("captured_at_utc")
+    if not isinstance(captured_at, str):
+        pytest.fail("Phase G snapshot must include captured_at_utc")
+    try:
+        captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+    except ValueError:
+        pytest.fail("Phase G snapshot captured_at_utc must be ISO 8601")
+    age = datetime.now(UTC) - captured.astimezone(UTC)
+    if age < timedelta(seconds=-60) or age > timedelta(minutes=15):
+        pytest.fail("Phase G Master snapshot is not fresh (maximum age: 15 minutes)")
+    tables = snapshot.get("tables")
+    prompt_versions = snapshot.get("prompt_versions")
+    if not isinstance(tables, dict) or not isinstance(prompt_versions, list):
+        pytest.fail("Phase G snapshot must contain tables and prompt_versions")
+
+    request = build_phase_g_request(
+        cast(dict[str, list[dict[str, object]]], tables),
+        cast(list[dict[str, object]], prompt_versions),
+        d2_run_id=f"D2_{uuid4().hex[:16]}",
+        runtime_state_root=state_root,
+        temp_root=temp_root,
+    )
+    await run_fresh_presubmit(request, expected_email=expected_email)
+    run = await execute_and_validate(request, expected_email=expected_email)
+    assert run.result.submission_state == "GENERATION_SUCCEEDED"
+    assert run.result.provider_media_id
+    assert run.result.provider_project_id == request.provider_project_id
+    assert run.video.duration_sec == pytest.approx(request.duration_sec, abs=0.05)
+    assert run.video.aspect_ratio == request.aspect_ratio
+    assert run.local_file.is_file()
+
+    evidence_path = state_root / "phase-g-live-result.json"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "d2_run_id": request.d2_run_id,
+                "scene_prompt_id": request.scene_prompt_id,
+                "provider_project_id": request.provider_project_id,
+                "provider_execution_id": run.result.provider_execution_id,
+                "provider_media_id": run.result.provider_media_id,
+                "local_file": str(run.local_file),
+                "size_bytes": run.video.size_bytes,
+                "sha256": run.video.sha256,
+                "duration_sec": run.video.duration_sec,
+                "width": run.video.width,
+                "height": run.video.height,
+                "audio_present": run.video.audio_present,
+                "full_decode": True,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _required_path(name: str) -> Path:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        pytest.skip(f"set {name} for the explicitly authorized Phase G run")
+    return Path(value).expanduser().resolve()

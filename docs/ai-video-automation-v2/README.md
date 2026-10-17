@@ -65,3 +65,7 @@ settings controls, migrated batchexecute parser, and exact media recovery path.
 The production Drive storage adapter remains fail-closed; D2 persistence uses
 the connected Drive connector with separate remote download/hash verification. See
 [Phase G D2 controlled execution](architecture/PHASE_G_D2_CONTROLLED_EXECUTION.md).
+The live port requires an expected TEST account identity and fails closed on
+non-English UI locales until translated control behavior is verified. A
+one-shot, credit-consuming regression is available at
+`tests/e2e/test_phase_g_d2_live.py` and remains opt-in.

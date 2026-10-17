@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from .agent_recovery import AgentSettingsRecoveryJournal
 from .errors import AssetVerificationError, FlowPresubmitError
@@ -21,7 +22,12 @@ from .phase_g import (
     PhaseGExecutionRequest,
     PhaseGExecutionResult,
 )
-from .phase_g_artifacts import ValidatedVideo, validate_video
+from .phase_g_artifacts import (
+    ValidatedVideo,
+    VerifiedRemoteArtifact,
+    validate_video,
+    verify_remote_redownload,
+)
 from .phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
 
 _SCENE_ID = "SCN_000001"
@@ -107,20 +113,23 @@ def build_phase_g_request(
     return PhaseGExecutionRequest.from_presubmit(request, d2_run_id)
 
 
-async def run_fresh_presubmit(request: PhaseGExecutionRequest) -> None:
+async def run_fresh_presubmit(request: PhaseGExecutionRequest, *, expected_email: str) -> None:
     """Exercise F5 on the pinned TEST profile before the separate Phase G port."""
     result = await prepare_live_flow(
         request.presubmit_request,
         auth_profile_key=_AUTH_PROFILE,
         project_name=_PROJECT_NAME,
         model_display_names=_MODEL_DISPLAY_NAMES,
+        expected_email=expected_email,
         headless=False,
     )
     if result.state != "FLOW_PRESUBMIT_READY":
         raise FlowPresubmitError("FLOW_PRESUBMIT_NOT_READY", "fresh F5 readback did not pass")
 
 
-async def execute_and_validate(request: PhaseGExecutionRequest) -> PhaseGD2Run:
+async def execute_and_validate(
+    request: PhaseGExecutionRequest, *, expected_email: str
+) -> PhaseGD2Run:
     """Perform one request, recover only its media ID, and fully validate the MP4."""
     ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
     journal = AgentSettingsRecoveryJournal(
@@ -128,7 +137,7 @@ async def execute_and_validate(request: PhaseGExecutionRequest) -> PhaseGD2Run:
         request.provider_account_id,
         request.provider_project_id,
     )
-    port = await GoogleFlowAgentOnlyGenerationPort.open()
+    port = await GoogleFlowAgentOnlyGenerationPort.open(expected_email=expected_email)
     try:
         result = await GoogleFlowAgentOnlyGenerationExecutor(port, ledger, journal).execute(request)
         if result.submission_state != "GENERATION_SUCCEEDED" or not result.provider_media_id:
@@ -161,25 +170,94 @@ async def execute_and_validate(request: PhaseGExecutionRequest) -> PhaseGD2Run:
         await port.close()
 
 
-def mark_remote_artifact_verified(
+async def recover_and_validate_existing(
+    request: PhaseGExecutionRequest, *, expected_email: str
+) -> PhaseGD2Run:
+    """Recover and validate the exact media ID already recorded for this run."""
+    ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
+    attempt = next(
+        (row for row in ledger.attempts() if row.get("d2_run_id") == request.d2_run_id),
+        None,
+    )
+    if attempt is None or attempt.get("submission_state") not in {
+        "PERSISTENCE_FAILED",
+        "MEDIA_VALIDATION_FAILED",
+    }:
+        raise PhaseGError(
+            "PHASE_G_ARTIFACT_RECOVERY_REQUIRED", "no recoverable generated D2 attempt exists"
+        )
+    if (
+        attempt.get("scene_id") != request.scene_id
+        or attempt.get("scene_prompt_id") != request.scene_prompt_id
+        or attempt.get("provider_account_id") != request.provider_account_id
+        or attempt.get("provider_project_id") != request.provider_project_id
+        or attempt.get("prompt_sha256") != request.prompt_sha256
+    ):
+        raise PhaseGError(
+            "PHASE_G_RECOVERY_IDENTITY_MISMATCH", "stored attempt differs from recovery request"
+        )
+    media_id = attempt.get("provider_media_id")
+    if not isinstance(media_id, str) or not media_id:
+        raise PhaseGError(
+            "PHASE_G_ARTIFACT_RECOVERY_REQUIRED", "stored attempt has no exact provider media ID"
+        )
+    port = await GoogleFlowAgentOnlyGenerationPort.open(expected_email=expected_email)
+    try:
+        await port.bind_request(request)
+        recovered = await port.download_exact_media(
+            request.presubmit_request.temp_root / f"recovery-{uuid4().hex}", media_id
+        )
+        video = validate_video(
+            recovered.path,
+            expected_duration_sec=request.duration_sec,
+            expected_aspect_ratio=request.aspect_ratio,
+        )
+        recovered_attempt = ledger.record_artifact_recovered(request.d2_run_id)
+        result = PhaseGExecutionResult(
+            request.d2_run_id,
+            "GENERATION_SUCCEEDED",
+            str(recovered_attempt.get("confirmation_id") or ""),
+            str(recovered_attempt.get("provider_execution_id") or "") or None,
+            media_id,
+            request.provider_project_id,
+        )
+        return PhaseGD2Run(request, result, recovered.path, video)
+    finally:
+        await port.close()
+
+
+def verify_drive_redownload(
     run: PhaseGD2Run,
+    downloaded_file: Path,
     *,
     remote_file_id: str,
     remote_filename: str,
-    remote_size_bytes: int,
-    remote_redownload_sha256: str,
+) -> VerifiedRemoteArtifact:
+    """Validate a connector-downloaded Drive copy before recording D2 success."""
+    return verify_remote_redownload(
+        run.local_file,
+        downloaded_file,
+        remote_file_id=remote_file_id,
+        remote_filename=remote_filename,
+    )
+
+
+def mark_remote_artifact_verified(
+    run: PhaseGD2Run,
+    verification: VerifiedRemoteArtifact,
 ) -> Mapping[str, object]:
     """Record D2 success and clean the primary local clip only after hash match."""
-    if run.local_file.stat().st_size != remote_size_bytes:
-        raise PhaseGError("PHASE_G_REMOTE_VERIFICATION_FAILED", "remote artifact size differs")
+    if (
+        verification.size_bytes != run.video.size_bytes
+        or verification.local_sha256 != run.video.sha256
+    ):
+        raise PhaseGError(
+            "PHASE_G_REMOTE_VERIFICATION_FAILED", "remote evidence differs from local"
+        )
     result = D2DailyCreditLedger(run.request.presubmit_request.runtime_state_root)
     attempt = result.mark_artifact_verified(
         run.request.d2_run_id,
-        local_sha256=run.video.sha256,
-        remote_sha256=remote_redownload_sha256,
-        remote_file_id=remote_file_id,
-        remote_filename=remote_filename,
-        remote_size_bytes=remote_size_bytes,
+        evidence=verification,
     )
     run.local_file.unlink()
     return attempt
