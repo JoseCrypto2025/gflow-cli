@@ -12,6 +12,8 @@ The adapter is keyed by the configured `Provider_ID`; it does not assume a fixed
 
 The request must contain a persisted prompt version with `Prompt_Status=APPROVED`. VALIDATED, SUPERSEDED, or other statuses are held before any browser call. Scene, profile, source-context hash, exact positive and negative prompt text, and the canonical Phase E prompt hash must all match. Phase F does not approve or persist prompt rows.
 
+The reusable row-transition guard lives in `gflow_cli.v2_runtime.prompt_approval`. A persisted `APPROVED` row may be rewritten only with identical values, or transitioned to `SUPERSEDED` while changing only `Prompt_Status` and `Updated_At`. Any other edit raises `APPROVED_PROMPT_IMMUTABLE`. Reapproval creates a distinct `VALIDATED` version, then requires a fresh, error-free Phase E result to match Scene/profile, exact positive/negative text, and both hashes before approval. A Scene/profile pair must finish with exactly one `APPROVED` row. Google Sheets writers must invoke this guard before writing; the Phase F provider adapter remains read-only with respect to prompt rows.
+
 ## Dedicated project and session
 
 The provider account must resolve to one explicitly configured automation project. The adapter selects that ID and compares the returned identity. Missing and mismatched project identities are held. It does not create projects or infer a project from recency, list order, or an open page. Session states other than `FLOW_SESSION_READY` and an account identity mismatch are held. No password, token, cookie, or profile contents enter the request or report.
