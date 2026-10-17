@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -132,6 +133,39 @@ _EXPECTED_SETTINGS = (
     "audio_mode",
     "quality_tier",
 )
+_AGENT_UI_SETTINGS = ("model_id", "generation_mode", "aspect_ratio", "output_count")
+_AGENT_DURATION_PARAMETER_KEY = "google_flow.agent.video.duration_instruction"
+
+
+def build_agent_only_directive(
+    prompt_text: str, technical_configuration: Mapping[str, object]
+) -> str:
+    """Translate Phase E's structured duration into the Agent's text-only control."""
+    canonical = technical_configuration.get("canonical_parameters")
+    adapter = technical_configuration.get("adapter_parameters")
+    duration = technical_configuration.get("duration_sec")
+    canonical_values = cast(Mapping[str, object], canonical)
+    adapter_values = cast(Mapping[str, object], adapter)
+    if (
+        not isinstance(canonical, Mapping)
+        or not isinstance(adapter, Mapping)
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(duration))
+        or duration <= 0
+        or canonical_values.get("DURATION_SEC") != duration
+        or adapter_values.get(_AGENT_DURATION_PARAMETER_KEY) != duration
+    ):
+        raise FlowPresubmitError(
+            "FLOW_DURATION_UNRESOLVED",
+            "Phase E must provide a mapped, positive structured duration for Agent-only T2V",
+        )
+    seconds = format(float(duration), "g")
+    return (
+        f"{prompt_text}\n\n"
+        f"Follow the selected video settings and target a duration of {seconds} seconds. "
+        "Create video only; do not generate images first or ask follow-up questions."
+    )
 
 
 def classify_flow_surface(url: object) -> str | None:
@@ -238,7 +272,13 @@ class GoogleFlowProviderAdapter:
             raise FlowPresubmitError("FLOW_SURFACE_CHANGED", "Flow editor surface is unknown")
 
         if surface == "AGENT_ONLY":
-            return await self._prepare_agent_only_transaction(request, port, settings, references)
+            agent_settings = self._agent_only_settings(request, settings)
+            return await self._prepare_agent_only_transaction(
+                request, port, agent_settings, references
+            )
+
+        if any(settings[key] is None for key in _EXPECTED_SETTINGS):
+            raise FlowPresubmitError("FLOW_SETTING_UNRESOLVED", "Phase E settings are incomplete")
 
         return await self._prepare_after_surface(request, port, settings, references, surface)
 
@@ -429,7 +469,12 @@ class GoogleFlowProviderAdapter:
         self._compare_mapping(settings, configured, "FLOW_SETTING_VALUE_MISMATCH")
         bound = await port.bind_references(references)
         self._compare_references(references, bound)
-        await port.fill_prompt(request.prompt_version.compiled_prompt_text)
+        provider_prompt = request.prompt_version.compiled_prompt_text
+        if surface == "AGENT_ONLY":
+            provider_prompt = build_agent_only_directive(
+                provider_prompt, request.preflight.technical_configuration
+            )
+        await port.fill_prompt(provider_prompt)
         if request.prompt_version.compiled_negative_prompt:
             await port.fill_negative_prompt(request.prompt_version.compiled_negative_prompt)
         readback = await port.readback()
@@ -452,7 +497,7 @@ class GoogleFlowProviderAdapter:
             )
         self._compare_mapping(settings, readback.settings, "FLOW_SETTING_VALUE_MISMATCH")
         self._compare_references(references, readback.references)
-        if readback.prompt != request.prompt_version.compiled_prompt_text:
+        if readback.prompt != provider_prompt:
             raise FlowPresubmitError(
                 "FLOW_PROMPT_VALUE_MISMATCH", "Flow prompt readback differs or is truncated"
             )
@@ -464,7 +509,8 @@ class GoogleFlowProviderAdapter:
                 "FLOW_NEGATIVE_PROMPT_UNSUPPORTED",
                 "selected Flow mode has no verified negative prompt contract",
             )
-        if readback.negative_prompt != request.prompt_version.compiled_negative_prompt:
+        expected_negative_prompt = request.prompt_version.compiled_negative_prompt or None
+        if readback.negative_prompt != expected_negative_prompt:
             raise FlowPresubmitError(
                 "FLOW_NEGATIVE_PROMPT_MISMATCH", "Flow negative prompt readback differs"
             )
@@ -487,6 +533,42 @@ class GoogleFlowProviderAdapter:
             True,
             True,
         )
+
+    @staticmethod
+    def _agent_only_settings(
+        request: FlowPresubmitRequest, settings: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Require known UI controls, keeping duration as a separate directive value."""
+        if request.generation_mode != "TEXT_TO_VIDEO":
+            raise FlowPresubmitError(
+                "FLOW_AGENT_MODE_UNSUPPORTED", "Agent-only F5 supports text-to-video only"
+            )
+        for key in ("resolution", "audio_mode", "quality_tier"):
+            # EXTERNAL_TTS is a downstream post-processing choice, not a Flow
+            # generation setting; F5 does not execute or map that stage.
+            if key == "audio_mode" and settings.get(key) == "EXTERNAL_TTS":
+                continue
+            if settings.get(key) is not None:
+                raise FlowPresubmitError(
+                    "FLOW_AGENT_SETTING_UNSUPPORTED",
+                    f"Agent-only Flow has no verified {key} contract",
+                )
+        duration = settings.get("duration_sec")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            raise FlowPresubmitError(
+                "FLOW_DURATION_UNRESOLVED",
+                "Agent-only T2V requires a structured duration from Phase E",
+            )
+        build_agent_only_directive(
+            request.prompt_version.compiled_prompt_text,
+            request.preflight.technical_configuration,
+        )
+        selected = {key: settings.get(key) for key in _AGENT_UI_SETTINGS}
+        if any(selected[key] is None for key in _AGENT_UI_SETTINGS):
+            raise FlowPresubmitError(
+                "FLOW_SETTING_UNRESOLVED", "required Agent video UI settings are incomplete"
+            )
+        return selected
 
     def _validate_request(self, request: FlowPresubmitRequest) -> dict[str, object]:
         result = request.preflight
@@ -555,7 +637,7 @@ class GoogleFlowProviderAdapter:
         settings = {key: technical.get(key) for key in _EXPECTED_SETTINGS}
         settings["model_id"] = request.model_id
         settings["generation_mode"] = request.generation_mode
-        if any(settings[key] is None for key in _EXPECTED_SETTINGS):
+        if any(settings[key] is None for key in ("duration_sec", "aspect_ratio", "output_count")):
             raise FlowPresubmitError("FLOW_SETTING_UNRESOLVED", "Phase E settings are incomplete")
         if technical.get("generation_mode") != request.generation_mode:
             raise FlowPresubmitError(

@@ -196,6 +196,10 @@ def resolve_profile(
         ("QUALITY_TIER", profile.quality_tier),
     )
     for kind, value in checks:
+        if kind == "AUDIO_MODE" and profile.audio_mode == "EXTERNAL_TTS":
+            # External TTS is a separate post-generation stage, not a model
+            # capability that must be present in the video provider catalog.
+            continue
         allowed = _values(capabilities, kind, profile.generation_mode)
         if value is not None and allowed:
             matches = value in allowed

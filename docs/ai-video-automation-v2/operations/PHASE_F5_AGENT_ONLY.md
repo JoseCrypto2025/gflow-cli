@@ -26,9 +26,13 @@ arguments, auth verifier, and `ProfileLease`.
 
 The Agent settings panel currently exposes video model, aspect ratio, output
 count, and the account-level confirmation preference. Duration, resolution,
-audio, and quality controls are not present in this view. F5 must reject a
-request that requires one of those unmapped settings; it must not report the
-requested value as observed state. The supported first mode is text-to-video.
+audio, and quality controls are not present in this view. Phase E therefore
+requires a structured, capability-valid duration and the Flow adapter puts that
+value into a dynamic Agent instruction. F5 verifies the composed text, not an
+Agent duration control or the eventual media length; Phase G must validate the
+generated duration. Explicit resolution, audio, or quality settings hold
+because this surface has no verified contract for them. The supported first
+mode is text-to-video.
 Reference inputs, Agent instructions, and negative-prompt entry are outside
 this F5 contract.
 

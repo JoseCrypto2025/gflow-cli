@@ -335,6 +335,32 @@ def _validate_value(
         return
     allowed, enumerable = _capability_values(catalog, model_id, mode, kind)
     if not allowed:
+        parameter = {
+            "ASPECT_RATIO": "ASPECT_RATIO",
+            "OUTPUT_COUNT": "OUTPUT_COUNT",
+        }.get(kind)
+        mapped_values: list[object] = []
+        if parameter is not None:
+            mappings = [
+                row
+                for row in catalog.rows("MODEL_PARAMETER_MAP")
+                if _text(row, "Model_ID") == model_id
+                and _text(row, "Generation_Mode") == mode
+                and _text(row, "Canonical_Parameter") == parameter
+                and _text(row, "Status").upper() == "ACTIVE"
+            ]
+            if len(mappings) == 1:
+                try:
+                    parsed_values = json.loads(_text(mappings[0], "Allowed_Values_JSON"))
+                except json.JSONDecodeError:
+                    parsed_values = None
+                if isinstance(parsed_values, list):
+                    mapped_values = cast(list[object], parsed_values)
+        if value in mapped_values:
+            # This mapping records values actually observed in the Agent UI;
+            # it can resolve a provider source that describes values only as
+            # prose, while duration still requires model capability evidence.
+            return
         warnings.append(
             PreflightIssue(
                 "CAPABILITY_NOT_MACHINE_ENUMERABLE",
@@ -1048,12 +1074,17 @@ def preflight_scene(
     duration = _num(scene.get("Duration_Target_Sec"))
     if duration is None:
         duration = profile.default_duration_sec
-    aspect = _text(scene, "Aspect_Ratio_Override") or _text(series, "Default_Aspect_Ratio")
+    aspect = (
+        _text(scene, "Aspect_Ratio_Override")
+        or _text(series, "Default_Aspect_Ratio")
+        or profile.default_aspect_ratio
+    )
     if not aspect:
         errors.append(
             PreflightIssue(
                 "ASPECT_RATIO_UNRESOLVED",
-                "Scene override and Series default do not resolve an aspect ratio",
+                "Scene override, Series default, and Generation Profile do not resolve "
+                "an aspect ratio",
             )
         )
     resolution = profile.default_resolution or _text(
@@ -1076,7 +1107,11 @@ def preflight_scene(
         (aspect, "ASPECT_RATIO", "ASPECT_RATIO_UNSUPPORTED"),
         (resolution, "RESOLUTION", "RESOLUTION_UNSUPPORTED"),
         (output_count, "OUTPUT_COUNT", "PARAMETER_VALUE_INVALID"),
-        (profile.audio_mode, "AUDIO_MODE", "PARAMETER_VALUE_INVALID"),
+        (
+            profile.audio_mode if profile.audio_mode != "EXTERNAL_TTS" else None,
+            "AUDIO_MODE",
+            "PARAMETER_VALUE_INVALID",
+        ),
         (profile.quality_tier, "QUALITY_TIER", "PARAMETER_VALUE_INVALID"),
     ):
         if value is not None:
@@ -1183,7 +1218,9 @@ def preflight_scene(
         "ASPECT_RATIO": aspect or None,
         "RESOLUTION": resolution or None,
         "OUTPUT_COUNT": output_count,
-        "AUDIO_ENABLED": profile.audio_mode not in {None, "NONE"},
+        "AUDIO_ENABLED": (
+            None if profile.audio_mode in {None, "EXTERNAL_TTS"} else profile.audio_mode == "NATIVE"
+        ),
         "REFERENCE_ASSETS": [ref.as_dict() for ref in references],
         "START_FRAME": [
             ref.drive_file_id for ref in references if ref.reference_role == "START_FRAME"

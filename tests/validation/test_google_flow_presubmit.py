@@ -128,7 +128,12 @@ class FakeAgentPort(FakePort):
             "confirm_before_generating": "Always",
         }
         self.applied = dict(self.original_settings)
+        self.preparation_settings: dict[str, object] | None = None
         self.restore_fails = False
+
+    async def apply_settings(self, settings: dict[str, object]) -> dict[str, object]:
+        self.preparation_settings = dict(settings)
+        return await super().apply_settings(settings)
 
     async def snapshot_settings(self) -> dict[str, object]:
         self.calls.append("snapshot_settings")
@@ -201,6 +206,36 @@ def request_for(
     )
 
 
+def agent_request_for(tmp_path: Path) -> FlowPresubmitRequest:
+    """Represent a Phase E T2V result with only Agent-verifiable controls."""
+    request = request_for(tmp_path)
+    positive = request.prompt_version.compiled_prompt_text
+    digest = prompt_sha256(positive, "")
+    technical = {
+        "generation_mode": "TEXT_TO_VIDEO",
+        "duration_sec": 8,
+        "aspect_ratio": "16:9",
+        "resolution": None,
+        "output_count": 1,
+        "audio_mode": None,
+        "quality_tier": None,
+        "canonical_parameters": {
+            "DURATION_SEC": 8,
+            "ASPECT_RATIO": "16:9",
+            "OUTPUT_COUNT": 1,
+        },
+        "adapter_parameters": {"google_flow.agent.video.duration_instruction": 8},
+    }
+    result = replace(
+        request.preflight,
+        technical_configuration=technical,
+        compiled_negative_prompt="",
+        prompt_sha256=digest,
+    )
+    prompt = replace(request.prompt_version, compiled_negative_prompt="", prompt_sha256=digest)
+    return replace(request, preflight=result, prompt_version=prompt)
+
+
 @pytest.fixture(autouse=True)
 def no_real_profile_lease(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(flow, "ProfileLease", lambda _path: FakeLease())
@@ -226,13 +261,14 @@ async def test_agent_only_settings_are_journaled_restored_and_marked_clean(
     tmp_path: Path,
 ) -> None:
     port = FakeAgentPort()
-    request = request_for(tmp_path)
+    request = agent_request_for(tmp_path)
     outcome = await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
     journal = AgentSettingsRecoveryJournal(
         request.runtime_state_root, request.provider_account_id, request.provider_project_id
     )
 
     assert outcome.state == "FLOW_PRESUBMIT_READY"
+    assert "target a duration of 8 seconds" in (port.prompt or "")
     assert port.calls.index("snapshot_settings") < port.calls.index("apply_settings")
     assert port.calls.index("apply_settings") < port.calls.index("restore_settings")
     assert port.applied == port.original_settings
@@ -242,10 +278,29 @@ async def test_agent_only_settings_are_journaled_restored_and_marked_clean(
 
 
 @pytest.mark.asyncio
+async def test_external_tts_is_not_sent_as_a_google_flow_setting(tmp_path: Path) -> None:
+    port = FakeAgentPort()
+    request = agent_request_for(tmp_path)
+    technical = dict(request.preflight.technical_configuration)
+    technical["audio_mode"] = "EXTERNAL_TTS"
+    request = replace(
+        request,
+        preflight=replace(request.preflight, technical_configuration=technical),
+    )
+
+    outcome = await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
+
+    assert outcome.state == "FLOW_PRESUBMIT_READY"
+    assert "audio_mode" not in outcome.settings
+    assert port.preparation_settings is not None
+    assert "audio_mode" not in port.preparation_settings
+
+
+@pytest.mark.asyncio
 async def test_agent_only_hold_restores_settings_and_cleans_journal(tmp_path: Path) -> None:
     port = FakeAgentPort()
     port.generate_present = False
-    request = request_for(tmp_path)
+    request = agent_request_for(tmp_path)
 
     with pytest.raises(FlowPresubmitError) as exc:
         await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
@@ -264,7 +319,7 @@ async def test_agent_only_restore_failure_leaves_recovery_journal_blocking(
 ) -> None:
     port = FakeAgentPort()
     port.restore_fails = True
-    request = request_for(tmp_path)
+    request = agent_request_for(tmp_path)
 
     with pytest.raises(FlowPresubmitError) as exc:
         await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
@@ -281,7 +336,7 @@ async def test_agent_only_startup_recovers_dirty_defaults_before_new_work(
     tmp_path: Path,
 ) -> None:
     port = FakeAgentPort()
-    request = request_for(tmp_path)
+    request = agent_request_for(tmp_path)
     original = dict(port.original_settings)
     dirty = {**original, "aspect_ratio": "9:16"}
     journal = AgentSettingsRecoveryJournal(
@@ -307,7 +362,7 @@ async def test_agent_only_dirty_journal_for_other_project_blocks_without_navigat
     tmp_path: Path,
 ) -> None:
     port = FakeAgentPort()
-    request = request_for(tmp_path)
+    request = agent_request_for(tmp_path)
     journal = AgentSettingsRecoveryJournal(
         request.runtime_state_root, request.provider_account_id, "prior-project"
     )

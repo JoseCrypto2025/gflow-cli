@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from gflow_cli.v2_runtime.errors import FlowPresubmitError
+from gflow_cli.v2_runtime.google_flow import build_agent_only_directive
 from gflow_cli.v2_runtime.phase_e import (
     InMemorySceneCatalog,
     build_scene_prompt_payload,
@@ -16,7 +18,7 @@ from gflow_cli.v2_runtime.phase_e import (
 def _fixtures() -> dict[str, list[dict[str, object]]]:
     caps = [
         ("GENERATION_MODE", '{"mode":"TEXT_TO_VIDEO","supported":true}'),
-        ("DURATION_SEC", "8"),
+        ("DURATION_SEC", "[4,6,8]"),
         ("ASPECT_RATIO", "16:9"),
         ("RESOLUTION", "720p"),
         ("OUTPUT_COUNT", "1"),
@@ -88,7 +90,8 @@ def _fixtures() -> dict[str, list[dict[str, object]]]:
                 "Purpose": "test",
                 "Status": "ACTIVE",
                 "Prompt_Template_ID": "PMT_0001",
-                "Default_Duration_Sec": 8,
+                "Default_Aspect_Ratio": "16:9",
+                "Default_Duration_Sec": None,
                 "Default_Resolution": "720p",
                 "Default_Output_Count": 1,
                 "Audio_Mode": "NONE",
@@ -125,6 +128,44 @@ def _fixtures() -> dict[str, list[dict[str, object]]]:
                 "Status": "ACTIVE",
             }
             for i, (kind, value) in enumerate(caps, 1)
+        ],
+        "MODEL_PARAMETER_MAP": [
+            {
+                "Model_Parameter_ID": "MPM_000001",
+                "Model_ID": "MDL_0001",
+                "Generation_Mode": "TEXT_TO_VIDEO",
+                "Canonical_Parameter": "ASPECT_RATIO",
+                "Adapter_Parameter_Key": "google_flow.agent.video.aspect_ratio",
+                "Parameter_Data_Type": "STRING",
+                "Allowed_Values_JSON": '["16:9","9:16"]',
+                "Default_Value_JSON": "",
+                "Is_Required": True,
+                "Status": "ACTIVE",
+            },
+            {
+                "Model_Parameter_ID": "MPM_000002",
+                "Model_ID": "MDL_0001",
+                "Generation_Mode": "TEXT_TO_VIDEO",
+                "Canonical_Parameter": "OUTPUT_COUNT",
+                "Adapter_Parameter_Key": "google_flow.agent.video.output_count",
+                "Parameter_Data_Type": "INTEGER",
+                "Allowed_Values_JSON": "[1,2,3,4]",
+                "Default_Value_JSON": "",
+                "Is_Required": True,
+                "Status": "ACTIVE",
+            },
+            {
+                "Model_Parameter_ID": "MPM_000003",
+                "Model_ID": "MDL_0001",
+                "Generation_Mode": "TEXT_TO_VIDEO",
+                "Canonical_Parameter": "DURATION_SEC",
+                "Adapter_Parameter_Key": "google_flow.agent.video.duration_instruction",
+                "Parameter_Data_Type": "NUMBER",
+                "Allowed_Values_JSON": "[4,6,8]",
+                "Default_Value_JSON": "",
+                "Is_Required": True,
+                "Status": "ACTIVE",
+            },
         ],
         "PROMPT_TEMPLATE_MASTER": [
             {
@@ -163,6 +204,88 @@ def test_preflight_pass_is_deterministic_and_provider_neutral() -> None:
     assert "A woman with short dark hair." in (result.compiled_prompt or "")
     assert result.source_context_sha256 and len(result.source_context_sha256) == 64
     assert result.prompt_sha256 and len(result.prompt_sha256) == 64
+
+
+@pytest.mark.parametrize("duration", [4, 6, 8])
+def test_phase_e_duration_is_structured_and_drives_distinct_agent_directives(duration: int) -> None:
+    tables = _fixtures()
+    tables["SCENES"][0]["Duration_Target_Sec"] = duration
+    result = _compile(tables)
+
+    assert result.status == "PREFLIGHT_PASS", result.errors
+    assert result.technical_configuration["duration_sec"] == duration
+    assert result.technical_configuration["canonical_parameters"]["DURATION_SEC"] == duration
+    assert (
+        result.technical_configuration["adapter_parameters"][
+            "google_flow.agent.video.duration_instruction"
+        ]
+        == duration
+    )
+    directive = build_agent_only_directive(
+        result.compiled_prompt or "scene prompt", result.technical_configuration
+    )
+    assert f"target a duration of {duration} seconds" in directive
+
+
+def test_different_structured_durations_produce_different_agent_directives() -> None:
+    directives = []
+    for duration in (4, 6, 8):
+        tables = _fixtures()
+        tables["SCENES"][0]["Duration_Target_Sec"] = duration
+        result = _compile(tables)
+        directives.append(
+            build_agent_only_directive(
+                result.compiled_prompt or "scene prompt", result.technical_configuration
+            )
+        )
+    assert len(set(directives)) == 3
+
+
+def test_absent_scene_and_profile_duration_holds_without_inventing_a_default() -> None:
+    tables = _fixtures()
+    tables["SCENES"][0]["Duration_Target_Sec"] = None
+    tables["GENERATION_PROFILE_MASTER"][0]["Default_Duration_Sec"] = None
+    result = _compile(tables)
+
+    assert result.status == "PREFLIGHT_HOLD"
+    assert result.technical_configuration["duration_sec"] is None
+    assert "REQUIRED_PARAMETER_MAPPING_MISSING" in {issue.code for issue in result.errors}
+    with pytest.raises(FlowPresubmitError) as exc:
+        build_agent_only_directive("scene prompt", result.technical_configuration)
+    assert exc.value.code == "FLOW_DURATION_UNRESOLVED"
+
+
+def test_profile_duration_is_only_a_fallback_after_scene_duration() -> None:
+    tables = _fixtures()
+    tables["SCENES"][0]["Duration_Target_Sec"] = None
+    tables["GENERATION_PROFILE_MASTER"][0]["Default_Duration_Sec"] = 6
+    result = _compile(tables)
+
+    assert result.status == "PREFLIGHT_PASS", result.errors
+    assert result.technical_configuration["duration_sec"] == 6
+
+
+def test_generation_profile_aspect_ratio_is_fallback_after_scene_and_series() -> None:
+    tables = _fixtures()
+    tables["SCENES"][0]["Aspect_Ratio_Override"] = ""
+    tables["SERIES_MASTER"][0]["Default_Aspect_Ratio"] = ""
+    tables["MODEL_CAPABILITY_MAP"] = [
+        row for row in tables["MODEL_CAPABILITY_MAP"] if row["Capability_Type"] != "ASPECT_RATIO"
+    ]
+    result = _compile(tables)
+
+    assert result.status == "PREFLIGHT_PASS", result.errors
+    assert result.technical_configuration["aspect_ratio"] == "16:9"
+
+
+def test_external_tts_is_not_mapped_to_google_flow_native_audio() -> None:
+    tables = _fixtures()
+    tables["GENERATION_PROFILE_MASTER"][0]["Audio_Mode"] = "EXTERNAL_TTS"
+    result = _compile(tables)
+
+    assert result.status == "PREFLIGHT_PASS", result.errors
+    assert result.technical_configuration["audio_mode"] == "EXTERNAL_TTS"
+    assert "AUDIO_ENABLED" not in result.technical_configuration["canonical_parameters"]
 
 
 def test_profile_missing_and_inactive_hold_with_machine_codes() -> None:
@@ -233,7 +356,7 @@ def test_unsupported_duration_and_aspect_ratio_are_not_clamped_or_substituted() 
     assert "ASPECT_RATIO_UNSUPPORTED" in codes
 
 
-def test_non_enumerable_capability_holds_with_explicit_warning() -> None:
+def test_live_agent_parameter_map_resolves_prose_capability_values() -> None:
     tables = _fixtures()
     tables["MODEL_CAPABILITY_MAP"] = [
         row for row in tables["MODEL_CAPABILITY_MAP"] if row["Capability_Type"] != "ASPECT_RATIO"
@@ -251,8 +374,8 @@ def test_non_enumerable_capability_holds_with_explicit_warning() -> None:
         }
     )
     result = _compile(tables)
-    assert result.status == "PREFLIGHT_HOLD"
-    assert "CAPABILITY_NOT_MACHINE_ENUMERABLE" in {x.code for x in result.warnings}
+    assert result.status == "PREFLIGHT_PASS", result.errors
+    assert "CAPABILITY_NOT_MACHINE_ENUMERABLE" not in {x.code for x in result.warnings}
 
 
 def test_first_frame_and_source_video_contracts_fail_closed() -> None:

@@ -79,6 +79,20 @@ Warnings remain explicit. In particular, CAPABILITY_NOT_MACHINE_ENUMERABLE
 never becomes an assumed provider capability. If the uncertain value is
 required for safe readiness, the result is HOLD as well.
 
+Duration resolves from `SCENES.Duration_Target_Sec`, then the optional
+`GENERATION_PROFILE_MASTER.Default_Duration_Sec`. If both are blank and the
+active model map marks duration required, Phase E holds with
+`REQUIRED_PARAMETER_MAPPING_MISSING`; it does not infer a duration. For the
+Agent-only Google Flow T2V adapter, this structured duration becomes a dynamic
+plain-language directive because the Agent settings panel has no duration
+control. The directive is not an explicit setting readback, so Phase G must
+validate the resulting media duration. Aspect ratio resolves in order from the
+Scene override, Series default, then Generation Profile default; the model
+parameter map validates/translates the result but does not own a duplicate
+profile default. `Audio_Mode=EXTERNAL_TTS` describes downstream TTS and is not
+converted to a Google Flow `AUDIO_ENABLED` value; native Flow audio remains
+unspecified unless an explicit verified provider contract exists.
+
 ## Security and execution boundary
 
 Auth_Profile_Key is treated as a logical reference only. Phase E does not
