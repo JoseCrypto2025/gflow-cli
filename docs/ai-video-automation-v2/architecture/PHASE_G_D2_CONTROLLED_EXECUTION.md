@@ -40,7 +40,8 @@ The task-local JSON ledger lives under `RUNTIME_STATE_ROOT/phase-g/`. It stores
 semantic IDs, prompt hashes, UTC timestamps, action counts, confirmation quote,
 provider IDs, accounting cost, and terminal state. It stores no credentials,
 tokens, cookies, or browser data. A cross-process lock and atomic replacement
-protect each update.
+protect each update. This local ledger is an operational guardrail, not a
+tamper-resistant accounting service; a machine owner can edit or remove it.
 
 Each attempt records its Generate action before crossing the UI boundary and
 may approve at most one attributable confirmation. The confirmation must
@@ -85,12 +86,13 @@ does not expose a resolution control, and native audio remains informational.
 `persist_and_verify` helper is a separate contract: it uploads to an injected
 storage port, confirms remote existence/size, always downloads the remote
 artifact to a separate randomly named verification path, and recomputes SHA-256.
-The same `VerifiedRemoteArtifact` evidence type is produced for a connector
-download via `verify_drive_redownload`. Finalization accepts this evidence,
-checks it against the validated local file and ledger, and removes the primary
-local file only after the remote hash matches. The connected Drive connector
-can create the D2 artifact file and stream a separate download for hash
-verification.
+For the connected Drive connector, an operator downloads the uploaded artifact
+to a separate verification path and runs
+`uv run python scripts/validation/finalize_d2_drive_artifact.py` with the D2
+run ID, Drive file ID/name, runtime state root, and redownload path. The ledger
+re-hashes both files itself, checks the remote metadata and recorded validated
+local artifact, marks D2 success only on an exact match, then removes the
+primary local file. Caller-supplied hash evidence is not accepted.
 This task-level path is classified `D2_CONNECTOR_DRIVE_PERSISTENCE`; it does
 not mean the production Drive storage adapter is ready.
 

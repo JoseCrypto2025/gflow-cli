@@ -24,9 +24,7 @@ from .phase_g import (
 )
 from .phase_g_artifacts import (
     ValidatedVideo,
-    VerifiedRemoteArtifact,
     validate_video,
-    verify_remote_redownload,
 )
 from .phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
 
@@ -165,6 +163,12 @@ async def execute_and_validate(
             raise PhaseGError(
                 "PHASE_G_MEDIA_VALIDATION_FAILED", "downloaded output failed its media contract"
             ) from exc
+        ledger.record_local_artifact_validated(
+            request.d2_run_id,
+            path=local_file,
+            size_bytes=video.size_bytes,
+            sha256=video.sha256,
+        )
         return PhaseGD2Run(request, result, local_file, video)
     finally:
         await port.close()
@@ -180,6 +184,7 @@ async def recover_and_validate_existing(
         None,
     )
     if attempt is None or attempt.get("submission_state") not in {
+        "GENERATION_SUCCEEDED",
         "PERSISTENCE_FAILED",
         "MEDIA_VALIDATION_FAILED",
     }:
@@ -212,7 +217,17 @@ async def recover_and_validate_existing(
             expected_duration_sec=request.duration_sec,
             expected_aspect_ratio=request.aspect_ratio,
         )
-        recovered_attempt = ledger.record_artifact_recovered(request.d2_run_id)
+        recovered_attempt = (
+            attempt
+            if attempt.get("submission_state") == "GENERATION_SUCCEEDED"
+            else ledger.record_artifact_recovered(request.d2_run_id)
+        )
+        ledger.record_local_artifact_validated(
+            request.d2_run_id,
+            path=recovered.path,
+            size_bytes=video.size_bytes,
+            sha256=video.sha256,
+        )
         result = PhaseGExecutionResult(
             request.d2_run_id,
             "GENERATION_SUCCEEDED",
@@ -226,41 +241,43 @@ async def recover_and_validate_existing(
         await port.close()
 
 
-def verify_drive_redownload(
-    run: PhaseGD2Run,
-    downloaded_file: Path,
+def finalize_remote_artifact(
+    runtime_state_root: Path,
+    d2_run_id: str,
     *,
+    remote_download: Path,
     remote_file_id: str,
     remote_filename: str,
-) -> VerifiedRemoteArtifact:
-    """Validate a connector-downloaded Drive copy before recording D2 success."""
-    return verify_remote_redownload(
-        run.local_file,
-        downloaded_file,
+) -> Mapping[str, object]:
+    """Finalize a Drive connector transfer using the ledger's exact local clip."""
+    ledger = D2DailyCreditLedger(runtime_state_root)
+    attempt = next((row for row in ledger.attempts() if row.get("d2_run_id") == d2_run_id), None)
+    if attempt is None or attempt.get("submission_state") != "GENERATION_SUCCEEDED":
+        raise PhaseGError(
+            "PHASE_G_ARTIFACT_RECOVERY_REQUIRED", "no validated generated clip is ready to persist"
+        )
+    local_path_value = attempt.get("local_artifact_path")
+    temp_root_value = attempt.get("temp_root")
+    if not isinstance(local_path_value, str) or not isinstance(temp_root_value, str):
+        raise PhaseGError(
+            "PHASE_G_ARTIFACT_RECOVERY_REQUIRED", "ledger has no validated local artifact path"
+        )
+    local_candidate = Path(local_path_value)
+    if local_candidate.is_symlink() or not local_candidate.is_file():
+        raise PhaseGError("PHASE_G_LOCAL_ARTIFACT_INVALID", "ledger artifact is missing or unsafe")
+    local_path = local_candidate.resolve()
+    if not local_path.is_relative_to(Path(temp_root_value).resolve()):
+        raise PhaseGError(
+            "PHASE_G_LOCAL_ARTIFACT_INVALID", "ledger artifact path is outside its D2 temp root"
+        )
+    completed = ledger.mark_artifact_verified(
+        d2_run_id,
+        remote_download=remote_download,
         remote_file_id=remote_file_id,
         remote_filename=remote_filename,
     )
-
-
-def mark_remote_artifact_verified(
-    run: PhaseGD2Run,
-    verification: VerifiedRemoteArtifact,
-) -> Mapping[str, object]:
-    """Record D2 success and clean the primary local clip only after hash match."""
-    if (
-        verification.size_bytes != run.video.size_bytes
-        or verification.local_sha256 != run.video.sha256
-    ):
-        raise PhaseGError(
-            "PHASE_G_REMOTE_VERIFICATION_FAILED", "remote evidence differs from local"
-        )
-    result = D2DailyCreditLedger(run.request.presubmit_request.runtime_state_root)
-    attempt = result.mark_artifact_verified(
-        run.request.d2_run_id,
-        evidence=verification,
-    )
-    run.local_file.unlink()
-    return attempt
+    local_path.unlink()
+    return completed
 
 
 def _record_artifact_failure(

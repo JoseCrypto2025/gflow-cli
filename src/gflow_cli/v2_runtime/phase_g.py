@@ -20,9 +20,9 @@ from typing import Protocol, cast
 from gflow_cli.errors import WafRejectionError
 
 from .agent_recovery import AgentSettingsRecoveryJournal, RecoveryJournalError
-from .errors import V2RuntimeError
+from .errors import AssetVerificationError, V2RuntimeError
 from .google_flow import FlowPresubmitRequest, build_agent_only_directive
-from .phase_g_artifacts import VerifiedRemoteArtifact
+from .phase_g_artifacts import sha256_file, verify_remote_redownload
 
 _RUN_ID_RE = re.compile(r"^D2_[A-Za-z0-9_-]{8,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -922,6 +922,52 @@ class D2DailyCreditLedger:
 
         return self._mutate(update)
 
+    def record_local_artifact_validated(
+        self, d2_run_id: str, *, path: Path, size_bytes: int, sha256: str
+    ) -> Mapping[str, object]:
+        """Persist the validated local clip identity for later Drive finalization."""
+        if (
+            not path.is_absolute()
+            or not path.is_file()
+            or path.is_symlink()
+            or isinstance(size_bytes, bool)
+            or size_bytes <= 0
+            or not _SHA256_RE.fullmatch(sha256)
+            or path.stat().st_size != size_bytes
+        ):
+            raise PhaseGError(
+                "PHASE_G_LOCAL_ARTIFACT_INVALID", "validated local artifact identity is invalid"
+            )
+        actual_sha256 = sha256_file(path)
+        if actual_sha256 != sha256:
+            raise PhaseGError(
+                "PHASE_G_LOCAL_ARTIFACT_INVALID", "validated artifact SHA-256 does not match file"
+            )
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            attempt = self._attempt(payload, d2_run_id)
+            if attempt.get("submission_state") != "GENERATION_SUCCEEDED":
+                raise PhaseGError(
+                    "PHASE_G_ARTIFACT_RECOVERY_REQUIRED",
+                    "attributed generation must succeed before recording local media",
+                )
+            temp_root = Path(str(attempt.get("temp_root", ""))).resolve()
+            resolved_path = path.resolve()
+            if not resolved_path.is_relative_to(temp_root):
+                raise PhaseGError(
+                    "PHASE_G_LOCAL_ARTIFACT_INVALID",
+                    "validated artifact is outside its D2 temporary root",
+                )
+            attempt.update(
+                local_artifact_path=str(resolved_path),
+                local_artifact_size_bytes=size_bytes,
+                local_artifact_sha256=sha256,
+                updated_at=_utc_now(),
+            )
+            return dict(attempt)
+
+        return self._mutate(update)
+
     def accounted_today(self) -> Decimal:
         """Sum reserved or definitively spent D2 credits for the Bangkok date."""
         with self._locked_file():
@@ -931,23 +977,11 @@ class D2DailyCreditLedger:
         self,
         d2_run_id: str,
         *,
-        evidence: VerifiedRemoteArtifact,
+        remote_download: Path,
+        remote_file_id: str,
+        remote_filename: str,
     ) -> Mapping[str, object]:
-        """Complete D2 only after a retrievable remote copy matches the local file."""
-        if (
-            not evidence.remote_verified
-            or not _SHA256_RE.fullmatch(evidence.local_sha256)
-            or not _SHA256_RE.fullmatch(evidence.remote_sha256)
-            or evidence.local_sha256 != evidence.remote_sha256
-            or not evidence.remote_file_id.strip()
-            or not evidence.remote_filename.strip()
-            or isinstance(evidence.size_bytes, bool)
-            or evidence.size_bytes <= 0
-        ):
-            raise PhaseGError(
-                "PHASE_G_REMOTE_VERIFICATION_FAILED",
-                "remote file identity, size, or SHA-256 is invalid",
-            )
+        """Verify the downloaded remote copy itself before completing D2."""
 
         def update(payload: dict[str, object]) -> dict[str, object]:
             attempt = self._attempt(payload, d2_run_id)
@@ -960,6 +994,45 @@ class D2DailyCreditLedger:
                 raise PhaseGError(
                     "PHASE_G_ARTIFACT_RECOVERY_REQUIRED",
                     "exact provider media identity is required before artifact completion",
+                )
+            local_path_value = attempt.get("local_artifact_path")
+            temp_root_value = attempt.get("temp_root")
+            if not isinstance(local_path_value, str) or not isinstance(temp_root_value, str):
+                raise PhaseGError(
+                    "PHASE_G_ARTIFACT_RECOVERY_REQUIRED",
+                    "validated local artifact path is required before remote verification",
+                )
+            local_candidate = Path(local_path_value)
+            temp_root = Path(temp_root_value).resolve()
+            if local_candidate.is_symlink() or not local_candidate.is_file():
+                raise PhaseGError(
+                    "PHASE_G_LOCAL_ARTIFACT_INVALID",
+                    "validated local artifact is missing or unsafe",
+                )
+            local_path = local_candidate.resolve()
+            if not local_path.is_relative_to(temp_root):
+                raise PhaseGError(
+                    "PHASE_G_LOCAL_ARTIFACT_INVALID",
+                    "validated local artifact escaped its D2 temp root",
+                )
+            try:
+                evidence = verify_remote_redownload(
+                    local_path,
+                    remote_download,
+                    remote_file_id=remote_file_id,
+                    remote_filename=remote_filename,
+                )
+            except AssetVerificationError as exc:
+                raise PhaseGError(
+                    "PHASE_G_REMOTE_VERIFICATION_FAILED",
+                    "remote re-download could not be verified against the local artifact",
+                ) from exc
+            if evidence.size_bytes != attempt.get(
+                "local_artifact_size_bytes"
+            ) or evidence.local_sha256 != attempt.get("local_artifact_sha256"):
+                raise PhaseGError(
+                    "PHASE_G_REMOTE_VERIFICATION_FAILED",
+                    "remote verification differs from the recorded validated local artifact",
                 )
             attempt.update(
                 remote_file_id=evidence.remote_file_id,
@@ -1039,6 +1112,7 @@ class D2DailyCreditLedger:
             "requested_duration_sec": request.duration_sec,
             "requested_aspect_ratio": request.aspect_ratio,
             "requested_output_count": request.output_count,
+            "temp_root": str(request.presubmit_request.temp_root.resolve()),
             "started_at": now,
             "started_bangkok_date": datetime.now(_BANGKOK).date().isoformat(),
             "generate_action_count": 0,

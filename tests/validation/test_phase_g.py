@@ -25,7 +25,7 @@ from gflow_cli.v2_runtime.phase_g import (
     PhaseGExecutionRequest,
     validate_phase_g_request,
 )
-from gflow_cli.v2_runtime.phase_g_artifacts import VerifiedRemoteArtifact
+from gflow_cli.v2_runtime.phase_g_artifacts import sha256_file
 from gflow_cli.v2_runtime.phase_g_live_flow import parse_confirmation_quote
 
 
@@ -503,19 +503,37 @@ def test_d2_success_requires_remote_retrieval_and_matching_sha(tmp_path: Path) -
         provider_media_id="media-new",
         provider_project_id=request.provider_project_id,
     )
+    local_file = request.presubmit_request.temp_root / request.d2_run_id / "clip.mp4"
+    local_file.parent.mkdir(parents=True)
+    local_file.write_bytes(b"validated-local-mp4")
+    local_hash = sha256_file(local_file)
+    ledger.record_local_artifact_validated(
+        request.d2_run_id,
+        path=local_file,
+        size_bytes=local_file.stat().st_size,
+        sha256=local_hash,
+    )
+    remote_file = tmp_path / "drive-redownload.mp4"
+    remote_file.write_bytes(b"different-local-mp4")
     with pytest.raises(PhaseGError) as mismatch:
         ledger.mark_artifact_verified(
             request.d2_run_id,
-            evidence=VerifiedRemoteArtifact("drive-file-1", "d2-run.mp4", 1234, "a" * 64, "b" * 64),
+            remote_download=remote_file,
+            remote_file_id="drive-file-1",
+            remote_filename="d2-run.mp4",
         )
     assert mismatch.value.code == "PHASE_G_REMOTE_VERIFICATION_FAILED"
+    remote_file.write_bytes(local_file.read_bytes())
     row = ledger.mark_artifact_verified(
         request.d2_run_id,
-        evidence=VerifiedRemoteArtifact("drive-file-1", "d2-run.mp4", 1234, "a" * 64, "a" * 64),
+        remote_download=remote_file,
+        remote_file_id="drive-file-1",
+        remote_filename="d2-run.mp4",
     )
     assert row["submission_state"] == "D2_SUCCEEDED"
     assert row["remote_verified"] is True
     assert row["remote_file_id"] == "drive-file-1"
+    assert row["remote_redownload_sha256"] == local_hash
     next_request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-run-0002")
     with pytest.raises(PhaseGError) as stop:
         ledger.create_attempt(next_request)
