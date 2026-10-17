@@ -5,6 +5,7 @@ import pytest
 from gflow_cli.v2_runtime.errors import FlowPresubmitError
 from gflow_cli.v2_runtime.live_flow import (
     GoogleFlowAgentOnlyPort,
+    _contenteditable_prompt_text,
     classify_agent_surface_evidence,
 )
 
@@ -27,6 +28,12 @@ def test_live_port_resolves_repository_owned_profile_and_exposes_no_submit_api()
     assert not any(
         hasattr(port, name)
         for name in ("submit", "generate", "click_generate", "send_generation_request")
+    )
+
+
+def test_contenteditable_prompt_readback_preserves_paragraphs_and_blank_lines() -> None:
+    assert _contenteditable_prompt_text(["first line", "", "third line"]) == (
+        "first line\n\nthird line"
     )
 
 

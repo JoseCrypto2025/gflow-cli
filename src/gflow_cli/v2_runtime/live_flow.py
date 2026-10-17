@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from typing import cast
 from urllib.parse import urlparse
 
 from playwright.async_api import BrowserContext, Locator, Page, Playwright
@@ -51,6 +52,53 @@ _SETTING_KEYS = frozenset(
         "confirm_before_generating",
     }
 )
+
+
+def _contenteditable_prompt_text(blocks: Sequence[str]) -> str:
+    """Reconstruct Flow's ProseMirror paragraph blocks as the filled prompt."""
+    return "\n".join(blocks)
+
+
+async def _read_prompt_field(locator: Locator) -> str:
+    """Read the current prompt value without confusing DOM text with input value."""
+    raw_value: object = await locator.evaluate(
+        """(element) => {
+          const tag = element.tagName.toLowerCase();
+          if (tag === "input" || tag === "textarea") {
+            return {kind: "value", value: element.value};
+          }
+          if (!element.isContentEditable) {
+            return {kind: "text", value: element.innerText || ""};
+          }
+          const blocks = Array.from(element.children);
+          if (blocks.every((block) => block.tagName === "P")) {
+            return {
+              kind: "blocks",
+              blocks: blocks.map((block) => block.textContent || ""),
+            };
+          }
+          return {kind: "text", value: element.innerText || ""};
+        }"""
+    )
+    if not isinstance(raw_value, dict):
+        raise FlowPresubmitError(
+            "FLOW_PROMPT_READBACK_UNSUPPORTED", "Flow prompt readback shape is unsupported"
+        )
+    value = cast(dict[str, object], raw_value)
+    kind = value.get("kind")
+    if kind in {"value", "text"}:
+        text = value.get("value")
+        return text if isinstance(text, str) else ""
+    if kind == "blocks":
+        blocks = value.get("blocks")
+        if isinstance(blocks, list):
+            block_values = cast(list[object], blocks)
+            text_blocks = [block for block in block_values if isinstance(block, str)]
+            if len(text_blocks) == len(block_values):
+                return _contenteditable_prompt_text(text_blocks)
+    raise FlowPresubmitError(
+        "FLOW_PROMPT_READBACK_UNSUPPORTED", "Flow prompt readback shape is unsupported"
+    )
 
 
 def classify_agent_surface_evidence(
@@ -332,9 +380,7 @@ class GoogleFlowAgentOnlyPort:
         settings = await self.snapshot_settings()
         surface = await self.inspect_surface()
         prompt_field = page.locator(_PROMPT_SELECTOR)
-        prompt = await prompt_field.inner_text() if await prompt_field.count() else None
-        if prompt is not None and not prompt.strip():
-            prompt = ""
+        prompt = await _read_prompt_field(prompt_field) if await prompt_field.count() else None
         negative_supported = await self.supports_negative_prompt()
         negative = None
         if negative_supported:
