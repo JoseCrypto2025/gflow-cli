@@ -36,3 +36,48 @@ The current authorized SSH agent connected successfully. The following was obser
 | Existing state parent | The Gflow state parent exists with owner `gflow:gflow`; its session contents were not read. |
 
 `VPS_READINESS=BLOCKED` for the V2 browser runtime: the V2 install/state/log/temp roots are absent and the audited paths did not contain an installed Playwright runtime. The existing n8n and relay components remain untouched. This audit did not install packages, create directories, inspect browser session contents, change services, or deploy Phase F.
+
+## Read-only audit snapshot — 2026-10-18
+
+The audit was repeated over SSH with strict host-key checking and BatchMode.
+It made no remote changes and did not inspect browser profile contents.
+
+| Check | Observed state |
+|---|---|
+| OS / kernel | Ubuntu 24.04.4 LTS / Linux 6.8.0-124-generic |
+| CPU / memory | 2 logical CPUs; 7.8 GiB RAM, 6.3 GiB available; 4 GiB swap, 140 MiB used |
+| Disk | Root filesystem 96 GiB total, 51 GiB used, 46 GiB available; `/opt`, `/var/lib`, `/var/log`, and `/var/tmp` share it |
+| Python / Node | Python 3.12.3 / Node v20.20.2 |
+| Browser / media tools | Google Chrome 154.0.8037.57; FFmpeg/ffprobe 6.1.1; Xvfb present |
+| uv / Playwright | `uv` absent; system Python has no Playwright distribution |
+| V2 roots | `/opt/gflow-v2`, `/var/lib/gflow`, `/var/log/gflow`, `/var/tmp/gflow`, and `/var/lib/gflow/browser-state` absent |
+| Service identity | `gflow` user/group exists (UID/GID 1000) |
+| Existing legacy path | `/opt/gflow-worker` exists, owned by `gflow:gflow`; it is excluded from V2 deployment |
+| Protected services | Private relay active on `172.16.3.1:18766`; n8n/Postgres and Traefik containers present; BotTrade services present |
+| V2 listeners/processes | No V2 checkout or V2 process found; existing listener owners were recorded without changing them |
+
+`VPS_READINESS=BLOCKED` until the approved V2 application is installed with the
+locked runtime and the V2 doctor passes. The deployment must not reuse the
+legacy worker path or take ownership of the relay listener.
+
+## V2 runtime doctor
+
+After installing the exact approved application commit and creating service-
+owned runtime roots, install the doctor from the approved operations commit at
+`/opt/gflow-v2-ops/v2_runtime_doctor.py`. Keep this operator utility outside
+the application checkout so the deployed source remains byte-for-byte tied to
+its approved SHA. Run it as the `gflow` service user with the V2 virtual
+environment and explicit production roots:
+
+```sh
+sudo -u gflow env \
+  RUNTIME_ENV=production STORAGE_PROVIDER=google-drive \
+  RUNTIME_STATE_ROOT=/var/lib/gflow TEMP_ROOT=/var/tmp/gflow \
+  LOG_ROOT=/var/log/gflow GFLOW_APP_ROOT=/opt/gflow-v2 \
+  /opt/gflow-v2/.venv/bin/python /opt/gflow-v2-ops/v2_runtime_doctor.py
+```
+
+The doctor prints bounded status details only. It checks the application SHA,
+Python/uv/imports, the locked Playwright minor, Chrome/Xvfb/FFmpeg/ffprobe,
+runtime ownership and permissions, browser/recovery roots, free disk, and the
+planned loopback port. It never reads browser profile contents or submits work.
