@@ -13,15 +13,21 @@ def _oauth_property_name() -> str:
     return "".join(map(chr, (99, 108, 105, 101, 110, 116, 95, 115, 101, 99, 114, 101, 116)))
 
 
-def _client_file(path: Path) -> Path:
+def _client_file(
+    path: Path,
+    *,
+    auth_uri: object = "https://accounts.google.com/o/oauth2/v2/auth",
+    token_uri: object = "https://oauth2.googleapis.com/token",
+    client_secret: str = "fixture-only",
+) -> Path:
     path.write_text(
         json.dumps(
             {
                 "installed": {
                     "client_id": "test.apps.googleusercontent.com",
-                    _oauth_property_name(): "fixture-only",
-                    "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
+                    _oauth_property_name(): client_secret,
+                    "auth_uri": auth_uri,
+                    "token_uri": token_uri,
                 }
             }
         ),
@@ -41,6 +47,79 @@ def test_client_config_must_be_outside_checkout_and_desktop_type(tmp_path: Path)
     config = bootstrap._safe_client_config(external, repo)
     assert config["client_id"] == "test.apps.googleusercontent.com"
     assert config[_oauth_property_name()] == "fixture-only"
+
+
+@pytest.mark.parametrize(
+    "auth_uri",
+    (
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        "https://accounts.google.com/o/oauth2/auth",
+    ),
+)
+def test_client_auth_uri_metadata_allowlist_keeps_runtime_endpoint(
+    tmp_path: Path, auth_uri: str
+) -> None:
+    client = _client_file(tmp_path / "oauth.json", auth_uri=auth_uri)
+    config = bootstrap._safe_client_config(client, tmp_path / "repo")
+    assert config["auth_uri"] == auth_uri
+
+    url = bootstrap._authorization_url(
+        config["client_id"], "http://127.0.0.1:8888/oauth2callback", "state", "challenge"
+    )
+    assert url.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+
+
+@pytest.mark.parametrize(
+    "auth_uri",
+    (
+        "http://accounts.google.com/o/oauth2/auth",
+        "https://evil.example/o/oauth2/auth",
+        "https://accounts.google.com.evil.example/o/oauth2/auth",
+        "https://accounts.google.com/o/oauth2/auth?x=1",
+        ["https://accounts.google.com/o/oauth2/auth"],
+    ),
+)
+def test_client_auth_uri_metadata_rejects_non_allowlisted_values(
+    tmp_path: Path, auth_uri: object
+) -> None:
+    client = _client_file(tmp_path / "oauth.json", auth_uri=auth_uri)
+    with pytest.raises(bootstrap.BootstrapError, match="endpoint configuration"):
+        bootstrap._safe_client_config(client, tmp_path / "repo")
+
+
+def test_client_token_uri_must_remain_exact(tmp_path: Path) -> None:
+    client = _client_file(
+        tmp_path / "oauth.json", token_uri="https://oauth2.googleapis.com.evil.example/token"
+    )
+    with pytest.raises(bootstrap.BootstrapError, match="endpoint configuration"):
+        bootstrap._safe_client_config(client, tmp_path / "repo")
+
+
+@pytest.mark.parametrize(
+    "contents",
+    ("{malformed", '{"web": {"auth_uri": "https://accounts.google.com/o/oauth2/auth"}}'),
+)
+def test_malformed_or_non_installed_client_json_fails_closed(tmp_path: Path, contents: str) -> None:
+    client = tmp_path / "oauth.json"
+    client.write_text(contents, encoding="utf-8")
+    with pytest.raises(bootstrap.BootstrapError):
+        bootstrap._safe_client_config(client, tmp_path / "repo")
+
+
+def test_rejected_client_metadata_does_not_emit_secret(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "distinctive-client-secret-must-never-appear"
+    client = _client_file(
+        tmp_path / "oauth.json",
+        auth_uri="https://accounts.google.com/o/oauth2/auth?unexpected=1",
+        client_secret=secret,
+    )
+    with pytest.raises(bootstrap.BootstrapError) as exc:
+        bootstrap._safe_client_config(client, tmp_path / "repo")
+
+    assert secret not in str(exc.value)
+    assert secret not in caplog.text
 
 
 def test_picker_authorization_uses_exact_files_drive_file_and_pkce() -> None:

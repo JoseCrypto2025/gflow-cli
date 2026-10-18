@@ -30,6 +30,12 @@ EXPECTED_SHEET_TITLE = "AI_VIDEO_AUTOMATION_MASTER_V2"
 EXPECTED_SCHEMA_COUNT = 34
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
 _AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
+_ALLOWED_CLIENT_AUTH_URIS = frozenset(
+    {
+        _AUTH_URI,
+        "https://accounts.google.com/o/oauth2/auth",
+    }
+)
 _STAGED_PATH_RE = re.compile(r"^/etc/gflow-v2/\.google-authorized-user\.staged-[0-9a-f]{32}\.json$")
 _REMOTE_ROOT = "/etc/gflow-v2"
 _CANONICAL_PATH = f"{_REMOTE_ROOT}/google-authorized-user.json"
@@ -144,7 +150,11 @@ def _safe_client_config(path: Path, repository_root: Path) -> dict[str, str]:
         raise BootstrapError("OAuth Desktop client configuration is incomplete")
     auth_uri = client.get("auth_uri", _AUTH_URI)
     token_uri = client.get("token_uri", _TOKEN_URI)
-    if auth_uri != _AUTH_URI or token_uri != _TOKEN_URI:
+    if (
+        not isinstance(auth_uri, str)
+        or auth_uri not in _ALLOWED_CLIENT_AUTH_URIS
+        or token_uri != _TOKEN_URI
+    ):
         raise BootstrapError("OAuth endpoint configuration is not Google-approved")
     return {
         "client_id": client_id,
