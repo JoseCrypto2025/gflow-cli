@@ -360,7 +360,10 @@ def test_canonical_verification_failure_restores_prior_credential(
     monkeypatch.setattr(bootstrap, "_restore_remote", lambda *_args: calls.append("restore"))
     monkeypatch.setattr(bootstrap, "_cleanup_remote", lambda *_args: calls.append("cleanup"))
 
-    with pytest.raises(bootstrap.BootstrapError, match="Canonical credential verification failed"):
+    with pytest.raises(
+        bootstrap.BootstrapError,
+        match="Canonical credential verification failed: canonical verification failed",
+    ):
         bootstrap._install_verified_remote("gflow-vps", bootstrap.OUTPUT_FOLDER_ID, b"fixture")
 
     assert calls == [

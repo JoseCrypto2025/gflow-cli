@@ -625,7 +625,7 @@ def _install_verified_remote(host: str, folder_id: str, credential: bytes) -> No
         try:
             _verify_remote_install(host, folder_id, _CANONICAL_PATH)
         except BootstrapError as exc:
-            raise BootstrapError("Canonical credential verification failed") from exc
+            raise BootstrapError(f"Canonical credential verification failed: {exc}") from exc
         canonical_verified = True
         _finalize_remote(host, stage_path, credential_sha256)
     except Exception as exc:
