@@ -169,7 +169,7 @@ class GoogleSheetsSnapshotSource:
         self.spreadsheet_id = spreadsheet_id
 
     def read(self) -> GoogleSheetsSnapshot:
-        schemas = _load_schema_headers(self._schema_dir)
+        schemas = load_schema_headers(self._schema_dir)
         tables: TableRows = {}
         for table_name, headers in schemas.items():
             try:
@@ -255,7 +255,7 @@ def snapshot_document(snapshot: GoogleSheetsSnapshot) -> Mapping[str, object]:
     }
 
 
-def _load_schema_headers(schema_dir: Path) -> dict[str, tuple[str, ...]]:
+def load_schema_headers(schema_dir: Path) -> dict[str, tuple[str, ...]]:
     headers: dict[str, tuple[str, ...]] = {}
     for subdir in ("master", "transaction", "relation"):
         for schema_path in sorted((schema_dir / subdir).glob("*.schema.json")):
