@@ -55,6 +55,7 @@ classifiers = [
 dependencies = [
     "click>=8.1.0",
     "httpx>=0.27.0",
+    "google-auth[requests]>=2.56.2",
     # Upper bound is mandatory, not cosmetic. playwright is not an ordinary
     # library here: it ships the browser driver, and 100% of gflow's product
     # surface is automation through it, so an untested playwright minor is an

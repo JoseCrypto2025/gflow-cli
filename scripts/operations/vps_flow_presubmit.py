@@ -1,9 +1,4 @@
-"""Production-only, non-submitting Flow presubmit for a verified data snapshot.
-
-This operator tool has no Phase G or Generate dependency. It is not a live
-Sheets connector: a caller must provide a recent snapshot from the approved
-master spreadsheet before D5 can run.
-"""
+"""Production-only, non-submitting Flow presubmit from live V2 master data."""
 
 from __future__ import annotations
 
@@ -21,8 +16,18 @@ from typing import Any, cast
 from gflow_cli.v2_runtime.config import RuntimeSettings, load_runtime_settings
 from gflow_cli.v2_runtime.google_flow import FlowPresubmitRequest, PersistedPromptVersion
 from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, Row, preflight_scene
+from gflow_cli.v2_runtime.google_sheets import (
+    APPROVED_SPREADSHEET_ID,
+    GoogleSheetsApiTransport,
+    GoogleSheetsReadError,
+    GoogleSheetsSnapshot,
+    GoogleSheetsSnapshotSource,
+    GoogleWorkspaceCredentialProvider,
+    SOURCE_LIVE_GOOGLE_SHEETS,
+    write_snapshot_atomic,
+)
 
-SPREADSHEET_ID = "1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q"
+SPREADSHEET_ID = APPROVED_SPREADSHEET_ID
 PROD_PROJECT_NAME = "AI Video Automation V2 - PROD"
 MAX_SNAPSHOT_AGE = timedelta(minutes=5)
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -54,7 +59,7 @@ def _utc_datetime(value: object) -> datetime:
 
 
 def load_snapshot(path: Path, *, now: datetime | None = None) -> dict[str, list[Row]]:
-    """Load a small, mode-restricted snapshot; never echo paths or file contents."""
+    """Load an offline test snapshot; this is never used by the production entry point."""
     if path.is_symlink() or not path.is_file():
         raise PresubmitInputError("SNAPSHOT_FILE_INVALID", "snapshot file is unavailable")
     try:
@@ -277,18 +282,50 @@ async def run_prod_presubmit(
     }
 
 
+def _read_live_snapshot(credential_path: Path, schema_dir: Path) -> GoogleSheetsSnapshot:
+    """Build a live read source from an external credential file and close its transport."""
+    repo_root = Path(__file__).resolve().parents[2]
+    token_provider = GoogleWorkspaceCredentialProvider(
+        credential_path, repository_root=repo_root
+    )
+    transport = GoogleSheetsApiTransport(token_provider)
+    try:
+        return GoogleSheetsSnapshotSource(transport, schema_dir).read()
+    finally:
+        transport.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a production non-submitting Flow presubmit")
-    parser.add_argument("--snapshot", required=True, type=Path)
     parser.add_argument("--scene-id", required=True)
     parser.add_argument("--profile-id", required=True)
     args = parser.parse_args()
     expected_email = os.environ.get("GFLOW_EXPECTED_GOOGLE_EMAIL", "")
+    snapshot_path: Path | None = None
     try:
         settings = load_runtime_settings()
-        tables = load_snapshot(args.snapshot)
+        credential_value = os.environ.get("GFLOW_GOOGLE_WORKSPACE_CREDENTIALS", "")
+        if not credential_value:
+            raise PresubmitInputError(
+                "GOOGLE_SHEETS_AUTH_NOT_CONFIGURED",
+                "V2 Google Workspace credential setup is required before D5",
+            )
+        schema_dir = Path(__file__).resolve().parents[2] / "schemas"
+        snapshot = _read_live_snapshot(Path(credential_value), schema_dir)
+        if snapshot.source != SOURCE_LIVE_GOOGLE_SHEETS or snapshot.spreadsheet_id != SPREADSHEET_ID:
+            raise PresubmitInputError(
+                "SNAPSHOT_SOURCE_UNTRUSTED", "snapshot did not come from the approved live source"
+            )
+        snapshot_dir = Path(settings.runtime_state_root) / "d5-snapshots"
+        if snapshot_dir.is_symlink():
+            raise PresubmitInputError("SNAPSHOT_PATH_INVALID", "runtime snapshot path is invalid")
+        snapshot_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(snapshot_dir, 0o700)
+        snapshot_path = snapshot_dir / f"{args.scene_id}-{args.profile_id}.json"
+        write_snapshot_atomic(snapshot, snapshot_path, runtime_root=Path(settings.runtime_state_root))
         request, model_names = build_prod_presubmit_request(
-            tables,
+            snapshot.tables,
             scene_id=args.scene_id,
             profile_id=args.profile_id,
             settings=settings,
@@ -302,6 +339,17 @@ def main() -> int:
     except PresubmitInputError as exc:
         print(json.dumps({"state": "HOLD", "reason_code": exc.code, "detail": str(exc)}))
         return 2
+    except GoogleSheetsReadError:
+        print(
+            json.dumps(
+                {
+                    "state": "HOLD",
+                    "reason_code": "GOOGLE_SHEETS_SOURCE_FAILED",
+                    "detail": "live master-data read or validation failed safely",
+                }
+            )
+        )
+        return 2
     except Exception:
         print(
             json.dumps(
@@ -313,6 +361,9 @@ def main() -> int:
             )
         )
         return 2
+    finally:
+        if snapshot_path is not None:
+            snapshot_path.unlink(missing_ok=True)
     print(json.dumps(report, sort_keys=True))
     return 0
 

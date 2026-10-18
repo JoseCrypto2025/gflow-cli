@@ -357,7 +357,7 @@ def _validate_production_execution(tables: dict[str, list[dict[str, str]]]) -> l
                             errors.append(f"{table} row {n}: {key} must be positive")
                     except ValueError:
                         pass
-    approved = set()
+    approved: set[tuple[str, str]] = set()
     for n, r in enumerate(rows("SCENE_PROMPT_VERSION"), 2):
         st = r.get("Prompt_Status", "")
         sid = r.get("Scene_ID", "")
@@ -374,11 +374,12 @@ def _validate_production_execution(tables: dict[str, list[dict[str, str]]]) -> l
         ):
             errors.append(f"SCENE_PROMPT_VERSION row {n}: profile must be ACTIVE")
         if st == "APPROVED":
-            if sid in approved:
+            approval_key = (sid, r.get("Generation_Profile_ID", ""))
+            if approval_key in approved:
                 errors.append(
-                    f"SCENE_PROMPT_VERSION row {n}: maximum one APPROVED prompt per Scene"
+                    f"SCENE_PROMPT_VERSION row {n}: maximum one APPROVED prompt per Scene/profile"
                 )
-            approved.add(sid)
+            approved.add(approval_key)
     for n, r in enumerate(rows("PRODUCTION_JOBS"), 2):
         st = r.get("Job_Status", "")
         if st in {"RUNNING", "COMPLETED", "FAILED"} and not r.get("Started_At"):

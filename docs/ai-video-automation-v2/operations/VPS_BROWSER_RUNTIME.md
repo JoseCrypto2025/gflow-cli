@@ -100,29 +100,39 @@ installed separately under `/opt/gflow-v2-ops`. Python, the locked Playwright
 checks passed. The doctor was rerun as the service user. No V2 worker or V2
 service was started, and protected containers/listeners were unchanged.
 
-D4 remains `WAITING_FOR_HUMAN_LOGIN`. The independent `gflow-prod` profile has
-not been authenticated, and no PROD project or `PROVIDER_ACCOUNT_MASTER` row
-has been verified or created. The TEST profile and personal browser profiles
-were not copied or reused. D5 stays offline until a human completes login and
-the account/project identity is verified. Do not use the presubmit wrapper with
-an unverified snapshot.
+D4 was reverified on 2026-10-18 using the repository CLI status path: the
+`gflow-prod` profile resolved under
+`/var/lib/gflow/browser-state/profile_gflow-prod` (owner `gflow:gflow`, mode
+0700), and the Flow host-session verifier reported authenticated. The account
+identifier was redacted from operator output. The live Master Sheet contains
+active PROD account `PVA_0002` for project
+`aafe9282-071f-4333-baa4-92b9f76a9c27`. TEST profile and personal browser data
+were not copied or reused.
 
-## D5 presubmit wrapper — offline implementation
+## D5 presubmit wrapper — live-source implementation, awaiting credential
 
-`scripts/operations/vps_flow_presubmit.py` accepts an input JSON snapshot with
-`spreadsheet_id`, UTC `read_at`, and table-name-to-row-array `tables`. It rejects
-snapshots older than five minutes, the wrong spreadsheet, secret-shaped field
-names, TEST-linked profiles, missing PROD account/project/auth mapping, stale
-approved prompts, and any Phase E mismatch before calling the browser. The
-snapshot must be produced from a fresh read of the approved spreadsheet and
-kept mode 0600. No live snapshot-export adapter is implemented, so a timestamp
-inside the JSON is not proof of a live Sheet read by itself.
+`scripts/operations/vps_flow_presubmit.py` now reads the approved Sheet through
+the V2 Google Workspace credential and a read-only Sheets API transport. The
+source enforces the approved spreadsheet ID, exact headers from all local V2
+schemas, full schema/FK/semantic validation, secret-shaped field rejection,
+and producer-owned UTC `read_at`. It writes any temporary snapshot atomically
+under runtime state with mode 0600, then removes it after presubmit. The
+production entry point does not accept caller-provided JSON; `load_snapshot()`
+is retained only for offline tests.
 
-The wrapper requires `RUNTIME_ENV=production`, explicit runtime roots, and
-`GFLOW_EXPECTED_GOOGLE_EMAIL`; it calls the F5 `prepare_live_flow()` path only.
-It never performs login or calls Phase G. The report always records
-`generate_clicked=false` and `credits_used=0`. A live D5 run is still waiting
-for D4 verification and a trusted current snapshot source.
+No V2 Google Workspace credential is currently installed. The source is
+implemented and tested with fake transports, but live reads remain
+`WAITING_FOR_HUMAN_AUTH_SETUP`; D5 must hold before opening Flow until the
+dedicated OAuth credential is installed as documented in
+`GOOGLE_WORKSPACE_AUTH_BOOTSTRAP.md`.
+
+The wrapper requires `RUNTIME_ENV=production`, explicit runtime roots,
+`GFLOW_EXPECTED_GOOGLE_EMAIL`, and `GFLOW_GOOGLE_WORKSPACE_CREDENTIALS`; it
+calls F5 `prepare_live_flow()` only after current live Sheet validation. It
+never performs login or calls Phase G. The report always records
+`generate_clicked=false` and `credits_used=0`. D5 is held only on the missing
+V2 Google Workspace API credential; D4 and PROD project/account identity are
+verified.
 
 ## D7 transaction coordinator — offline implementation
 

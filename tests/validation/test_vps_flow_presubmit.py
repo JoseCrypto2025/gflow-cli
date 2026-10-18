@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from gflow_cli.v2_runtime.config import RuntimeSettings
 from gflow_cli.v2_runtime.google_flow import FlowPresubmitResult
+from gflow_cli.v2_runtime.phase_e import Row
 from scripts.operations import vps_flow_presubmit as presubmit
 from tests.validation.test_phase_e_prompt_preflight import _fixtures
 
@@ -50,10 +53,16 @@ def _prod_tables() -> dict[str, list[dict[str, object]]]:
     return tables
 
 
+def _phase_e_rows(tables: dict[str, list[dict[str, object]]]) -> Mapping[str, list[Row]]:
+    return cast(Mapping[str, list[Row]], tables)
+
+
 def _add_approved(tables: dict[str, list[dict[str, object]]]) -> None:
     from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, preflight_scene
 
-    preflight = preflight_scene(InMemorySceneCatalog(tables), "SCN_000001", "GPR_0001", "PROD")
+    preflight = preflight_scene(
+        InMemorySceneCatalog(_phase_e_rows(tables)), "SCN_000001", "GPR_0001", "PROD"
+    )
     assert preflight.status == "PREFLIGHT_PASS"
     tables["SCENE_PROMPT_VERSION"] = [
         {
@@ -74,7 +83,7 @@ def test_build_request_resolves_only_current_prod_rows(tmp_path: Path) -> None:
     _add_approved(tables)
 
     request, names = presubmit.build_prod_presubmit_request(
-        tables,
+        _phase_e_rows(tables),
         scene_id="SCN_000001",
         profile_id="GPR_0001",
         settings=_settings(tmp_path),
@@ -115,7 +124,7 @@ def test_build_request_rejects_ambiguous_or_non_prod_state(
 
     with pytest.raises(presubmit.PresubmitInputError) as exc_info:
         presubmit.build_prod_presubmit_request(
-            tables,
+            _phase_e_rows(tables),
             scene_id="SCN_000001",
             profile_id="GPR_0001",
             settings=_settings(tmp_path),
@@ -232,7 +241,7 @@ def test_runner_calls_only_non_submitting_f5(monkeypatch: pytest.MonkeyPatch) ->
     tables = _prod_tables()
     _add_approved(tables)
     request, names = presubmit.build_prod_presubmit_request(
-        tables,
+        _phase_e_rows(tables),
         scene_id="SCN_000001",
         profile_id="GPR_0001",
         settings=_settings(Path("/tmp")),
@@ -270,7 +279,7 @@ def test_runner_holds_when_f5_does_not_reach_ready(monkeypatch: pytest.MonkeyPat
     tables = _prod_tables()
     _add_approved(tables)
     request, names = presubmit.build_prod_presubmit_request(
-        tables,
+        _phase_e_rows(tables),
         scene_id="SCN_000001",
         profile_id="GPR_0001",
         settings=_settings(Path("/tmp")),
@@ -292,8 +301,6 @@ def test_main_redacts_unexpected_exception_text(monkeypatch: pytest.MonkeyPatch,
         "argv",
         [
             "vps_flow_presubmit.py",
-            "--snapshot",
-            "snapshot.json",
             "--scene-id",
             "SCN_000001",
             "--profile-id",
@@ -310,3 +317,33 @@ def test_main_redacts_unexpected_exception_text(monkeypatch: pytest.MonkeyPatch,
     output = capsys.readouterr().out
     assert "PRESUBMIT_FAILED" in output
     assert "do-not-print" not in output
+
+
+def test_main_holds_before_flow_when_v2_google_credential_is_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    from gflow_cli.v2_runtime.config import RuntimeSettings
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["vps_flow_presubmit.py", "--scene-id", "SCN_000001", "--profile-id", "GPR_0002"],
+    )
+    monkeypatch.delenv("GFLOW_GOOGLE_WORKSPACE_CREDENTIALS", raising=False)
+    monkeypatch.setattr(
+        presubmit,
+        "load_runtime_settings",
+        lambda: RuntimeSettings(
+            "production", "google-drive", Path("/state"), Path("/tmp"), Path("/logs")
+        ),
+    )
+    monkeypatch.setattr(
+        presubmit,
+        "run_prod_presubmit",
+        lambda *_args, **_kwargs: pytest.fail("Flow must not open without V2 Sheets auth"),
+    )
+
+    assert presubmit.main() == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["reason_code"] == "GOOGLE_SHEETS_AUTH_NOT_CONFIGURED"
+    assert report["state"] == "HOLD"

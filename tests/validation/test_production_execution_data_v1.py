@@ -71,6 +71,40 @@ def test_approved_prompt_is_unique_and_hashes_are_checked() -> None:
     assert any("64 hex" in e for e in errors)
 
 
+def test_test_and_prod_approvals_coexist_per_scene_and_profile() -> None:
+    tables = _seed()
+    tables["GENERATION_PROFILE_MASTER"].append(
+        {"Generation_Profile_ID": "GPR_0002", "Status": "ACTIVE"}
+    )
+    tables["SCENE_PROMPT_VERSION"].append(
+        {
+            "Scene_Prompt_ID": "SPV_000002",
+            "Scene_ID": "SCN_000001",
+            "Prompt_Version": "1",
+            "Generation_Profile_ID": "GPR_0002",
+            "Compiled_Prompt_Text": "independent production prompt",
+            "Prompt_Status": "APPROVED",
+            "Approved_At": "2026-10-18T00:00:00Z",
+        }
+    )
+    errors = validate_rows(SCHEMA_DIR, tables)
+    assert not any("maximum one APPROVED prompt" in error for error in errors)
+
+    tables["SCENE_PROMPT_VERSION"].append(
+        {
+            "Scene_Prompt_ID": "SPV_000003",
+            "Scene_ID": "SCN_000001",
+            "Prompt_Version": "2",
+            "Generation_Profile_ID": "GPR_0002",
+            "Compiled_Prompt_Text": "duplicate production approval",
+            "Prompt_Status": "APPROVED",
+            "Approved_At": "2026-10-18T00:01:00Z",
+        }
+    )
+    errors = validate_rows(SCHEMA_DIR, tables)
+    assert any("maximum one APPROVED prompt per Scene/profile" in error for error in errors)
+
+
 def test_retry_and_verified_completion_cleanup_invariant() -> None:
     tables = _seed()
     tables["SCENE_JOBS"] = [
