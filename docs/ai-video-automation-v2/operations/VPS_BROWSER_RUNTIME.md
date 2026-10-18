@@ -148,3 +148,28 @@ and its credit ledger are explicitly D2-scoped, while D2's post-submit credit
 state remains unresolved. Reusing that TEST-only runner or opening a second
 credit ledger could violate cumulative accounting; keep D6 live on HOLD until
 D2 is reconciled and a reviewed production budget path exists.
+
+## Current autonomous-run checkpoint — 2026-10-18
+
+The statements above describe the earlier 2026-10-18 D7 audit and are
+superseded for current source-code capability by the `automation-v2` checkpoint
+validated at `94c15a5b9fe07fac64cea7bc71d246b47d1d36c0`:
+
+- OAuth bootstrap stages a candidate credential, verifies the approved Sheet
+  and Drive folder as `gflow`, then atomically promotes it with digest-guarded
+  recovery. The canonical VPS credential is still absent; human OAuth consent
+  is required.
+- Phase G now has explicit environment/provider/account/project identity and a
+  single shared provider/day credit guard. This is offline engineering only;
+  it does not make D5 pass or resolve the historical D2 attempt.
+- Offline D7 Sheets and Drive adapters are implemented and fake-transport
+  tested. Sheets uses bounded optimistic read/compare/write/readback under a
+  single VPS writer lock; ordinary Sheets calls do not provide server-side CAS.
+- D7 remains **partially prepared**: the Sheets adapter is not yet wired to
+  `ProductionJobCoordinator`; current approved tabs do not persist transition
+  history or provider media ID. Drive uses multipart rather than resumable
+  upload, and its caller must supply a freshly verified output-folder identity.
+- No live Sheets/Drive write, D5 presubmit, Flow Generate, or media generation
+  was run. At the time of this checkpoint, `/opt/gflow-v2` still held
+  `9bb6e88b4805d63a59d0ff218e24b38f3117db0a`; the validated source update had
+  been pushed but not yet deployed.
