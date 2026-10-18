@@ -390,7 +390,9 @@ def _run_ssh(host: str, command: str, *, input_data: bytes | None, timeout: int)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BootstrapError("Secure Google Workspace remote operation failed") from exc
     if result.returncode != 0:
-        raise BootstrapError("Secure Google Workspace remote operation failed")
+        raise BootstrapError(
+            f"Secure Google Workspace remote operation failed (exit code {result.returncode})"
+        )
     return result.stdout
 
 
@@ -622,12 +624,10 @@ def _install_verified_remote(host: str, folder_id: str, credential: bytes) -> No
             raise BootstrapError("Remote credential promotion was not confirmed")
         try:
             _verify_remote_install(host, folder_id, _CANONICAL_PATH)
-            canonical_verified = True
-            _finalize_remote(host, stage_path, credential_sha256)
         except BootstrapError as exc:
-            raise BootstrapError(
-                "Credential promotion is on HOLD; canonical rollback must be reconciled"
-            ) from exc
+            raise BootstrapError("Canonical credential verification failed") from exc
+        canonical_verified = True
+        _finalize_remote(host, stage_path, credential_sha256)
     except Exception as exc:
         # If SSH lost the promotion acknowledgement or the follow-up status
         # probe, ``promoted`` may still be false even though the remote rename

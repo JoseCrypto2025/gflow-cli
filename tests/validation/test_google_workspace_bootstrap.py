@@ -360,7 +360,7 @@ def test_canonical_verification_failure_restores_prior_credential(
     monkeypatch.setattr(bootstrap, "_restore_remote", lambda *_args: calls.append("restore"))
     monkeypatch.setattr(bootstrap, "_cleanup_remote", lambda *_args: calls.append("cleanup"))
 
-    with pytest.raises(bootstrap.BootstrapError, match="canonical rollback must be reconciled"):
+    with pytest.raises(bootstrap.BootstrapError, match="Canonical credential verification failed"):
         bootstrap._install_verified_remote("gflow-vps", bootstrap.OUTPUT_FOLDER_ID, b"fixture")
 
     assert calls == [
@@ -371,6 +371,32 @@ def test_canonical_verification_failure_restores_prior_credential(
         "restore",
         "cleanup",
     ]
+
+
+def test_canonical_verification_failure_is_distinguished_from_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(bootstrap.secrets, "token_hex", lambda _size: "e" * 32)
+    monkeypatch.setattr(bootstrap, "_stage_remote", lambda *_args: calls.append("stage"))
+    monkeypatch.setattr(bootstrap, "_verify_remote_install", lambda *_args: calls.append("verify"))
+    monkeypatch.setattr(bootstrap, "_promote_remote", lambda *_args: calls.append("promote"))
+    monkeypatch.setattr(
+        bootstrap,
+        "_finalize_remote",
+        lambda *_args: (_ for _ in ()).throw(bootstrap.BootstrapError("finalization failed")),
+    )
+    monkeypatch.setattr(bootstrap, "_cleanup_remote", lambda *_args: calls.append("cleanup"))
+    monkeypatch.setattr(
+        bootstrap,
+        "_restore_remote",
+        lambda *_args: pytest.fail("verified canonical credential should not be rolled back"),
+    )
+
+    with pytest.raises(bootstrap.BootstrapError, match="finalization failed"):
+        bootstrap._install_verified_remote("gflow-vps", bootstrap.OUTPUT_FOLDER_ID, b"fixture")
+
+    assert calls == ["stage", "verify", "promote", "verify", "cleanup"]
 
 
 def test_remote_host_option_injection_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -399,3 +425,4 @@ def test_failed_remote_errors_are_redacted(monkeypatch: pytest.MonkeyPatch) -> N
             b"fixture",
         )
     assert "secret" not in str(exc.value)
+    assert "exit code 1" in str(exc.value)
