@@ -38,12 +38,17 @@ Request only:
 https://www.googleapis.com/auth/drive.file
 ```
 
-Google documents this as a non-sensitive, per-file scope supported by Sheets.
-The desktop/mobile Picker authorization flow permits only `drive.file`; do not
-combine another scope into that Picker consent. For a public External app,
-Google's current scope guidance says basic app verification applies to
-non-sensitive scopes. Sensitive/restricted-scope verification and the
-restricted-scope security assessment do not apply to `drive.file` alone.
+Google classifies drive.file as non-sensitive, per-file access supported by
+Sheets. The desktop/mobile Picker authorization flow permits only drive.file;
+do not combine another scope into that Picker consent. Google says an app that
+uses only non-sensitive scopes is not required to complete OAuth app
+verification. Publishing status and verification status are separate: a
+Production publishing state does not itself mean the app is verified, and
+separate brand or configuration requirements may still appear in Cloud Console.
+For this personal, limited-user use, do not assume full app verification is
+required; check the exact Console configuration before consent. Sensitive/
+restricted-scope verification and the restricted-scope security assessment do
+not apply to drive.file alone.
 
 Production publishing avoids the seven-day Testing expiry, but it does not
 guarantee a refresh token can never expire. Revocation, six months of
@@ -66,8 +71,9 @@ The human must select exactly the spreadsheet and folder above in the Google
 Picker. The authorization URL uses `trigger_onepick=true`,
 `prompt=consent`, `allow_multiple=true`, `allow_folder_selection=true`,
 and filters the Picker to those two IDs. The tool checks the exact returned ID
-set and then verifies the Sheet and writable folder through their APIs before
-installing anything.
+set and verifies the Sheet and writable folder through the APIs before sending
+credential bytes to the VPS. The candidate is then staged; the canonical
+credential is not touched until the service-user verification succeeds.
 
 The OAuth consent screen itself does not return an identity claim under the
 Picker's single `drive.file` scope. During the manual account chooser, use the
@@ -92,20 +98,33 @@ claims that Picker IDs prove the Flow account identity.
      --ssh-host gflow-vps
    ```
 
-4. Open the one-time URL printed by the tool in a browser, manually choose the
+4. Open the one-time URL printed by the tool in a browser on this workstation;
+   do not paste or share the URL. Manually choose the
    same Google account that owns the verified `gflow-prod` identity, consent
    to `drive.file`, then select the Master spreadsheet and existing
    `Job_Artifacts` folder in Picker. Do not enter passwords or MFA into the
    terminal or the bootstrap process.
 5. The loopback callback listens only on `127.0.0.1`. The tool checks OAuth
    state and PKCE, requires exactly the two approved Picker IDs and the one
-   reviewed scope, verifies the Sheet has 34 tabs and the folder can accept
-   children, then streams credential bytes over SSH stdin.
-6. The remote installer atomically writes
-   `/etc/gflow-v2/google-authorized-user.json`, owned by `gflow:gflow`,
-   mode `0600`. The tool then runs the deployed V2 read-only source as the
-   `gflow` service user and verifies all local schemas plus output-folder
-   access. It prints only the resulting status.
+   reviewed scope, and verifies the Sheet identity and writable folder before
+   streaming credential bytes over SSH stdin.
+6. The remote installer creates a unique staged file on the same filesystem
+   as the canonical path, owned by `gflow:gflow`, mode `0600`. It runs the
+   deployed V2 source as `gflow` against that staged file, checks all 34 local
+   schemas and the exact spreadsheet title, then checks the exact existing
+   `Job_Artifacts` folder identity, type, and `canAddChildren` capability.
+7. Only after staged verification passes does the installer atomically promote
+   the staged file to the canonical path and verify owner/mode/digest. Promotion
+   is serialized with a file lock; the previous canonical file is backed up
+   until canonical verification succeeds. A failed promotion or canonical
+   verification attempts a digest-guarded rollback and removes the staged file.
+   If the SSH acknowledgement is lost, the client performs a bounded status
+   check and attempts safe rollback if canonical state cannot be proven; inspect
+   file status before any rerun. Output contains only safe status text.
+
+The local bootstrap script runs on the Windows workstation; the remote install
+contract is Linux-specific and targets only the configured `gflow-vps` host.
+It is an operator script, not a CLI or MCP generation surface.
 
 The only environment setting is a path:
 
@@ -121,11 +140,13 @@ material and is treated as a credential.
 ## Failure and rotation
 
 - Missing/wrong Picker IDs, wrong Sheet title/tab count, inaccessible output
-  folder, scope drift, state mismatch, timeout, or API failure blocks install.
+  folder, scope drift, state mismatch, timeout, API failure, unsafe remote
+  directory, or stage/promotion permission mismatch blocks installation.
 - OAuth/API errors are reduced to stable safe status text; raw response bodies,
   authorization codes, access/refresh tokens, and client secrets are not logged.
-- If remote verification fails after installation, D5 remains held. Do not
-  attempt Flow or Generate.
+- If remote staged verification fails, the candidate is removed and the prior
+  canonical credential remains untouched. D5 remains held. Do not attempt Flow
+  or Generate.
 - Revoke and replace the OAuth grant after suspected exposure. Keep the V2
   credential readable only by `gflow`.
 - The D5 live source re-reads and validates all schema tables before opening
@@ -144,11 +165,12 @@ canonical UTC RFC3339 timestamps ending in one `Z`.
 
 ## Current status
 
-As of this recovery, the VPS credential file is missing. Bootstrap cannot
-complete until the human has configured the Cloud project and completed
-manual OAuth consent plus Picker grants. D5 remains held before Flow until the
-service-user source verification passes. D5 is non-generating; D6 is not
-authorized here.
+As of 2026-10-18, the VPS canonical credential file is absent and the deployed
+application SHA is `9bb6e88b4805d63a59d0ff218e24b38f3117db0a`; the V2 runtime
+doctor passes. Bootstrap cannot complete until the human has configured the
+Cloud OAuth project and completed manual consent plus Picker grants. D5 remains
+held before Flow until the staged service-user verification and D5 live
+presubmit pass. No D6 generation has occurred.
 
 ## Official Google references
 
