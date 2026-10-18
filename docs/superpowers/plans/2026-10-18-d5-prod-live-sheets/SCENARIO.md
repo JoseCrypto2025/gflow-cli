@@ -57,3 +57,48 @@ Feature: Trusted D5 production master-data source
     When a first PROD prompt candidate is approved
     Then both profile-scoped approvals remain current and the TEST row is unchanged
 ```
+
+## D5 recovery continuation — UTC, prompt immutability, and OAuth bootstrap
+
+| # | Dimension | Scenario | Severity | Expected behaviour | Test category |
+|---|---|---|---|---|---|
+| 11 | D6 Timestamp | An operator writes a value ending in ` UTCZ` or a naive local datetime | Critical | Shared UTC parser rejects it; schema validator reports a timestamp error before Phase E | Unit |
+| 12 | D6 Timestamp | A timestamp producer receives a non-UTC aware datetime | High | Shared formatter normalizes to UTC and emits one terminal `Z` marker | Unit |
+| 13 | D1 OAuth | OAuth callback has missing/wrong state, wrong path, duplicate callback, or provider error | Critical | Refuse token exchange and credential install; do not log callback query/code | Unit |
+| 14 | D1 OAuth | Picker returns missing/extra IDs or the wrong resource type | Critical | Fail closed before credential install; require exact Master Sheet + existing output folder grants | Unit |
+| 15 | D8 Paths | OAuth client JSON is inside repository, symlinked, or malformed | High | Reject before opening consent flow; never copy client config into checkout | Unit |
+| 16 | D12 Secrets | Token exchange/API failure contains client secret, code, or token response | Critical | Emit only stable safe error; no token/client secret appears in logs or report | Unit |
+| 17 | D6 Prompt integrity | Fresh PROD Phase E differs from previous source-context hash while prompt text remains the same | High | Append a distinct VALIDATED version with the fresh source hash; preserve the APPROVED row | Unit + live Sheet |
+| 18 | D6 Prompt integrity | Approval switch is attempted after source row changed since read | Critical | Abort before any write; require exact read-before-write conflict check | Unit + live Sheet |
+| 19 | D6 Prompt integrity | Exact approval switch applies to old and new rows | Critical | One atomic batch leaves exactly one APPROVED prompt per Scene/profile; TEST approval remains unchanged | Unit + live Sheet |
+| 20 | D6 Historical metadata | Old row contains exact `YYYY-MM-DDTHH:MM:SS UTCZ` after it is SUPERSEDED | High | Normalize only that exact reversible pattern to the same `...Z` instant; preserve semantic columns and status | Unit + live Sheet |
+
+OAuth bootstrap is a one-time manual-consent operator tool, not a CLI/MCP feature. Password and MFA entry remain human-only. Flow, Generate, and Phase G remain outside this operation.
+
+### Continuation must-cover scenarios
+
+1. One canonical UTC formatter/parser is reused by V2 timestamp writers and rejects malformed `UTCZ` and naive values.
+2. OAuth uses a loopback-only callback, random state, PKCE, the sole reviewed `drive.file` scope, exact Picker IDs, and redacted errors.
+3. Credentials are not installed until the spreadsheet and existing Drive output folder are verified by API.
+4. The old APPROVED prompt is immutable; the new row is appended VALIDATED, freshly checked, then switched atomically with the old row.
+5. Full 34-schema validation passes before deployment; missing OAuth consent keeps D5 before Flow.
+
+### BDD additions
+
+```gherkin
+Feature: D5 recovery and dedicated Google Workspace credential
+  Scenario: Reject malformed UTC timestamp metadata
+    Given a populated TIMESTAMP field contains a value ending in UTCZ
+    When the full V2 schema validator checks the live snapshot
+    Then it reports a timestamp validation error before Phase E
+
+  Scenario: Grant only the approved Sheet and output folder
+    Given a human completes OAuth consent and the Picker returns selected IDs
+    When the bootstrap validates the Master spreadsheet and existing output folder
+    Then it installs a 0600 service-owned credential only if both exact IDs are readable
+
+  Scenario: Switch a PROD prompt approval transactionally
+    Given the APPROVED PROD row is unchanged and a distinct VALIDATED candidate matches fresh Phase E
+    When one Sheets batch supersedes the old row and approves the candidate
+    Then exactly one PROD approval remains and the TEST approval is unchanged
+```

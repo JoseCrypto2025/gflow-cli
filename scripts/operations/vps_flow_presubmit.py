@@ -26,6 +26,7 @@ from gflow_cli.v2_runtime.google_sheets import (
     SOURCE_LIVE_GOOGLE_SHEETS,
     write_snapshot_atomic,
 )
+from gflow_cli.v2_runtime.timestamps import parse_utc_timestamp
 
 SPREADSHEET_ID = APPROVED_SPREADSHEET_ID
 PROD_PROJECT_NAME = "AI Video Automation V2 - PROD"
@@ -48,14 +49,11 @@ def _utc_datetime(value: object) -> datetime:
     if not isinstance(value, str):
         raise PresubmitInputError("SNAPSHOT_TIMESTAMP_INVALID", "snapshot timestamp is invalid")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parse_utc_timestamp(value)
     except ValueError as exc:
         raise PresubmitInputError(
             "SNAPSHOT_TIMESTAMP_INVALID", "snapshot timestamp is invalid"
         ) from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise PresubmitInputError("SNAPSHOT_TIMESTAMP_INVALID", "snapshot timestamp must be UTC")
-    return parsed.astimezone(UTC)
 
 
 def load_snapshot(path: Path, *, now: datetime | None = None) -> dict[str, list[Row]]:

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .errors import DiskSpaceError
+from .timestamps import format_utc_timestamp
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +35,13 @@ def check_free_space(
     free = usage.free
     required = minimum_bytes + estimated_job_bytes
     return DiskGuardResult(
-        free >= required, path, free, usage.total, required, job_id, datetime.now(UTC).isoformat()
+        free >= required,
+        path,
+        free,
+        usage.total,
+        required,
+        job_id,
+        format_utc_timestamp(datetime.now(UTC), timespec="auto"),
     )
 
 

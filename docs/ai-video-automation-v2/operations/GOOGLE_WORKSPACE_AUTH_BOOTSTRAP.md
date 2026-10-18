@@ -1,70 +1,159 @@
-# V2 Google Workspace API Credential Bootstrap
+# V2 Google Workspace OAuth and Picker bootstrap
 
-## Purpose and status
+## Purpose and boundaries
 
-The V2 D5 source uses a dedicated Google OAuth user credential. It does not use
-the gflow Flow browser profile, the Google Drive connector, n8n credentials, or
-any Chrome cookie/session data. The current repository has no V2 OAuth
-credential installed on the VPS, so live Sheet reads and D5 remain held until
-the one-time setup below is complete.
+The D5 source uses a dedicated Google OAuth user credential. It does not use
+the gflow Flow browser profile, Flow cookies, Chrome profile databases, n8n
+credentials, Google Drive connector credentials, or a human-authored snapshot.
+The credential supports bounded reads of the approved Master Sheet, future
+bounded Sheet writes, and upload/verification in one existing output folder.
 
-The credential is intended to support later bounded Sheets writes and Drive
-upload/remote verification. Current code implements Sheets reads only; it has
-no Sheet write operation.
+The bootstrap is an operator-only one-time tool. The human completes Google
+sign-in, consent, and Picker selection; the tool exchanges the authorization
+code, verifies the selected resources, and transfers the credential over
+strict-host-key-checked SSH stdin. It never automates password or MFA entry and
+does not write credential content to a local file, command line, environment,
+log, or report.
 
-## One-time setup
+## Google Cloud configuration
 
-1. In a Google Cloud project owned by the data owner, enable the Google Sheets
-   API and Google Drive API.
-2. Configure a dedicated OAuth consent application and client for V2. Do not
-   reuse n8n credentials or a browser session.
-3. Request the narrow `https://www.googleapis.com/auth/drive.file` scope. The
-   Sheets API supports this per-file scope; Drive access remains restricted to
-   files granted to the app.
-4. Explicitly grant the app the approved Master spreadsheet and the dedicated
-   V2 output folder using a Picker-based file grant. Do not grant broad Drive
-   access.
-5. For unattended use, publish the consent app to Production and complete any
-   Google verification required for its scopes. An external OAuth app left in
-   Testing issues refresh tokens that expire after seven days for non-basic
-   scopes.
-6. Complete OAuth consent manually in a trusted browser. Do not automate
-   password/MFA, reuse the Flow browser profile, or copy Flow cookies.
-7. Install the resulting `authorized_user` credential at:
+Use a dedicated Cloud project and OAuth Desktop application client. Do not
+reuse n8n, Flow, or connector credentials.
 
-   ```text
-   /etc/gflow-v2/google-authorized-user.json
+Enable these APIs in that project:
+
+1. Google Sheets API.
+2. Google Drive API.
+3. Google Picker API.
+
+Configure the OAuth audience for the Google account that owns or can use the
+approved resources. A consumer Google account requires **External**. Add the
+account as a test user while testing. Set publishing status to **Production**
+before unattended use; an External app left in Testing issues refresh tokens
+that expire after seven days for non-basic scopes.
+
+Request only:
+
+```text
+https://www.googleapis.com/auth/drive.file
+```
+
+Google documents this as a non-sensitive, per-file scope supported by Sheets.
+The desktop/mobile Picker authorization flow permits only `drive.file`; do not
+combine another scope into that Picker consent. For a public External app,
+Google's current scope guidance says basic app verification applies to
+non-sensitive scopes. Sensitive/restricted-scope verification and the
+restricted-scope security assessment do not apply to `drive.file` alone.
+
+Production publishing avoids the seven-day Testing expiry, but it does not
+guarantee a refresh token can never expire. Revocation, six months of
+inactivity, token-count limits, account policies, and other documented causes
+can invalidate a refresh token.
+
+## Existing resources and grant contract
+
+The script is pinned to these existing resources and refuses different IDs:
+
+| Resource | ID | Required verification |
+|---|---|---|
+| Master spreadsheet | `1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q` | Exact title `AI_VIDEO_AUTOMATION_MASTER_V2`; 34 tabs |
+| V2 output folder | `1IXhplXVv4ukNhb2EWnAqV2nL2e1V1x0L` | Existing `Job_Artifacts` folder; Drive reports `canAddChildren=true` |
+
+The output folder already exists and was observed empty during this recovery.
+Do not create another folder or put test files in it.
+
+The human must select exactly the spreadsheet and folder above in the Google
+Picker. The authorization URL uses `trigger_onepick=true`,
+`prompt=consent`, `allow_multiple=true`, `allow_folder_selection=true`,
+and filters the Picker to those two IDs. The tool checks the exact returned ID
+set and then verifies the Sheet and writable folder through their APIs before
+installing anything.
+
+The OAuth consent screen itself does not return an identity claim under the
+Picker's single `drive.file` scope. During the manual account chooser, use the
+same intended Google account verified for `gflow-prod`; the script never
+claims that Picker IDs prove the Flow account identity.
+
+## Human bootstrap procedure
+
+1. In Google Cloud Console, confirm the dedicated project has Sheets, Drive,
+   and Picker APIs enabled; the OAuth audience and publishing status are
+   appropriate for unattended use; and the required account is allowed to
+   consent.
+2. Create or download an OAuth **Desktop app** client JSON. Keep it outside
+   `D:\Gflow-CLI`; never commit or attach it to a ticket.
+3. After the reviewed V2 code has been deployed, run on the authorized
+   Windows workstation:
+
+   ```powershell
+   cd D:\Gflow-CLI
+   uv run python scripts/operations/bootstrap_google_workspace_auth.py `
+     --oauth-client-json "C:\path\outside-repository\oauth-client.json" `
+     --ssh-host gflow-vps
    ```
 
-   It must be owned by `gflow:gflow`, mode `0600`, and remain outside Git,
-   runtime snapshot directories, Google Sheets, Drive, and logs. Set:
+4. Open the one-time URL printed by the tool in a browser, manually choose the
+   same Google account that owns the verified `gflow-prod` identity, consent
+   to `drive.file`, then select the Master spreadsheet and existing
+   `Job_Artifacts` folder in Picker. Do not enter passwords or MFA into the
+   terminal or the bootstrap process.
+5. The loopback callback listens only on `127.0.0.1`. The tool checks OAuth
+   state and PKCE, requires exactly the two approved Picker IDs and the one
+   reviewed scope, verifies the Sheet has 34 tabs and the folder can accept
+   children, then streams credential bytes over SSH stdin.
+6. The remote installer atomically writes
+   `/etc/gflow-v2/google-authorized-user.json`, owned by `gflow:gflow`,
+   mode `0600`. The tool then runs the deployed V2 read-only source as the
+   `gflow` service user and verifies all local schemas plus output-folder
+   access. It prints only the resulting status.
 
-   ```text
-   GFLOW_GOOGLE_WORKSPACE_CREDENTIALS=/etc/gflow-v2/google-authorized-user.json
-   ```
+The only environment setting is a path:
 
-   Do not put the credential JSON contents in an environment file, command
-   line, ticket, or report.
+```text
+GFLOW_GOOGLE_WORKSPACE_CREDENTIALS=/etc/gflow-v2/google-authorized-user.json
+```
 
-## Rotation and failure handling
+Never place credential JSON in an environment file or pass it on a command
+line. The local OAuth client configuration and authorized-user data must remain
+outside Git. The generated authorized-user file contains refresh-token
+material and is treated as a credential.
 
-- Keep the file readable only by the Gflow service identity.
-- Revoke and replace the credential after suspected exposure.
-- Treat refresh/API failure as a D5 hold. Never fall back to browser cookies,
-  n8n secrets, connector credentials, or human-authored snapshots.
-- Emit stable error codes only; never log authorization headers, token
-  responses, refresh tokens, API response bodies, or credential contents.
-- Before D5, verify owner/mode and perform a read-only request against the exact
-  approved spreadsheet.
+## Failure and rotation
 
-## Current human action required
+- Missing/wrong Picker IDs, wrong Sheet title/tab count, inaccessible output
+  folder, scope drift, state mismatch, timeout, or API failure blocks install.
+- OAuth/API errors are reduced to stable safe status text; raw response bodies,
+  authorization codes, access/refresh tokens, and client secrets are not logged.
+- If remote verification fails after installation, D5 remains held. Do not
+  attempt Flow or Generate.
+- Revoke and replace the OAuth grant after suspected exposure. Keep the V2
+  credential readable only by `gflow`.
+- The D5 live source re-reads and validates all schema tables before opening
+  Flow. It assigns a UTC RFC3339 `read_at` only after successful reads and
+  validation.
 
-Set up and authorize the dedicated V2 OAuth app with `drive.file`, grant only
-the approved Master spreadsheet and V2 output folder, then install its
-`authorized_user` file at the path above with owner `gflow:gflow` and mode
-`0600`. Until then, `GOOGLE_SHEETS_LIVE_SOURCE` is
-`WAITING_FOR_HUMAN_AUTH_SETUP` and D5 must not open Flow.
+## Timestamp defect recovery
 
-Google's primary references: [Sheets API scope choices](https://developers.google.com/workspace/sheets/api/scopes),
-[OAuth 2.0 refresh-token behavior](https://developers.google.com/identity/protocols/oauth2/),
-and [Drive file-scope guidance](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
+The malformed `UTCZ` values did not come from a V2 timestamp producer. The
+operator-side conversion kept the displayed ` UTC` suffix while changing the
+date/time separator to `T` and appending `Z`. The affected values mapped
+unambiguously to the same UTC instants; historical prompt metadata was
+normalized only after the old prompt became `SUPERSEDED`. V2 writers now use a
+shared aware-datetime formatter, and the schema validator accepts only
+canonical UTC RFC3339 timestamps ending in one `Z`.
+
+## Current status
+
+As of this recovery, the VPS credential file is missing. Bootstrap cannot
+complete until the human has configured the Cloud project and completed
+manual OAuth consent plus Picker grants. D5 remains held before Flow until the
+service-user source verification passes. D5 is non-generating; D6 is not
+authorized here.
+
+## Official Google references
+
+- [Google Picker for desktop and mobile apps](https://developers.google.com/workspace/drive/picker/guides/desktop-mobile-picker)
+- [Google Sheets API OAuth scopes](https://developers.google.com/workspace/sheets/api/scopes)
+- [Google Drive API scope guidance](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
+- [OAuth 2.0 refresh-token behavior](https://developers.google.com/identity/protocols/oauth2/)
+- [OAuth app audience and publishing status](https://support.google.com/cloud/answer/15549945?hl=en)

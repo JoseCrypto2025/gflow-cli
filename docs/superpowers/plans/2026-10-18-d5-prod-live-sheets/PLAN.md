@@ -122,3 +122,37 @@ docs/ai-video-automation-v2/operations/VPS_BROWSER_RUNTIME.md — updated D5 rea
 - [ ] Fake tests cover schema, provenance, security, atomicity, and fail-closed behavior.
 - [ ] Missing real V2 credential is reported as `WAITING_FOR_HUMAN_AUTH_SETUP`; no Generate/credit spend/D6 occurs.
 - [ ] Checks, push, exact-SHA deployment, and runtime doctor are recorded.
+
+## Continuation tasks — UTC root cause, immutable repair, and OAuth bootstrap
+
+These tasks extend the already-approved D5 live-source plan. The continuation request overrides its earlier read-only-only Sheet wording solely for the one-time prompt recovery; the runtime Google Sheets source remains read-only. No general Sheets transaction writer or APPROVED-row metadata bypass is added.
+
+### Task 7 — Canonical UTC and strict schema timestamps
+
+- [x] Add a shared V2 UTC formatter/parser with canonical RFC3339 `Z` output and aware-only input.
+- [x] Reuse it in V2 timestamp producers and strict TIMESTAMP validation.
+- [x] Add regression tests for one `Z`, UTC normalization, naive rejection, malformed `UTCZ`, and validator errors.
+
+### Task 8 — Fresh Phase E and immutable PROD version recovery
+
+- [x] Re-read all exact source rows and current approval rows immediately before each write.
+- [x] Append a new VALIDATED version using fresh Phase E and derived next ID/version.
+- [x] Read back and exact-match fields, then atomically switch old/new status in one batch.
+- [x] Normalize old malformed metadata only after old row is confirmed SUPERSEDED; preserve all semantic fields.
+- [x] Validate all 34 live tables; require zero errors before deployment.
+
+### Task 9 — Deterministic Google Workspace OAuth/Picker bootstrap
+
+- [x] Implement an operator-only bootstrap accepting OAuth client JSON outside checkout.
+- [x] Use loopback-only callback, state + PKCE, manual consent, only `drive.file`, and Picker with exact spreadsheet/folder IDs.
+- [x] Verify both resources via Sheets/Drive APIs before atomic remote install; never print tokens/client secret.
+- [x] Update runbook with exact Cloud Console APIs, audience/publishing, verification status, callback/grant steps, secure install, and timestamp RCA.
+- [x] Add fake HTTP/callback/security tests; no password/MFA automation or OAuth live test until human consent.
+
+### Task 10 — Quality, exact-SHA deploy, and D5 gate
+
+- [x] Run all focused and full offline gates, schema validation, changed-file secret scan, and hygiene.
+- [ ] Commit and push only to `origin/automation-v2`; require clean tree and remote SHA match.
+- [ ] Deploy that exact SHA using the supported V2 install path; preserve prior deployed SHA and run doctor.
+- [ ] Stop at `HUMAN_GOOGLE_OAUTH_ACTION_REQUIRED` until consent/grants exist; after credential install verify 34 live tables + output folder, then run only D5 F5.
+- [x] Generate remains unclicked; D6 remains NOT_STARTED.

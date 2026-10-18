@@ -8,7 +8,7 @@ import csv
 import json
 import re
 import sys
-from datetime import datetime
+from gflow_cli.v2_runtime.timestamps import parse_utc_timestamp
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -147,12 +147,9 @@ def _type_error(value: str, data_type: str) -> str | None:
         return "must be boolean"
     elif kind == "TIMESTAMP":
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parse_utc_timestamp(value)
         except ValueError:
-            return "must be ISO 8601 timestamp"
-        offset = parsed.utcoffset()
-        if parsed.tzinfo is None or offset is None or offset.total_seconds() != 0:
-            return "must use UTC ISO 8601"
+            return "must be canonical UTC RFC3339 timestamp ending in Z"
     elif kind == "URL":
         parsed_url = urlparse(value)
         if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:

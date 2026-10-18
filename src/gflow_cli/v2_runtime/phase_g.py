@@ -23,6 +23,7 @@ from .agent_recovery import AgentSettingsRecoveryJournal, RecoveryJournalError
 from .errors import AssetVerificationError, V2RuntimeError
 from .google_flow import FlowPresubmitRequest, build_agent_only_directive
 from .phase_g_artifacts import sha256_file, verify_remote_redownload
+from .timestamps import format_utc_timestamp
 
 _RUN_ID_RE = re.compile(r"^D2_[A-Za-z0-9_-]{8,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1297,4 +1298,4 @@ def _counter(value: object) -> int:
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return format_utc_timestamp(datetime.now(UTC), timespec="seconds")

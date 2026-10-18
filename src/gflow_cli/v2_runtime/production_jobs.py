@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from typing import Protocol
 from urllib.parse import urlparse
 
+from .timestamps import format_utc_timestamp
+
 
 class JobConflictError(ValueError):
     """A request key, attempt key, or expected state conflicts with stored data."""
@@ -57,9 +59,7 @@ _TRANSITIONS: dict[str, frozenset[str]] = {
 
 def _utc(value: datetime | None) -> str:
     moment = value or datetime.now(UTC)
-    if moment.tzinfo is None or moment.utcoffset() is None:
-        raise ValueError("job timestamps must be timezone-aware")
-    return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    return format_utc_timestamp(moment, timespec="auto")
 
 
 def _canonical_digest(value: Mapping[str, object]) -> str:

@@ -17,6 +17,8 @@ from urllib.parse import quote
 
 import httpx
 
+from .timestamps import format_utc_timestamp
+
 Row = Mapping[str, object]
 TableRows = dict[str, list[Row]]
 APPROVED_SPREADSHEET_ID = "1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q"
@@ -65,6 +67,10 @@ class GoogleWorkspaceCredentialProvider:
             raise GoogleSheetsReadError("Google Workspace credential must be outside the checkout")
         if os.name == "posix" and stat.S_IMODE(path.stat().st_mode) & 0o077:
             raise GoogleSheetsReadError("Google Workspace credential permissions are too broad")
+        if os.name == "posix" and path.stat().st_uid != os.geteuid():
+            raise GoogleSheetsReadError(
+                "Google Workspace credential owner does not match service user"
+            )
         try:
             from google.oauth2.credentials import Credentials
 
@@ -181,7 +187,7 @@ class GoogleSheetsSnapshotSource:
             raise GoogleSheetsReadError("snapshot clock must return a UTC-aware timestamp")
         return GoogleSheetsSnapshot(
             spreadsheet_id=self.spreadsheet_id,
-            read_at=read_at.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            read_at=format_utc_timestamp(read_at, timespec="seconds"),
             source=SOURCE_LIVE_GOOGLE_SHEETS,
             tables=tables,
         )

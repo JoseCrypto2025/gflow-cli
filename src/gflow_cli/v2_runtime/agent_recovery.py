@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from .errors import V2RuntimeError
+from .timestamps import format_utc_timestamp
 
 JournalState = Literal["CLEAN", "DIRTY", "RESTORING"]
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -243,4 +244,4 @@ class AgentSettingsRecoveryJournal:
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return format_utc_timestamp(datetime.now(UTC), timespec="seconds")
