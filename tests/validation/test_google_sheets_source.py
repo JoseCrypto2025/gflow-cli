@@ -285,6 +285,88 @@ def test_batch_get_uses_one_ordered_request_and_maps_every_range() -> None:
     client.close()
 
 
+def test_batch_get_accepts_canonical_quoted_absolute_ranges_and_empty_values() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "valueRanges": [
+                    {"range": "'FIRST'!$A$1:$AZ$1001", "values": [["ID", "Value"]]},
+                    {"range": "'SECOND'!$A$1:$AZ$1001"},
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(Tokens(), client=client)
+    assert adapter.read_values_batch(
+        APPROVED_SPREADSHEET_ID,
+        {"FIRST": "A1:AZ1001", "SECOND": "A1:AZ1001"},
+    ) == {"FIRST": [["ID", "Value"]], "SECOND": []}
+    adapter.close()
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("returned_range", "expected_title"),
+    [
+        ("Sheet1!A1:B2", "Sheet1"),
+        ("'My Custom Sheet'!$A$1:$B$2", "My Custom Sheet"),
+        ("'Jon''s_Data'!A1:B2", "Jon's_Data"),
+    ],
+)
+def test_a1_range_parser_handles_quoted_titles_and_absolute_cells(
+    returned_range: str, expected_title: str
+) -> None:
+    from gflow_cli.v2_runtime.google_sheets import _parse_a1_range
+
+    parsed = _parse_a1_range(returned_range)
+    assert parsed is not None
+    assert parsed.sheet_name == expected_title
+    assert parsed.bounds == (1, 1, 2, 2)
+
+
+def test_batch_get_reports_safe_diagnostic_for_range_identity_mismatch() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "valueRanges": [
+                    {"range": "SECOND!A1:AZ1001", "values": []},
+                    {"range": "FIRST!A1:AZ1001", "values": []},
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(Tokens(), client=client)
+    with pytest.raises(GoogleSheetsReadError) as error:
+        adapter.read_values_batch(
+            APPROVED_SPREADSHEET_ID,
+            {"FIRST": "A1:AZ1001", "SECOND": "A1:AZ1001"},
+        )
+    message = str(error.value)
+    assert "BATCH_RESPONSE_COUNT=2" in message
+    assert "EXPECTED_RANGE_COUNT=2" in message
+    assert "FAILED_INDEX=0" in message
+    assert "REQUESTED_RANGE=FIRST!A1:AZ1001" in message
+    assert "RETURNED_RANGE=SECOND!A1:AZ1001" in message
+    assert "FAILURE_REASON=sheet_mismatch" in message
+    assert "secret-token" not in message
+    adapter.close()
+    client.close()
+
+
 def test_full_34_schema_snapshot_uses_one_batch_and_keeps_validation(tmp_path: Path) -> None:
     schema_dir = Path(__file__).resolve().parents[2] / "schemas"
     from gflow_cli.v2_runtime.google_sheets import load_schema_headers
@@ -298,7 +380,12 @@ def test_full_34_schema_snapshot_uses_one_batch_and_keeps_validation(tmp_path: P
         value_ranges = []
         for a1_range in ranges:
             sheet_name = a1_range.split("!", 1)[0].strip("'")
-            value_ranges.append({"range": a1_range, "values": [list(headers[sheet_name])]})
+            value_ranges.append(
+                {
+                    "range": f"'{sheet_name}'!$A$1:$AZ$1001",
+                    "values": [list(headers[sheet_name]), [], []],
+                }
+            )
         return httpx.Response(200, json={"valueRanges": value_ranges})
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -313,6 +400,51 @@ def test_full_34_schema_snapshot_uses_one_batch_and_keeps_validation(tmp_path: P
     assert all(rows == [] for rows in snapshot.tables.values())
     assert len(seen) == 1
     assert len(seen[0].url.params.get_list("ranges")) == 34
+
+    sequential_values = {
+        table_name: [list(table_headers), [], []] for table_name, table_headers in headers.items()
+    }
+
+    class SequentialTransport:
+        def read_values(
+            self, spreadsheet_id: str, sheet_name: str, value_range: str
+        ) -> Sequence[Sequence[object]]:
+            del spreadsheet_id, value_range
+            return sequential_values[sheet_name]
+
+    sequential_snapshot = GoogleSheetsSnapshotSource(SequentialTransport(), schema_dir).read()
+    assert snapshot.tables == sequential_snapshot.tables
+    adapter.close()
+    client.close()
+
+
+@pytest.mark.parametrize("response_count", [0, 2])
+def test_batch_get_range_count_mismatch_has_bounded_diagnostic(response_count: int) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "valueRanges": [
+                    {"range": "FIRST!A1:AZ1001", "values": []} for _ in range(response_count)
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(Tokens(), client=client)
+    with pytest.raises(GoogleSheetsReadError) as error:
+        adapter.read_values_batch(APPROVED_SPREADSHEET_ID, {"FIRST": "A1:AZ1001"})
+    message = str(error.value)
+    assert f"BATCH_RESPONSE_COUNT={response_count}" in message
+    assert "EXPECTED_RANGE_COUNT=1" in message
+    assert "FAILED_INDEX=<none>" in message
+    assert "FAILURE_REASON=range_count_mismatch" in message
+    assert "secret-token" not in message
     adapter.close()
     client.close()
 

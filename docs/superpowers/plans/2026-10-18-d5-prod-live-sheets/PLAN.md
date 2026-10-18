@@ -152,7 +152,31 @@ These tasks extend the already-approved D5 live-source plan. The continuation re
 ### Task 10 — Quality, exact-SHA deploy, and D5 gate
 
 - [x] Run all focused and full offline gates, schema validation, changed-file secret scan, and hygiene.
-- [ ] Commit and push only to `origin/automation-v2`; require clean tree and remote SHA match.
-- [ ] Deploy that exact SHA using the supported V2 install path; preserve prior deployed SHA and run doctor.
-- [ ] Stop at `HUMAN_GOOGLE_OAUTH_ACTION_REQUIRED` until consent/grants exist; after credential install verify 34 live tables + output folder, then run only D5 F5.
+- [x] Commit and push only to `origin/automation-v2`; require clean tree and remote SHA match.
+- [x] Deploy the tested runtime source SHA using the supported V2 install path; preserve prior deployed SHA and pass the V2 doctor.
+- [x] Hold before Flow until human consent/grants exist; after credential installation verify the 34-table snapshot and existing output folder.
+- [ ] Run only the D5 F5 live, non-generating presubmit; keep Generate unclicked and credits at zero.
 - [x] Generate remains unclicked; D6 remains NOT_STARTED.
+
+### Task 11 — Sheets request batching and bounded rate-limit recovery
+
+**What:** Keep the full 34-schema validator authoritative while avoiding duplicate reads and surviving transient Google API throttling.
+
+**Steps:**
+- [x] Record baseline: 34 sequential values GETs per snapshot; pickerless precheck plus staged verification repeats the full dataset (68 value requests) and makes two additional Sheets metadata GETs.
+- [x] Add one `values.batchGet` for the schema-ordered approved tabs, retaining each existing bounded `A1:AZ1001` range and all per-tab validation semantics.
+- [x] Remove the redundant full schema read from the pickerless direct grant precheck; retain its exact Sheet/Drive identity checks and run the single authoritative full schema validation against the staged credential.
+- [x] Add sequential bounded retry for safe Google API GETs on 429/5xx only, honoring Retry-After within a total deadline; preserve 401/403 behavior.
+- [x] Carry only a typed exhausted-429 signal across the remote verifier boundary. On that signal, verify candidate digest and secure metadata, retain the stage, report `STAGED_VERIFY=DEFERRED_RATE_LIMIT`, and skip promotion/finalization. All other failures keep cleanup/rollback.
+- [x] Update the OAuth operations runbook with retry limits and the safe re-verification command for a retained stage.
+
+**Tests:** Retry-After seconds/date, exponential fallback and total bounds, success after 429, exhausted 429, 5xx retry, no 401/403 retry, exact batch range mapping and unchanged 34-schema validation, reduced request count, direct-precheck duplicate-read removal, retained stage/no promotion/no finalization after exhausted 429, safe metadata checks, and existing cleanup on non-rate-limit failures.
+
+**Definition of done:** One values batch request per full 34-schema verification; one full snapshot read per bootstrap; complete valid snapshot remains semantically identical; staged 429 yields a secure resumable HOLD with no OAuth rerun; no live OAuth, VPS mutation, Flow, or generation is performed by engineering tests.
+
+### D5 Google Workspace OAuth live closeout — 2026-10-18
+
+- **D5 Google Workspace OAuth: DONE.** Pickerless reuse of the approved `drive.file` grant succeeded; the canonical credential was installed through the exact-path/exact-SHA resume flow and verified as `gflow:gflow`, mode `0600`, readable by `gflow`.
+- The live verifier passed the approved Master Sheet, all 34 schemas, and the existing `Job_Artifacts` folder. No OAuth rerun or Picker was needed for promotion.
+- The OAuth and credential flow is closed; change it only after a real future failure is demonstrated.
+- **Next:** D5 VPS non-generating F5 presubmit remains pending. Revalidate the live PROD identity, current unique APPROVED prompt, and production runtime prerequisites before running it. D6 remains NOT_STARTED; the Generate kill switch remains active.

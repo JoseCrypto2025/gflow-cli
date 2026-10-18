@@ -102,3 +102,25 @@ Feature: D5 recovery and dedicated Google Workspace credential
     When one Sheets batch supersedes the old row and approves the candidate
     Then exactly one PROD approval remains and the TEST approval is unchanged
 ```
+
+### Continuation — D5 Sheets rate-limit and request-efficiency recovery
+
+| # | Dimension | Scenario | Severity | Expected behaviour | Test category |
+|---|---|---|---|---|---|
+| 21 | D6/API resilience | One or more Sheets `values.batchGet` requests return HTTP 429 with a valid `Retry-After`, then succeed | High | Honor the bounded delay, assemble the same 34-table snapshot, and run unchanged header/row/FK/semantic validation | Unit |
+| 22 | D7/API resilience | The staged verifier exhausts bounded HTTP 429 retries | High | Preserve only the unchanged staged candidate after verifying its digest, owner/group, mode, and readability; report `DEFERRED_RATE_LIMIT`, skip promotion/finalization, and allow later re-verification without OAuth | Unit |
+| 23 | D7/Auth | Sheets returns HTTP 401 or 403 during snapshot verification | Critical | Do not retry as a rate limit; keep existing fail-closed cleanup and safe error behavior | Unit |
+| 24 | D6/Request efficiency | The full schema snapshot is fetched | Medium | Use one ordered `values.batchGet` with explicit bounded ranges; reject missing/duplicate/unexpected ranges and preserve exact existing validation results | Unit |
+| 25 | D6/Request efficiency | Pickerless grant precheck and staged verification run in one bootstrap | Medium | Do not read all 34 table ranges twice; the staged credential verification is the authoritative full schema read | Unit |
+
+Retry policy: seven total attempts maximum (initial request plus six retries), fallback delays near 1/2/4/8/16/32 seconds with bounded jitter, valid `Retry-After` preferred, total wait bounded to 90 seconds. Retry only safe Google API GETs on HTTP 429 and 5xx. Never retry 401/403, OAuth token exchange, writes, or schema validation errors. Batch response ranges remain bounded to the existing `A1:AZ1001` per approved tab so the existing overflow-column rejection remains intact.
+
+An exhausted 429 is a verification HOLD, not a credential failure. Keep the unpromoted credential only when the remote verifier returns the typed 429-exhausted signal and remote metadata still matches the staged SHA-256, `gflow:gflow`, mode `0600`, parent mode `0750`, and `gflow` readability. Emit the exact stage path and SHA-256 so the existing resume command can re-verify it; do not promote or finalize until a later complete verification succeeds. All other failures retain the existing cleanup and rollback behavior.
+
+## D5 Google Workspace OAuth live closeout — 2026-10-18
+
+- **D5 Google Workspace OAuth = DONE.** The existing `drive.file` grant was reused without opening Picker; the exact staged credential passed the 34-schema, Master Sheet, and `Job_Artifacts` checks, then was promoted and canonically verified as `gflow:gflow`, mode `0600`, readable by `gflow`.
+- OAuth authorization and credential handling are closed. Do not change that flow absent a demonstrated future failure.
+- **Next milestone:** D5 VPS non-generating presubmit (Phase F5), status **PENDING / NOT RUN**. Its dependencies are the verified `gflow-prod` identity and PROD project/account, canonical Workspace credential, a fresh valid 34-schema snapshot, and exactly one current APPROVED PROD prompt matching fresh Phase E. Recheck these at execution time.
+- **Known downstream hold:** D2 remains `UNKNOWN_SUBMISSION_STATE`; that blocks D6 paid generation until reconciled. D6 and Generate remain unstarted.
+- Recommended first action: run the repository-supported D5 F5 presubmit preflight against the live PROD identity and current Sheet data; stop on any mismatch without clicking Generate.

@@ -50,6 +50,113 @@ class GoogleSheetsRateLimitExhaustedError(GoogleSheetsReadError):
 _MAX_GET_ATTEMPTS = 7
 _MAX_RETRY_WAIT_SECONDS = 90.0
 _BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+_A1_CELL_RE = re.compile(r"\$?([A-Za-z]+)\$?([1-9][0-9]*)\Z")
+_SAFE_SHEET_DIAGNOSTIC_RE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+
+
+@dataclass(frozen=True)
+class _ParsedA1Range:
+    sheet_name: str
+    bounds: tuple[int, int, int, int]
+
+
+def _parse_a1_range(value: str) -> _ParsedA1Range | None:
+    """Parse a bounded A1 range, including quoted titles and absolute cells."""
+    if not value or len(value) > 512:
+        return None
+    if value.startswith("'"):
+        title_chars: list[str] = []
+        index = 1
+        while index < len(value):
+            char = value[index]
+            if char == "'":
+                if index + 1 < len(value) and value[index + 1] == "'":
+                    title_chars.append("'")
+                    index += 2
+                    continue
+                if index + 1 >= len(value) or value[index + 1] != "!":
+                    return None
+                sheet_name = "".join(title_chars)
+                cell_range = value[index + 2 :]
+                break
+            title_chars.append(char)
+            index += 1
+        else:
+            return None
+    else:
+        if value.count("!") != 1:
+            return None
+        sheet_name, cell_range = value.split("!", 1)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", sheet_name):
+            return None
+    if not sheet_name or not cell_range or "!" in cell_range:
+        return None
+    endpoints = cell_range.split(":")
+    if len(endpoints) not in (1, 2):
+        return None
+    first_match = _A1_CELL_RE.fullmatch(endpoints[0])
+    last_match = _A1_CELL_RE.fullmatch(endpoints[-1])
+    if first_match is None or last_match is None:
+        return None
+
+    def column_number(letters: str) -> int:
+        number = 0
+        for letter in letters.upper():
+            number = number * 26 + ord(letter) - ord("A") + 1
+        return number
+
+    bounds = (
+        int(first_match.group(2)),
+        column_number(first_match.group(1)),
+        int(last_match.group(2)),
+        column_number(last_match.group(1)),
+    )
+    if bounds[0] > bounds[2] or bounds[1] > bounds[3]:
+        return None
+    return _ParsedA1Range(sheet_name, bounds)
+
+
+def _safe_range_diagnostic(value: object) -> str:
+    if not isinstance(value, str):
+        return "<missing>"
+    parsed = _parse_a1_range(value)
+    if parsed is None:
+        return "<invalid>"
+    if not _SAFE_SHEET_DIAGNOSTIC_RE.fullmatch(parsed.sheet_name):
+        return "<unrecognized>"
+    start_row, start_col, end_row, end_col = parsed.bounds
+
+    def column_name(column: int) -> str:
+        result = ""
+        while column:
+            column, remainder = divmod(column - 1, 26)
+            result = chr(ord("A") + remainder) + result
+        return result
+
+    return (
+        f"{parsed.sheet_name}!{column_name(start_col)}{start_row}:{column_name(end_col)}{end_row}"
+    )
+
+
+def _batch_range_error(
+    *,
+    response_count: int,
+    expected_count: int,
+    index: int | None,
+    requested: str | None,
+    returned: object,
+    reason: str,
+) -> GoogleSheetsReadError:
+    requested_value = requested if requested is not None else "<none>"
+    return GoogleSheetsReadError(
+        "Google Sheets batch range mismatch: "
+        f"BATCH_RESPONSE_COUNT={response_count} "
+        f"EXPECTED_RANGE_COUNT={expected_count} "
+        f"FAILED_INDEX={index if index is not None else '<none>'} "
+        f"REQUESTED_RANGE={requested_value} "
+        f"RETURNED_RANGE={_safe_range_diagnostic(returned)} "
+        f"FAILURE_REASON={reason}"
+    )
 
 
 def google_api_get_with_retry(
@@ -296,22 +403,68 @@ class GoogleSheetsApiTransport:
             raise GoogleSheetsReadError("Google Sheets batch response shape is invalid")
         value_ranges = cast(list[object], raw_value_ranges)
         if len(value_ranges) != len(requested):
-            raise GoogleSheetsReadError("Google Sheets batch response range count is invalid")
+            raise _batch_range_error(
+                response_count=len(value_ranges),
+                expected_count=len(requested),
+                index=None,
+                requested=None,
+                returned=None,
+                reason="range_count_mismatch",
+            )
         result: dict[str, Sequence[Sequence[object]]] = {}
-        for item in value_ranges:
+        requested_items = list(requested.items())
+        for index, (item, (sheet_name, value_range)) in enumerate(
+            zip(value_ranges, requested_items, strict=True)
+        ):
             if not isinstance(item, dict):
-                raise GoogleSheetsReadError("Google Sheets batch response range is invalid")
+                raise _batch_range_error(
+                    response_count=len(value_ranges),
+                    expected_count=len(requested),
+                    index=index,
+                    requested=f"{sheet_name}!{value_range}",
+                    returned=None,
+                    reason="invalid_range_entry",
+                )
             item_mapping = cast(Mapping[str, object], item)
             returned_range = item_mapping.get("range")
-            if not isinstance(returned_range, str):
-                raise GoogleSheetsReadError("Google Sheets batch response range is invalid")
-            range_match = re.fullmatch(r"'?([A-Z][A-Z0-9_]{0,63})'?!A1:AZ1001", returned_range)
-            if range_match is None:
-                raise GoogleSheetsReadError("Google Sheets batch response range is invalid")
-            sheet_name = range_match.group(1)
-            if sheet_name not in requested or sheet_name in result:
-                raise GoogleSheetsReadError(
-                    "Google Sheets batch response contains an unexpected range"
+            parsed_returned = (
+                _parse_a1_range(returned_range) if isinstance(returned_range, str) else None
+            )
+            parsed_requested = _parse_a1_range(f"{sheet_name}!{value_range}")
+            if parsed_returned is None or parsed_requested is None:
+                raise _batch_range_error(
+                    response_count=len(value_ranges),
+                    expected_count=len(requested),
+                    index=index,
+                    requested=f"{sheet_name}!{value_range}",
+                    returned=returned_range,
+                    reason="invalid_a1_range",
+                )
+            returned_bounds = parsed_returned.bounds
+            requested_bounds = parsed_requested.bounds
+            if parsed_returned.sheet_name != sheet_name:
+                reason = "sheet_mismatch"
+            elif not (
+                requested_bounds[0]
+                <= returned_bounds[0]
+                <= returned_bounds[2]
+                <= requested_bounds[2]
+                and requested_bounds[1]
+                <= returned_bounds[1]
+                <= returned_bounds[3]
+                <= requested_bounds[3]
+            ):
+                reason = "range_out_of_bounds"
+            else:
+                reason = ""
+            if reason:
+                raise _batch_range_error(
+                    response_count=len(value_ranges),
+                    expected_count=len(requested),
+                    index=index,
+                    requested=f"{sheet_name}!{value_range}",
+                    returned=returned_range,
+                    reason=reason,
                 )
             raw_values = item_mapping.get("values", [])
             if not isinstance(raw_values, list):
@@ -320,8 +473,6 @@ class GoogleSheetsApiTransport:
             if any(not isinstance(row, list) for row in rows):
                 raise GoogleSheetsReadError("Google Sheets batch response shape is invalid")
             result[sheet_name] = cast(Sequence[Sequence[object]], rows)
-        if set(result) != set(requested):
-            raise GoogleSheetsReadError("Google Sheets batch response is incomplete")
         return {sheet_name: result[sheet_name] for sheet_name in requested}
 
     def read_metadata(self) -> Mapping[str, object]:
