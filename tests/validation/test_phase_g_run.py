@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,10 @@ from gflow_cli.v2_runtime.phase_g_run import (
     build_phase_g_request,
     finalize_remote_artifact,
     recover_and_validate_existing,
+)
+from gflow_cli.v2_runtime.production_execution import (
+    CreditBudgetContext,
+    ProductionExecutionContext,
 )
 from tests.validation.test_phase_e_prompt_preflight import _fixtures
 from tests.validation.test_phase_g import request_for
@@ -42,6 +47,9 @@ def _d2_test_tables() -> dict[str, list[dict[str, object]]]:
     tables = _fixtures()
     tables["GENERATION_PROFILE_MASTER"][0]["Environment"] = "TEST"
     tables["PROVIDER_ACCOUNT_MASTER"][0]["Environment"] = "TEST"
+    tables["PROVIDER_ACCOUNT_MASTER"][0]["Provider_Project_ID"] = (
+        "34e60953-e534-46e9-ac65-993893e61065"
+    )
     return tables
 
 
@@ -73,6 +81,86 @@ def test_d2_request_builder_requires_exactly_one_approved_prompt(tmp_path: Path)
             d2_run_id="D2_test-run-0001",
             runtime_state_root=tmp_path / "state",
             temp_root=tmp_path / "temp",
+        )
+
+
+def test_prod_request_builder_binds_context_to_live_master_identity(tmp_path: Path) -> None:
+    tables = _d2_test_tables()
+    prod_account = deepcopy(tables["PROVIDER_ACCOUNT_MASTER"][0])
+    prod_account.update(
+        Provider_Account_ID="PVA_0002",
+        Environment="PROD",
+        Auth_Profile_Key="GFLOW_PROD_AUTH",
+        Provider_Project_ID="prod-project",
+    )
+    tables["PROVIDER_ACCOUNT_MASTER"].append(prod_account)
+    prod_profile = deepcopy(tables["GENERATION_PROFILE_MASTER"][0])
+    prod_profile.update(
+        Generation_Profile_ID="GPR_0002",
+        Provider_Account_ID="PVA_0002",
+        Environment="PROD",
+        Purpose="production",
+    )
+    tables["GENERATION_PROFILE_MASTER"].append(prod_profile)
+    preflight = preflight_scene(InMemorySceneCatalog(tables), "SCN_000001", "GPR_0002", "PROD")
+    prompt = _prompt_rows()[0]
+    prompt.update(
+        Scene_Prompt_ID="SPV_000006",
+        Generation_Profile_ID="GPR_0002",
+        Compiled_Prompt_Text=preflight.compiled_prompt or "",
+        Compiled_Negative_Prompt=preflight.compiled_negative_prompt or "",
+        Source_Context_SHA256=preflight.source_context_sha256 or "",
+        Prompt_SHA256=preflight.prompt_sha256 or "",
+    )
+    context = ProductionExecutionContext(
+        "PROD",
+        "PRV_0001",
+        "PVA_0002",
+        "prod-project",
+        "GFLOW_PROD_AUTH",
+        "SCN_000001",
+        "GPR_0002",
+        "SPV_000006",
+        "D6_test-run-0001",
+        CreditBudgetContext(provider_remaining_free=50),
+    )
+
+    request = build_phase_g_request(
+        tables,
+        [prompt],
+        d2_run_id=context.attempt_id,
+        runtime_state_root=tmp_path / "state",
+        temp_root=tmp_path / "temp",
+        execution_context=context,
+    )
+
+    assert request.provider_account_id == "PVA_0002"
+    assert request.provider_project_id == "prod-project"
+    assert request.execution_context == context
+
+
+def test_prod_request_builder_rejects_test_account_context(tmp_path: Path) -> None:
+    tables = _d2_test_tables()
+    context = ProductionExecutionContext(
+        "PROD",
+        "PRV_0001",
+        "PVA_0001",
+        "34e60953-e534-46e9-ac65-993893e61065",
+        "GFLOW_PROD_AUTH",
+        "SCN_000001",
+        "GPR_0001",
+        "SPV_000002",
+        "D6_test-run-0002",
+        CreditBudgetContext(provider_remaining_free=50),
+    )
+    with pytest.raises(PhaseGError):
+        build_phase_g_request(
+            tables,
+            _prompt_rows(),
+            d2_run_id=context.attempt_id,
+            runtime_state_root=tmp_path / "state",
+            temp_root=tmp_path / "temp",
+            execution_context=context,
         )
 
 

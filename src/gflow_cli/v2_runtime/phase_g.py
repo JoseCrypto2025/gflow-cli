@@ -23,9 +23,14 @@ from .agent_recovery import AgentSettingsRecoveryJournal, RecoveryJournalError
 from .errors import AssetVerificationError, V2RuntimeError
 from .google_flow import FlowPresubmitRequest, build_agent_only_directive
 from .phase_g_artifacts import sha256_file, verify_remote_redownload
+from .production_execution import (
+    ProductionCreditGuard,
+    ProductionExecutionContext,
+    ProductionExecutionError,
+)
 from .timestamps import format_utc_timestamp
 
-_RUN_ID_RE = re.compile(r"^D2_[A-Za-z0-9_-]{8,64}$")
+_RUN_ID_RE = re.compile(r"^(?:D2|D6)_[A-Za-z0-9_-]{8,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _LEDGER_SCHEMA = 1
@@ -94,10 +99,14 @@ class PhaseGExecutionRequest:
     output_count: int
     d2_run_id: str
     presubmit_request: FlowPresubmitRequest
+    execution_context: ProductionExecutionContext | None = None
 
     @classmethod
     def from_presubmit(
-        cls, request: FlowPresubmitRequest, d2_run_id: str
+        cls,
+        request: FlowPresubmitRequest,
+        d2_run_id: str,
+        execution_context: ProductionExecutionContext | None = None,
     ) -> PhaseGExecutionRequest:
         """Construct a pinned Phase G request from a Phase F input."""
         result = request.preflight
@@ -130,6 +139,7 @@ class PhaseGExecutionRequest:
             count,
             d2_run_id,
             request,
+            execution_context,
         )
         validate_phase_g_request(value)
         return value
@@ -214,14 +224,22 @@ class GoogleFlowAgentOnlyGenerationExecutor:
         port: FlowGenerationPort,
         ledger: D2DailyCreditLedger,
         recovery_journal: AgentSettingsRecoveryJournal,
+        *,
+        production_credit_guard: ProductionCreditGuard | None = None,
     ) -> None:
         self.port = port
         self.ledger = ledger
         self.recovery_journal = recovery_journal
+        self.production_credit_guard = production_credit_guard
 
     async def execute(self, request: PhaseGExecutionRequest) -> PhaseGExecutionResult:
         """Apply settings, click once, validate one new gate and restore defaults."""
         validate_phase_g_request(request)
+        if (request.execution_context is None) != (self.production_credit_guard is None):
+            raise PhaseGError(
+                "PHASE_G_EXECUTION_CONTEXT_REQUIRED",
+                "production execution context and shared credit guard must be supplied together",
+            )
         try:
             self.recovery_journal.require_clean_or_missing()
         except RecoveryJournalError as exc:
@@ -257,7 +275,19 @@ class GoogleFlowAgentOnlyGenerationExecutor:
         generate_recorded = False
         gate_approved = False
         try:
-            self.ledger.create_attempt(request)
+            if request.execution_context is not None and self.production_credit_guard is not None:
+                self.production_credit_guard.prepare(request.execution_context)
+            try:
+                self.ledger.create_attempt(request)
+            except BaseException:
+                if (
+                    request.execution_context is not None
+                    and self.production_credit_guard is not None
+                ):
+                    self.production_credit_guard.fail_before_submit(
+                        request.execution_context.attempt_id
+                    )
+                raise
             applied = dict(await self.port.apply_settings(target))
             if any(applied.get(key) != value for key, value in target.items()):
                 raise PhaseGError(
@@ -285,6 +315,10 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             self.ledger.mark_generate_action(request.d2_run_id)
             generate_recorded = True
             started = True
+            if request.execution_context is not None and self.production_credit_guard is not None:
+                self.production_credit_guard.record_generate_click(
+                    request.execution_context.attempt_id
+                )
             await self.port.click_generate_once()
             gate = await self.port.await_confirmation(baseline)
             if (
@@ -312,6 +346,24 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 )
                 raise PhaseGError(code, "confirmation must prove one video and known positive cost")
             try:
+                if (
+                    request.execution_context is not None
+                    and self.production_credit_guard is not None
+                ):
+                    budget = request.execution_context.credit_budget_context
+                    if (
+                        gate.visible_balance is not None
+                        and budget.provider_remaining_free != gate.visible_balance
+                    ):
+                        raise ProductionExecutionError(
+                            "provider free balance changed since the execution context was read"
+                        )
+                    self.production_credit_guard.reserve_quote(
+                        request.execution_context.attempt_id,
+                        video_count=gate.video_count,
+                        quoted_credits=gate.credit_cost,
+                        budget=budget,
+                    )
                 self.ledger.approve_gate(
                     request.d2_run_id,
                     video_count=gate.video_count,
@@ -319,6 +371,13 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                     visible_balance=gate.visible_balance,
                     confirmation_id=gate.confirmation_id,
                 )
+            except ProductionExecutionError as exc:
+                # The confirmation has not been approved yet, so a failed
+                # quote/budget gate is a confirmed pre-charge stop.
+                self._record_no_charge(request)
+                raise PhaseGError(
+                    "PHASE_G_CREDIT_GUARD_HOLD", "shared production credit gate refused approval"
+                ) from exc
             except PhaseGError as exc:
                 if exc.code in {
                     "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
@@ -394,6 +453,9 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                     provider_project_id=evidence.provider_project_id,
                     accounted_credit_cost=evidence.accounted_credit_cost,
                 )
+                self._resolve_production_guard(
+                    request, "WAF_REJECTION", evidence.accounted_credit_cost
+                )
                 started = False
                 raise PhaseGError(
                     "WAF_REJECTED", "Flow refused unusual activity; no retry is permitted"
@@ -408,6 +470,15 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 provider_project_id=evidence.provider_project_id,
                 accounted_credit_cost=evidence.accounted_credit_cost,
             )
+            if evidence.submission_state == "GENERATION_SUCCEEDED":
+                guard_state = "SUCCESS"
+            elif evidence.submission_state == "PROVIDER_REFUSED":
+                guard_state = "PROVIDER_REJECTED"
+            elif evidence.submission_state in {"GENERATION_FAILED", "UNEXPECTED_MULTI_OUTPUT"}:
+                guard_state = "FAILED_CONFIRMED"
+            else:
+                guard_state = "UNKNOWN_SUBMISSION_STATE"
+            self._resolve_production_guard(request, guard_state, evidence.accounted_credit_cost)
             started = False
             return PhaseGExecutionResult(
                 request.d2_run_id,
@@ -426,11 +497,19 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                     provider_project_id=request.provider_project_id,
                     accounted_credit_cost=None if gate_approved else 0,
                 )
+                self._resolve_production_guard(request, "WAF_REJECTION", None)
             started = False
             raise
         except BaseException:
             if started and generate_recorded:
                 self._record_unknown(request)
+            elif request.execution_context is not None and self.production_credit_guard is not None:
+                try:
+                    self.production_credit_guard.fail_before_submit(
+                        request.execution_context.attempt_id
+                    )
+                except ProductionExecutionError:
+                    pass
             raise
         finally:
             # Failed restoration leaves the journal DIRTY and blocks new work.
@@ -464,6 +543,26 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             accounted_credit_cost=0,
             provider_project_id=request.provider_project_id,
         )
+        self._resolve_production_guard(request, "FAILED_CONFIRMED", 0)
+
+    def _resolve_production_guard(
+        self,
+        request: PhaseGExecutionRequest,
+        state: str,
+        actual_credits: Decimal | int | float | str | None,
+    ) -> None:
+        if request.execution_context is None or self.production_credit_guard is None:
+            return
+        try:
+            self.production_credit_guard.resolve(
+                request.execution_context.attempt_id,
+                state,
+                actual_credits=actual_credits,
+            )
+        except ProductionExecutionError as exc:
+            raise PhaseGError(
+                "PHASE_G_CREDIT_GUARD_HOLD", "shared production credit state is unresolved"
+            ) from exc
 
     def _record_unknown(self, request: PhaseGExecutionRequest) -> None:
         """Reserve the quoted amount or all remaining budget on ambiguous submit."""
@@ -477,6 +576,7 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 submission_state="UNKNOWN_SUBMISSION_STATE",
                 provider_project_id=request.provider_project_id,
             )
+            self._resolve_production_guard(request, "UNKNOWN_SUBMISSION_STATE", None)
         except PhaseGError:
             # Do not mask the triggering exception; the recovery journal still
             # records settings as DIRTY if the browser restore cannot be proven.
@@ -489,7 +589,21 @@ def validate_phase_g_request(request: PhaseGExecutionRequest) -> None:
     phase_e = presubmit.preflight
     prompt = presubmit.prompt_version
     if not _RUN_ID_RE.fullmatch(request.d2_run_id):
-        raise PhaseGError("PHASE_G_RUN_ID_INVALID", "D2 run ID is invalid")
+        raise PhaseGError("PHASE_G_RUN_ID_INVALID", "Phase G attempt ID is invalid")
+    context = request.execution_context
+    if context is not None and (
+        context.attempt_id != request.d2_run_id
+        or context.scene_id != request.scene_id
+        or context.scene_prompt_id != request.scene_prompt_id
+        or context.generation_profile_id != request.generation_profile_id
+        or context.provider_id != request.provider_id
+        or context.provider_account_id != request.provider_account_id
+        or context.provider_project_id != request.provider_project_id
+    ):
+        raise PhaseGError(
+            "PHASE_G_EXECUTION_CONTEXT_MISMATCH",
+            "production context differs from the pinned Phase E request",
+        )
     if prompt.prompt_status != "APPROVED":
         raise PhaseGError("PHASE_G_PROMPT_NOT_APPROVED", "prompt version is not APPROVED")
     if not phase_e.ready_for_provider_adapter or phase_e.status != "PREFLIGHT_PASS":

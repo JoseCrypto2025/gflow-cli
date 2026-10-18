@@ -27,6 +27,7 @@ from .phase_g_artifacts import (
     validate_video,
 )
 from .phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
+from .production_execution import ProductionCreditGuard, ProductionExecutionContext
 
 _SCENE_ID = "SCN_000001"
 _PROFILE_ID = "GPR_0001"
@@ -54,16 +55,22 @@ def build_phase_g_request(
     d2_run_id: str,
     runtime_state_root: Path,
     temp_root: Path,
+    execution_context: ProductionExecutionContext | None = None,
 ) -> PhaseGExecutionRequest:
-    """Re-run Phase E from live-read rows and require one exact APPROVED row."""
+    """Re-run Phase E and require one exact approval for the chosen environment."""
+    scene_id = execution_context.scene_id if execution_context else _SCENE_ID
+    profile_id = execution_context.generation_profile_id if execution_context else _PROFILE_ID
+    environment = execution_context.environment if execution_context else "TEST"
     catalog = InMemorySceneCatalog(tables)
-    preflight = preflight_scene(catalog, _SCENE_ID, _PROFILE_ID, "TEST")
+    preflight = preflight_scene(catalog, scene_id, profile_id, environment)
     if preflight.status != "PREFLIGHT_PASS" or not preflight.ready_for_provider_adapter:
         raise PhaseGError("PHASE_E_PREFLIGHT_REQUIRED", "fresh Phase E did not pass")
     current = [
         row
         for row in prompt_versions
-        if row.get("Scene_ID") == _SCENE_ID and row.get("Prompt_Status") == "APPROVED"
+        if row.get("Scene_ID") == scene_id
+        and row.get("Generation_Profile_ID") == profile_id
+        and row.get("Prompt_Status") == "APPROVED"
     ]
     if len(current) != 1:
         raise PhaseGError(
@@ -82,41 +89,112 @@ def build_phase_g_request(
     )
     provider_id = str(preflight.resolved.get("provider_id", ""))
     model_id = str(preflight.resolved.get("model_id", ""))
+    account_id = execution_context.provider_account_id if execution_context else _ACCOUNT_ID
     accounts = [
         row
         for row in tables.get("PROVIDER_ACCOUNT_MASTER", [])
-        if row.get("Provider_Account_ID") == _ACCOUNT_ID and row.get("Status") == "ACTIVE"
+        if row.get("Provider_Account_ID") == account_id
+        and row.get("Status") == "ACTIVE"
+        and row.get("Environment") == environment
     ]
     if len(accounts) != 1:
         raise PhaseGError(
-            "PHASE_G_ACCOUNT_INVALID", "one active pinned TEST provider account is required"
+            "PHASE_G_ACCOUNT_INVALID",
+            "one active provider account for the execution environment is required",
         )
-    sheet_project_id = accounts[0].get("Provider_Project_ID")
-    if sheet_project_id and sheet_project_id != _PROJECT_ID:
+    account = accounts[0]
+    sheet_project_id = account.get("Provider_Project_ID")
+    project_id = execution_context.provider_project_id if execution_context else _PROJECT_ID
+    context_identity: dict[str, str] = {}
+    if (
+        not isinstance(sheet_project_id, str)
+        or not sheet_project_id
+        or sheet_project_id != project_id
+    ):
         raise PhaseGError(
             "PHASE_G_PROJECT_MISMATCH", "pinned TEST project differs from Provider Account Master"
+        )
+    if execution_context is not None:
+        if account.get("Provider_ID") != execution_context.provider_id:
+            raise PhaseGError(
+                "PHASE_G_IDENTITY_MISMATCH", "provider account belongs to another provider"
+            )
+        if account.get("Auth_Profile_Key") != execution_context.auth_profile:
+            raise PhaseGError(
+                "PHASE_G_IDENTITY_MISMATCH", "auth profile differs from Provider Account Master"
+            )
+        context_identity = {
+            "environment": environment,
+            "provider_id": str(account.get("Provider_ID", "")),
+            "provider_account_id": str(account.get("Provider_Account_ID", "")),
+            "provider_project_id": str(account.get("Provider_Project_ID", "")),
+            "auth_profile": str(account.get("Auth_Profile_Key", "")),
+            "scene_id": scene_id,
+            "generation_profile_id": profile_id,
+        }
+    generation_profiles = [
+        row
+        for row in tables.get("GENERATION_PROFILE_MASTER", [])
+        if row.get("Generation_Profile_ID") == profile_id
+        and row.get("Environment") == environment
+        and row.get("Status") == "ACTIVE"
+    ]
+    if execution_context is not None and (
+        len(generation_profiles) != 1
+        or generation_profiles[0].get("Provider_Account_ID") != account_id
+        or generation_profiles[0].get("Model_ID") != model_id
+    ):
+        raise PhaseGError(
+            "PHASE_G_IDENTITY_MISMATCH", "generation profile is not bound to account/model"
         )
     request = FlowPresubmitRequest(
         preflight,
         prompt,
         provider_id,
-        _ACCOUNT_ID,
+        account_id,
         model_id,
         "TEXT_TO_VIDEO",
-        _PROJECT_ID,
+        project_id,
         runtime_state_root,
         temp_root,
         (),
     )
+    if execution_context is not None:
+        execution_context.validate(
+            {
+                "environment": context_identity["environment"],
+                "provider_id": context_identity["provider_id"],
+                "provider_account_id": context_identity["provider_account_id"],
+                "provider_project_id": context_identity["provider_project_id"],
+                "auth_profile": context_identity["auth_profile"],
+                "scene_id": scene_id,
+                "generation_profile_id": profile_id,
+                "scene_prompt_id": prompt.scene_prompt_id,
+            }
+        )
+        if execution_context.attempt_id != d2_run_id:
+            raise PhaseGError(
+                "PHASE_G_EXECUTION_CONTEXT_MISMATCH", "attempt ID differs from context"
+            )
+        return PhaseGExecutionRequest.from_presubmit(
+            request, d2_run_id, execution_context=execution_context
+        )
     return PhaseGExecutionRequest.from_presubmit(request, d2_run_id)
 
 
 async def run_fresh_presubmit(request: PhaseGExecutionRequest, *, expected_email: str) -> None:
-    """Exercise F5 on the pinned TEST profile before the separate Phase G port."""
+    """Exercise F5 on the repository-owned profile selected by execution context."""
+    context = request.execution_context
+    profile_key = context.auth_profile if context else _AUTH_PROFILE
+    project_name = (
+        "AI Video Automation V2 - PROD"
+        if context and context.environment == "PROD"
+        else _PROJECT_NAME
+    )
     result = await prepare_live_flow(
         request.presubmit_request,
-        auth_profile_key=_AUTH_PROFILE,
-        project_name=_PROJECT_NAME,
+        auth_profile_key=profile_key,
+        project_name=project_name,
         model_display_names=_MODEL_DISPLAY_NAMES,
         expected_email=expected_email,
         headless=False,
@@ -129,15 +207,26 @@ async def execute_and_validate(
     request: PhaseGExecutionRequest, *, expected_email: str
 ) -> PhaseGD2Run:
     """Perform one request, recover only its media ID, and fully validate the MP4."""
-    ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
+    context = request.execution_context
+    ledger_root = request.presubmit_request.runtime_state_root
+    if context is not None and context.environment == "PROD":
+        # Keep D2 historical evidence separate; the shared guard below owns the
+        # provider/day ceiling across all new TEST and PROD attempts.
+        ledger_root = ledger_root / "production"
+    ledger = D2DailyCreditLedger(ledger_root)
+    credit_guard = (
+        ProductionCreditGuard(request.presubmit_request.runtime_state_root) if context else None
+    )
     journal = AgentSettingsRecoveryJournal(
         request.presubmit_request.runtime_state_root,
         request.provider_account_id,
         request.provider_project_id,
     )
-    port = await GoogleFlowAgentOnlyGenerationPort.open(expected_email=expected_email)
+    port = await _open_generation_port(request, expected_email=expected_email)
     try:
-        result = await GoogleFlowAgentOnlyGenerationExecutor(port, ledger, journal).execute(request)
+        result = await GoogleFlowAgentOnlyGenerationExecutor(
+            port, ledger, journal, production_credit_guard=credit_guard
+        ).execute(request)
         if result.submission_state != "GENERATION_SUCCEEDED" or not result.provider_media_id:
             raise PhaseGError(
                 "PHASE_G_OUTPUT_NOT_READY", "attempt has not produced one attributable media ID"
@@ -172,6 +261,28 @@ async def execute_and_validate(
         return PhaseGD2Run(request, result, local_file, video)
     finally:
         await port.close()
+
+
+async def _open_generation_port(
+    request: PhaseGExecutionRequest, *, expected_email: str
+) -> GoogleFlowAgentOnlyGenerationPort:
+    context = request.execution_context
+    if context is None:
+        return await GoogleFlowAgentOnlyGenerationPort.open(expected_email=expected_email)
+    project_name = {
+        "TEST": _PROJECT_NAME,
+        "PROD": "AI Video Automation V2 - PROD",
+    }.get(context.environment)
+    if project_name is None:
+        raise PhaseGError("PHASE_G_ENVIRONMENT_UNSUPPORTED", "only TEST and PROD are supported")
+    return await GoogleFlowAgentOnlyGenerationPort.open(
+        expected_email=expected_email,
+        auth_profile_key=context.auth_profile,
+        provider_account_id=context.provider_account_id,
+        provider_project_id=context.provider_project_id,
+        project_name=project_name,
+        model_display_names=_MODEL_DISPLAY_NAMES,
+    )
 
 
 async def recover_and_validate_existing(

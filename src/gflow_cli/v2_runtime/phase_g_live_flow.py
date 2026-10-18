@@ -136,11 +136,24 @@ def _gate_digest(markup: str) -> str:
 
 
 class GoogleFlowAgentOnlyGenerationPort:
-    """One-request Flow port pinned to the dedicated V2 TEST account and project."""
+    """One-request Flow port pinned to one explicit V2 environment identity."""
 
-    def __init__(self, base: GoogleFlowAgentOnlyPort, lease: ProfileLease) -> None:
+    def __init__(
+        self,
+        base: GoogleFlowAgentOnlyPort,
+        lease: ProfileLease,
+        *,
+        auth_profile_key: str,
+        provider_account_id: str,
+        provider_project_id: str,
+        project_name: str,
+    ) -> None:
         self._base = base
         self._lease = lease
+        self._auth_profile_key = auth_profile_key
+        self._provider_account_id = provider_account_id
+        self._provider_project_id = provider_project_id
+        self._project_name = project_name
         self._request: PhaseGExecutionRequest | None = None
         self._baseline: FlowSubmissionBaseline | None = None
         self._records: dict[tuple[str, str, str], _ObservedRecord] = {}
@@ -152,19 +165,28 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._page: Page | None = None
 
     @classmethod
-    async def open(cls, *, expected_email: str) -> GoogleFlowAgentOnlyGenerationPort:
-        """Open only the repository-owned TEST profile; never launch personal Chrome."""
+    async def open(
+        cls,
+        *,
+        expected_email: str,
+        auth_profile_key: str = _TEST_AUTH_PROFILE,
+        provider_account_id: str = "PVA_0001",
+        provider_project_id: str = _TEST_PROJECT_ID,
+        project_name: str = _TEST_PROJECT_NAME,
+        model_display_names: Mapping[str, str] = _MODEL_DISPLAY_NAMES,
+    ) -> GoogleFlowAgentOnlyGenerationPort:
+        """Open a repository-owned TEST or PROD profile, never personal Chrome."""
         if not expected_email.strip() or "@" not in expected_email:
             raise FlowPresubmitError(
                 "FLOW_EXPECTED_IDENTITY_REQUIRED",
-                "live Phase G requires the explicitly verified TEST account identity",
+                "live Phase G requires an explicitly verified Google account identity",
             )
         base = await GoogleFlowAgentOnlyPort.open(
-            auth_profile_key=_TEST_AUTH_PROFILE,
-            provider_account_id="PVA_0001",
-            provider_project_id=_TEST_PROJECT_ID,
-            project_name=_TEST_PROJECT_NAME,
-            model_display_names=_MODEL_DISPLAY_NAMES,
+            auth_profile_key=auth_profile_key,
+            provider_account_id=provider_account_id,
+            provider_project_id=provider_project_id,
+            project_name=project_name,
+            model_display_names=model_display_names,
             expected_email=expected_email,
             headless=False,
         )
@@ -176,7 +198,14 @@ class GoogleFlowAgentOnlyGenerationPort:
             raise FlowPresubmitError(
                 "FLOW_LANE_BUSY", "dedicated Flow profile is already in use"
             ) from exc
-        return cls(base, lease)
+        return cls(
+            base,
+            lease,
+            auth_profile_key=auth_profile_key,
+            provider_account_id=provider_account_id,
+            provider_project_id=provider_project_id,
+            project_name=project_name,
+        )
 
     async def close(self) -> None:
         """Detach response observation and close the isolated repository browser."""
@@ -190,25 +219,56 @@ class GoogleFlowAgentOnlyGenerationPort:
             self._lease.release()
 
     async def bind_request(self, request: PhaseGExecutionRequest) -> None:
-        """Pin this live adapter to exactly the approved TEST job identity."""
+        """Pin this live adapter to exactly the approved environment job identity."""
         if self._request is not None or self._generate_clicked:
             raise PhaseGError("PHASE_G_PORT_ALREADY_BOUND", "Flow port is already bound")
+        context = request.execution_context
+        if context is None:
+            valid_identity = (
+                self._auth_profile_key == _TEST_AUTH_PROFILE
+                and self._provider_account_id == "PVA_0001"
+                and self._provider_project_id == _TEST_PROJECT_ID
+                and self._project_name == _TEST_PROJECT_NAME
+                and request.provider_account_id == "PVA_0001"
+            )
+        else:
+            expected_profile = {
+                "TEST": _TEST_AUTH_PROFILE,
+                "PROD": "GFLOW_PROD_AUTH",
+            }.get(context.environment)
+            expected_project_name = {
+                "TEST": _TEST_PROJECT_NAME,
+                "PROD": "AI Video Automation V2 - PROD",
+            }.get(context.environment)
+            valid_identity = (
+                expected_profile == self._auth_profile_key == context.auth_profile
+                and self._provider_account_id == context.provider_account_id
+                and self._provider_project_id == context.provider_project_id
+                and self._project_name == expected_project_name
+                and request.provider_account_id == context.provider_account_id
+            )
         if (
-            request.provider_account_id != "PVA_0001"
-            or request.provider_project_id != _TEST_PROJECT_ID
+            not valid_identity
+            or request.provider_project_id != self._provider_project_id
             or request.model_id != "MDL_0001"
-            or request.generation_profile_id != "GPR_0001"
             or request.scene_id != "SCN_000001"
             or request.generation_mode != "TEXT_TO_VIDEO"
             or request.output_count != 1
         ):
-            raise PhaseGError("PHASE_G_TEST_IDENTITY_MISMATCH", "request is outside D2 TEST scope")
+            raise PhaseGError(
+                "PHASE_G_EXECUTION_IDENTITY_MISMATCH", "request identity is not pinned"
+            )
         session = await self._base.inspect_session()
-        if session.status != "FLOW_SESSION_READY" or session.account_id != "PVA_0001":
-            raise FlowPresubmitError("FLOW_AUTH_NOT_READY", "TEST profile readiness is unverified")
-        project = await self._base.select_project(_TEST_PROJECT_ID)
-        if project.project_id != _TEST_PROJECT_ID:
-            raise PhaseGError("PHASE_G_PROJECT_MISMATCH", "dedicated TEST project is not selected")
+        if (
+            session.status != "FLOW_SESSION_READY"
+            or session.account_id != self._provider_account_id
+        ):
+            raise FlowPresubmitError(
+                "FLOW_AUTH_NOT_READY", "selected profile readiness is unverified"
+            )
+        project = await self._base.select_project(self._provider_project_id)
+        if project.project_id != self._provider_project_id:
+            raise PhaseGError("PHASE_G_PROJECT_MISMATCH", "dedicated V2 project is not selected")
         if await self._base.inspect_surface() != "AGENT_ONLY":
             raise PhaseGError("PHASE_G_SURFACE_MISMATCH", "Flow surface is not Agent-only")
         self._request = request

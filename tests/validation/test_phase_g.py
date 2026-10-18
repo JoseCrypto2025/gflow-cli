@@ -27,6 +27,11 @@ from gflow_cli.v2_runtime.phase_g import (
 )
 from gflow_cli.v2_runtime.phase_g_artifacts import sha256_file
 from gflow_cli.v2_runtime.phase_g_live_flow import parse_confirmation_quote
+from gflow_cli.v2_runtime.production_execution import (
+    CreditBudgetContext,
+    ProductionCreditGuard,
+    ProductionExecutionContext,
+)
 
 
 def request_for(tmp_path: Path, *, status: str = "APPROVED") -> FlowPresubmitRequest:
@@ -259,7 +264,7 @@ class FakeGenerationPort:
 
     async def bind_request(self, request: PhaseGExecutionRequest) -> None:
         self.calls.append("bind")
-        assert request.d2_run_id == "D2_test-run-0001"
+        assert request.d2_run_id.startswith(("D2_", "D6_"))
 
     async def snapshot_settings(self) -> Mapping[str, object]:
         self.calls.append("snapshot")
@@ -340,6 +345,85 @@ async def test_phase_g_executes_single_approved_gate_and_restores_original_setti
     assert port.settings == port.original
     assert journal.read().state == "CLEAN"  # type: ignore[union-attr]
     assert ledger.accounted_today() == Decimal(10)
+
+
+@pytest.mark.asyncio
+async def test_phase_g_uses_shared_production_credit_guard_before_confirmation(
+    tmp_path: Path,
+) -> None:
+    port = FakeGenerationPort()
+    base = request_for(tmp_path)
+    context = ProductionExecutionContext(
+        "TEST",
+        "PRV_0001",
+        "PVA_0001",
+        "34e60953-e534-46e9-ac65-993893e61065",
+        "GFLOW_V2_TEST_AUTH",
+        "SCN_000001",
+        "GPR_0001",
+        "SPV_000002",
+        "D6_prod-run-0001",
+        CreditBudgetContext(provider_remaining_free=Decimal("50")),
+    )
+    request = PhaseGExecutionRequest.from_presubmit(
+        base, context.attempt_id, execution_context=context
+    )
+    port.evidence = replace(port.evidence, d2_run_id=context.attempt_id)
+    ledger = D2DailyCreditLedger(tmp_path / "production-runtime")
+    journal = AgentSettingsRecoveryJournal(
+        tmp_path / "runtime", "PVA_0001", request.provider_project_id
+    )
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    result = await GoogleFlowAgentOnlyGenerationExecutor(
+        port, ledger, journal, production_credit_guard=guard
+    ).execute(request)
+
+    assert result.submission_state == "GENERATION_SUCCEEDED"
+    assert port.calls.count("generate") == port.calls.count("approve") == 1
+    saved = guard._read()["attempts"][0]  # noqa: SLF001 - verifies the shared durable contract
+    assert saved["environment"] == "TEST"
+    assert saved["state"] == "SUCCESS"
+    assert saved["generate_click_count"] == 1
+    assert saved["reserved_credits"] == "10"
+
+
+@pytest.mark.asyncio
+async def test_phase_g_credit_balance_failure_does_not_approve_or_reserve(
+    tmp_path: Path,
+) -> None:
+    port = FakeGenerationPort()
+    base = request_for(tmp_path)
+    context = ProductionExecutionContext(
+        "TEST",
+        "PRV_0001",
+        "PVA_0001",
+        "34e60953-e534-46e9-ac65-993893e61065",
+        "GFLOW_V2_TEST_AUTH",
+        "SCN_000001",
+        "GPR_0001",
+        "SPV_000002",
+        "D6_prod-run-0002",
+        CreditBudgetContext(provider_remaining_free=Decimal("5")),
+    )
+    request = PhaseGExecutionRequest.from_presubmit(
+        base, context.attempt_id, execution_context=context
+    )
+    port.evidence = replace(port.evidence, d2_run_id=context.attempt_id)
+    ledger = D2DailyCreditLedger(tmp_path / "production-runtime")
+    journal = AgentSettingsRecoveryJournal(
+        tmp_path / "runtime", "PVA_0001", request.provider_project_id
+    )
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+
+    with pytest.raises(PhaseGError) as refused:
+        await GoogleFlowAgentOnlyGenerationExecutor(
+            port, ledger, journal, production_credit_guard=guard
+        ).execute(request)
+
+    assert refused.value.code == "PHASE_G_CREDIT_GUARD_HOLD"
+    assert port.calls.count("approve") == 0
+    assert ledger.accounted_today() == Decimal(0)
+    assert guard._read()["attempts"][0]["reserved_credits"] == "0"  # noqa: SLF001
 
 
 @pytest.mark.asyncio
