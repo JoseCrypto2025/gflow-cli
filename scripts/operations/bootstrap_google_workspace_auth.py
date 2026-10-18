@@ -17,11 +17,15 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import httpx
 
-from gflow_cli.v2_runtime.google_sheets import APPROVED_SPREADSHEET_ID, GOOGLE_DRIVE_FILE_SCOPE
+from gflow_cli.v2_runtime.google_sheets import (
+    APPROVED_SPREADSHEET_ID,
+    GOOGLE_DRIVE_FILE_SCOPE,
+    google_api_get_with_retry,
+)
 
 OUTPUT_FOLDER_ID = "1IXhplXVv4ukNhb2EWnAqV2nL2e1V1x0L"
 OUTPUT_FOLDER_NAME = "Job_Artifacts"
@@ -39,6 +43,23 @@ _ALLOWED_CLIENT_AUTH_URIS = frozenset(
 _STAGED_PATH_RE = re.compile(r"^/etc/gflow-v2/\.google-authorized-user\.staged-[0-9a-f]{32}\.json$")
 _REMOTE_ROOT = "/etc/gflow-v2"
 _CANONICAL_PATH = f"{_REMOTE_ROOT}/google-authorized-user.json"
+_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|authorization[_-]?code|"
+    r"client[_-]?secret|password|credential(?:s)?[_-]?json)\b\s*[=:]\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_BEARER_RE = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+")
+
+
+def _redact_remote_text(value: bytes | str) -> str:
+    """Bound remote diagnostics and redact credential-bearing values."""
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    # A serialized authorized-user object is never useful as diagnostic output.
+    if re.search(r'(?i)"(?:refresh_token|client_secret|token_uri)"\s*:', text):
+        text = "[credential JSON redacted]"
+    text = _SENSITIVE_VALUE_RE.sub(r"\1[REDACTED]", text)
+    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
+    return text[:4000]
 
 
 def _stage_script(stage_path: str) -> str:
@@ -127,6 +148,19 @@ class BootstrapError(ValueError):
     """A safe operator-facing bootstrap failure without response or token data."""
 
 
+class StagedVerificationRateLimitExhaustedError(BootstrapError):
+    """The remote verifier exhausted its bounded Google API HTTP 429 retries."""
+
+
+class StagedCredentialDeferredError(BootstrapError):
+    """An unchanged, securely staged credential is retained for later verification."""
+
+    def __init__(self, stage_path: str, credential_sha256: str) -> None:
+        super().__init__("Staged verification deferred after Google API rate limiting")
+        self.stage_path = stage_path
+        self.credential_sha256 = credential_sha256
+
+
 def _safe_client_config(path: Path, repository_root: Path) -> dict[str, str]:
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise BootstrapError("OAuth client configuration must be an external regular file")
@@ -170,24 +204,35 @@ def _pkce_pair() -> tuple[str, str]:
     return verifier, challenge.rstrip(b"=").decode("ascii")
 
 
-def _authorization_url(client_id: str, redirect_uri: str, state: str, code_challenge: str) -> str:
-    query = urlencode(
-        {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": GOOGLE_DRIVE_FILE_SCOPE,
-            "access_type": "offline",
-            "prompt": "consent",
-            "trigger_onepick": "true",
-            "allow_multiple": "true",
-            "allow_folder_selection": "true",
-            "file_ids": f"{APPROVED_SPREADSHEET_ID},{OUTPUT_FOLDER_ID}",
-            "state": state,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-        }
-    )
+def _authorization_url(
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    code_challenge: str,
+    *,
+    include_picker: bool = True,
+) -> str:
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": GOOGLE_DRIVE_FILE_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    if include_picker:
+        params.update(
+            {
+                "trigger_onepick": "true",
+                "allow_multiple": "true",
+                "allow_folder_selection": "true",
+                "file_ids": f"{APPROVED_SPREADSHEET_ID},{OUTPUT_FOLDER_ID}",
+            }
+        )
+    query = urlencode(params)
     return f"{_AUTH_URI}?{query}"
 
 
@@ -205,6 +250,21 @@ def _validate_callback(
     granted = {item for item in picked[0].split(",") if item}
     if granted != expected_ids:
         raise BootstrapError("Picker must grant exactly the approved spreadsheet and output folder")
+    scopes = set(" ".join(query.get("scope", [])).split())
+    if scopes != {GOOGLE_DRIVE_FILE_SCOPE}:
+        raise BootstrapError("Google returned an unexpected OAuth scope set")
+    return codes[0]
+
+
+def _validate_pickerless_callback(query: Mapping[str, list[str]], *, expected_state: str) -> str:
+    states = query.get("state", [])
+    if len(states) != 1 or not secrets.compare_digest(states[0], expected_state):
+        raise BootstrapError("OAuth callback state validation failed")
+    if query.get("error"):
+        raise BootstrapError("Google OAuth consent was cancelled")
+    codes = query.get("code", [])
+    if len(codes) != 1 or not codes[0]:
+        raise BootstrapError("OAuth callback is missing the authorization code")
     scopes = set(" ".join(query.get("scope", [])).split())
     if scopes != {GOOGLE_DRIVE_FILE_SCOPE}:
         raise BootstrapError("Google returned an unexpected OAuth scope set")
@@ -301,21 +361,27 @@ def _verify_grants(
 ) -> None:
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
-        sheet = client.get(
+        sheet = google_api_get_with_retry(
+            client,
             f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}",
             params={"fields": "spreadsheetId,properties(title),sheets.properties(sheetId,title)"},
             headers=headers,
         )
-        sheet.raise_for_status()
+        if not sheet.is_success:
+            sheet.raise_for_status()
         sheet_data: object = sheet.json()
-        folder = client.get(
+        folder = google_api_get_with_retry(
+            client,
             f"https://www.googleapis.com/drive/v3/files/{folder_id}",
             params={"fields": "id,name,mimeType,capabilities(canAddChildren)"},
             headers=headers,
         )
-        folder.raise_for_status()
+        if not folder.is_success:
+            folder.raise_for_status()
         folder_data: object = folder.json()
     except Exception as exc:  # noqa: BLE001 — response body and headers are sensitive
+        if isinstance(exc, BootstrapError):
+            raise
         raise BootstrapError("Google could not verify the approved file grants") from exc
     if not isinstance(sheet_data, dict) or not isinstance(folder_data, dict):
         raise BootstrapError("Google file verification response is invalid")
@@ -341,6 +407,120 @@ def _verify_grants(
         or folder_caps.get("canAddChildren") is not True
     ):
         raise BootstrapError("Approved V2 output folder is not writable through this grant")
+
+
+def _raise_google_api_error(response: httpx.Response, resource_label: str) -> None:
+    try:
+        payload: object = response.json()
+    except ValueError:
+        payload = None
+    detail = ""
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            parts = [
+                str(error[key])
+                for key in ("code", "status", "message")
+                if isinstance(error.get(key), (str, int))
+            ]
+            details = error.get("errors")
+            if isinstance(details, list) and details and isinstance(details[0], dict):
+                reason = details[0].get("reason")
+                if isinstance(reason, str):
+                    parts.append(f"reason={reason}")
+            detail = "; ".join(parts)
+        elif isinstance(error, str):
+            detail = error
+    safe_detail = _redact_remote_text(detail) if detail else "no safe error detail returned"
+    raise BootstrapError(
+        f"Google API access failed for {resource_label}: HTTP {response.status_code}; {safe_detail}"
+    )
+
+
+def _verify_previous_file_grants(
+    client: httpx.Client,
+    *,
+    access_token: str,
+    repository_root: Path,
+) -> dict[str, str]:
+    """Read only the two approved Drive IDs and validate the existing 34-table snapshot."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    def drive_file(file_id: str, label: str) -> dict[str, Any]:
+        response = google_api_get_with_retry(
+            client,
+            "https://www.googleapis.com/drive/v3/files/" + quote(file_id, safe=""),
+            params={"fields": "id,name,mimeType,isAppAuthorized,capabilities(canAddChildren)"},
+            headers=headers,
+        )
+        if not response.is_success:
+            _raise_google_api_error(response, label)
+        payload: object = response.json()
+        if not isinstance(payload, dict):
+            raise BootstrapError(f"Google Drive returned invalid metadata for {label}")
+        return cast(dict[str, Any], payload)
+
+    sheet_file = drive_file(APPROVED_SPREADSHEET_ID, "approved Master Sheet Drive file")
+    if (
+        sheet_file.get("id") != APPROVED_SPREADSHEET_ID
+        or sheet_file.get("name") != EXPECTED_SHEET_TITLE
+        or sheet_file.get("mimeType") != "application/vnd.google-apps.spreadsheet"
+    ):
+        raise BootstrapError("Approved Master Sheet Drive metadata did not match")
+    sheet_app_authorized = sheet_file.get("isAppAuthorized")
+    if sheet_app_authorized is False:
+        raise BootstrapError("Approved Master Sheet isAppAuthorized=false")
+
+    folder = drive_file(OUTPUT_FOLDER_ID, "approved Job_Artifacts folder")
+    if (
+        folder.get("id") != OUTPUT_FOLDER_ID
+        or folder.get("name") != OUTPUT_FOLDER_NAME
+        or folder.get("mimeType") != "application/vnd.google-apps.folder"
+    ):
+        raise BootstrapError("Approved Job_Artifacts folder metadata did not match")
+    capabilities = folder.get("capabilities")
+    can_add_children = (
+        capabilities.get("canAddChildren") if isinstance(capabilities, dict) else None
+    )
+    if can_add_children is not True:
+        raise BootstrapError("Approved Job_Artifacts folder lacks canAddChildren")
+    folder_app_authorized = folder.get("isAppAuthorized")
+    if folder_app_authorized is False:
+        raise BootstrapError("Approved Job_Artifacts folder isAppAuthorized=false")
+
+    spreadsheet_response = google_api_get_with_retry(
+        client,
+        "https://sheets.googleapis.com/v4/spreadsheets/" + quote(APPROVED_SPREADSHEET_ID, safe=""),
+        params={"fields": "spreadsheetId,properties(title),sheets.properties(sheetId,title)"},
+        headers=headers,
+    )
+    if not spreadsheet_response.is_success:
+        _raise_google_api_error(spreadsheet_response, "approved Master Sheet Sheets API")
+    spreadsheet: object = spreadsheet_response.json()
+    if not isinstance(spreadsheet, dict):
+        raise BootstrapError("Google Sheets returned invalid Master Sheet metadata")
+    sheet = cast(dict[str, Any], spreadsheet)
+    props = sheet.get("properties")
+    tabs = sheet.get("sheets")
+    if (
+        sheet.get("spreadsheetId") != APPROVED_SPREADSHEET_ID
+        or not isinstance(props, dict)
+        or props.get("title") != EXPECTED_SHEET_TITLE
+        or not isinstance(tabs, list)
+        or len(tabs) != EXPECTED_SCHEMA_COUNT
+    ):
+        raise BootstrapError("Approved Master Sheet identity or 34-tab count did not match")
+
+    return {
+        "master_sheet_drive_access": "PASS",
+        "master_sheet_sheets_access": "PASS",
+        "master_sheet_is_app_authorized": ("YES" if sheet_app_authorized is True else "UNKNOWN"),
+        "schema_34_verify": "DEFERRED_TO_STAGED_VERIFY",
+        "job_artifacts_access": "PASS",
+        "job_artifacts_mime_type": cast(str, folder["mimeType"]),
+        "job_artifacts_is_app_authorized": ("YES" if folder_app_authorized is True else "UNKNOWN"),
+        "job_artifacts_required_capability": "PASS",
+    }
 
 
 def _authorized_user_json(token: Mapping[str, Any], client_config: Mapping[str, str]) -> bytes:
@@ -387,11 +567,25 @@ def _run_ssh(host: str, command: str, *, input_data: bytes | None, timeout: int)
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        stdout = _redact_remote_text(exc.stdout or b"").strip() or "(empty)"
+        stderr = _redact_remote_text(exc.stderr or b"").strip() or "(empty)"
+        raise BootstrapError(
+            "Secure Google Workspace remote operation timed out; "
+            f"stdout: {stdout}; stderr: {stderr}"
+        ) from exc
+    except OSError as exc:
         raise BootstrapError("Secure Google Workspace remote operation failed") from exc
     if result.returncode != 0:
+        stdout = _redact_remote_text(result.stdout).strip() or "(empty)"
+        stderr = _redact_remote_text(result.stderr).strip() or "(empty)"
+        if result.returncode == 75 and stdout == "REMOTE_VERIFY=DEFERRED_RATE_LIMIT":
+            raise StagedVerificationRateLimitExhaustedError(
+                "Remote staged verifier exhausted Google API HTTP 429 retries"
+            )
         raise BootstrapError(
-            f"Secure Google Workspace remote operation failed (exit code {result.returncode})"
+            "Secure Google Workspace remote operation failed "
+            f"(exit code {result.returncode}); stdout: {stdout}; stderr: {stderr}"
         )
     return result.stdout
 
@@ -413,7 +607,7 @@ def _stage_remote(host: str, stage_path: str, credential: bytes) -> None:
         raise BootstrapError("Staged credential owner/mode verification failed")
 
 
-def _verify_remote_install(host: str, folder_id: str, credential_path: str) -> None:
+def verify_google_workspace_credential(host: str, folder_id: str, credential_path: str) -> None:
     if credential_path != _CANONICAL_PATH:
         _validate_stage_path(credential_path)
     if folder_id != OUTPUT_FOLDER_ID:
@@ -423,9 +617,11 @@ import httpx
 from pathlib import Path
 from gflow_cli.v2_runtime.google_sheets import (
     APPROVED_SPREADSHEET_ID,
+    GoogleSheetsRateLimitExhaustedError,
     GoogleSheetsApiTransport,
     GoogleSheetsSnapshotSource,
     GoogleWorkspaceCredentialProvider,
+    google_api_get_with_retry,
 )
 root = Path('/opt/gflow-v2')
 provider = GoogleWorkspaceCredentialProvider(
@@ -433,7 +629,22 @@ provider = GoogleWorkspaceCredentialProvider(
 )
 transport = GoogleSheetsApiTransport(provider)
 try:
-    snapshot = GoogleSheetsSnapshotSource(transport, root / 'schemas').read()
+    try:
+        snapshot = GoogleSheetsSnapshotSource(transport, root / 'schemas').read()
+        sheet = transport.read_metadata()
+        with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+            response = google_api_get_with_retry(
+                client,
+                'https://www.googleapis.com/drive/v3/files/{folder_id}',
+                params={{'fields': 'id,name,mimeType,capabilities(canAddChildren)'}},
+                headers={{'Authorization': 'Bearer ' + provider.access_token()}},
+            )
+            if not response.is_success:
+                response.raise_for_status()
+            folder = response.json()
+    except GoogleSheetsRateLimitExhaustedError:
+        print('REMOTE_VERIFY=DEFERRED_RATE_LIMIT', flush=True)
+        raise SystemExit(75)
 finally:
     transport.close()
 if (
@@ -441,21 +652,6 @@ if (
     or len(snapshot.tables) != {EXPECTED_SCHEMA_COUNT}
 ):
     raise SystemExit(2)
-with httpx.Client(timeout=20.0, follow_redirects=False) as client:
-    sheet_response = client.get(
-        'https://sheets.googleapis.com/v4/spreadsheets/' + APPROVED_SPREADSHEET_ID,
-        params={{'fields': 'spreadsheetId,properties(title)'}},
-        headers={{'Authorization': 'Bearer ' + provider.access_token()}},
-    )
-    sheet_response.raise_for_status()
-    sheet = sheet_response.json()
-    response = client.get(
-        'https://www.googleapis.com/drive/v3/files/{folder_id}',
-        params={{'fields': 'id,name,mimeType,capabilities(canAddChildren)'}},
-        headers={{'Authorization': 'Bearer ' + provider.access_token()}},
-    )
-    response.raise_for_status()
-    folder = response.json()
 if (
     sheet.get('spreadsheetId') != APPROVED_SPREADSHEET_ID
     or sheet.get('properties', {{}}).get('title') != '{EXPECTED_SHEET_TITLE}'
@@ -479,6 +675,79 @@ print('REMOTE_VERIFY=PASS SCHEMAS={EXPECTED_SCHEMA_COUNT} OUTPUT_FOLDER=PASS')
         f"REMOTE_VERIFY=PASS SCHEMAS={EXPECTED_SCHEMA_COUNT} OUTPUT_FOLDER=PASS"
     ):
         raise BootstrapError("V2 service-user could not verify the Sheet and output folder")
+
+
+# Backward-compatible private name for existing callers/tests; all production
+# paths below invoke the one public verifier entry point.
+_verify_remote_install = verify_google_workspace_credential
+
+
+def _remote_credential_metadata_script(credential_path: str) -> str:
+    if credential_path == _CANONICAL_PATH:
+        pass
+    else:
+        _validate_stage_path(credential_path)
+    return f"""set -eu
+file={shlex.quote(credential_path)}
+test -f "$file" && test ! -L "$file"
+readable=NO
+if sudo -n -u gflow test -r "$file"; then readable=YES; fi
+file_meta=$(stat -c '%U|%G|%a|%s' "$file")
+parent_mode=$(stat -c '%a' "$(dirname "$file")")
+sha=$(sha256sum "$file" | cut -d ' ' -f 1)
+printf 'CREDENTIAL_META|%s|%s|%s|%s|%s|%s|%s\\n' \\
+  "$sha" "${{file_meta%%|*}}" "$(printf '%s' "$file_meta" | cut -d '|' -f 2)" \\
+  "$(printf '%s' "$file_meta" | cut -d '|' -f 3)" \\
+  "$(printf '%s' "$file_meta" | cut -d '|' -f 4)" "$parent_mode" "$readable"
+"""
+
+
+def _credential_metadata(host: str, credential_path: str) -> dict[str, str]:
+    script = _remote_credential_metadata_script(credential_path)
+    stdout = _run_ssh(
+        host,
+        "sudo -n bash -c " + shlex.quote(script),
+        input_data=None,
+        timeout=45,
+    )
+    fields = stdout.decode("utf-8", errors="replace").strip().split("|")
+    if len(fields) != 8 or fields[0] != "CREDENTIAL_META":
+        raise BootstrapError("Remote credential metadata response is invalid")
+    keys = ("sha256", "owner", "group", "mode", "size", "parent_mode", "readable_by_gflow")
+    metadata: dict[str, str] = {key: value for key, value in zip(keys, fields[1:], strict=True)}
+    if not re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]):
+        raise BootstrapError("Remote credential SHA-256 metadata is invalid")
+    if metadata["readable_by_gflow"] not in {"YES", "NO"}:
+        raise BootstrapError("Remote credential readability metadata is invalid")
+    return metadata
+
+
+def _require_promoted_parity(
+    host: str, expected_sha256: str, staged_metadata: Mapping[str, str]
+) -> dict[str, str]:
+    canonical = _credential_metadata(host, _CANONICAL_PATH)
+    if canonical["sha256"] != expected_sha256 or canonical["sha256"] != staged_metadata["sha256"]:
+        raise BootstrapError(
+            "Canonical promotion SHA-256 mismatch "
+            f"(expected {expected_sha256}, actual {canonical['sha256']})"
+        )
+    if canonical["readable_by_gflow"] != "YES":
+        raise BootstrapError(
+            "Canonical promotion permission defect: credential is not readable by gflow "
+            f"(owner={canonical['owner']} group={canonical['group']} mode={canonical['mode']} "
+            f"parent_mode={canonical['parent_mode']})"
+        )
+    if (canonical["owner"], canonical["group"], canonical["mode"]) != ("gflow", "gflow", "600"):
+        raise BootstrapError(
+            "Canonical promotion owner/mode defect "
+            f"(owner={canonical['owner']} group={canonical['group']} mode={canonical['mode']})"
+        )
+    if canonical["parent_mode"] != "750":
+        raise BootstrapError(
+            "Canonical promotion parent directory mode defect "
+            f"(expected=750 actual={canonical['parent_mode']})"
+        )
+    return canonical
 
 
 def _promote_remote(host: str, stage_path: str, expected_sha256: str) -> None:
@@ -554,10 +823,19 @@ def _finalize_remote(host: str, stage_path: str, expected_sha256: str) -> None:
 
 def _restore_script(stage_path: str, expected_sha256: str) -> str:
     backup_path = f"{stage_path}.previous"
+    failed_candidate_path = f"{stage_path}.failed-candidate"
     return f"""set -eu
 target={shlex.quote(_CANONICAL_PATH)}
 backup={shlex.quote(backup_path)}
+failed={shlex.quote(failed_candidate_path)}
 expected={shlex.quote(expected_sha256)}
+if test -f "$target" && test ! -L "$target" \\
+  && test "$(sha256sum "$target" | cut -d ' ' -f 1)" = "$expected"; then
+  test ! -e "$failed" && test ! -L "$failed"
+  cp -- "$target" "$failed"
+  chown gflow:gflow "$failed"
+  chmod 0600 "$failed"
+fi
 if test -e "$backup"; then
   test -f "$backup" && test ! -L "$backup"
   test "$(stat -c '%U:%G:%a' "$backup")" = 'gflow:gflow:600'
@@ -601,16 +879,30 @@ def _cleanup_remote(host: str, stage_path: str) -> None:
         raise BootstrapError("Staged credential cleanup could not be verified")
 
 
-def _install_verified_remote(host: str, folder_id: str, credential: bytes) -> None:
+def _install_verified_remote(
+    host: str,
+    folder_id: str,
+    credential: bytes,
+    *,
+    stop_after_staged_verify: bool = False,
+) -> tuple[str, str]:
     """Stage, service-verify, then promote; cleanup the candidate on every HOLD path."""
     stage_path = f"{_REMOTE_ROOT}/.google-authorized-user.staged-{secrets.token_hex(16)}.json"
     credential_sha256 = hashlib.sha256(credential).hexdigest()
     promotion_attempted = False
     promoted = False
     canonical_verified = False
+    staged_metadata: dict[str, str] | None = None
+    canonical_metadata: dict[str, str] | None = None
     try:
         _stage_remote(host, stage_path, credential)
-        _verify_remote_install(host, folder_id, stage_path)
+        verify_google_workspace_credential(host, folder_id, stage_path)
+        staged_metadata = _credential_metadata(host, stage_path)
+        _validate_verified_candidate(staged_metadata, credential_sha256)
+        if stop_after_staged_verify:
+            # Successful stop mode intentionally retains this verified credential.
+            # Returning here bypasses all promotion and failure-cleanup handling.
+            return stage_path, credential_sha256
         promotion_attempted = True
         try:
             _promote_remote(host, stage_path, credential_sha256)
@@ -622,12 +914,43 @@ def _install_verified_remote(host: str, folder_id: str, credential: bytes) -> No
                 raise
         if not promoted:
             raise BootstrapError("Remote credential promotion was not confirmed")
+        canonical_metadata = _require_promoted_parity(host, credential_sha256, staged_metadata)
         try:
-            _verify_remote_install(host, folder_id, _CANONICAL_PATH)
+            verify_google_workspace_credential(host, folder_id, _CANONICAL_PATH)
         except BootstrapError as exc:
-            raise BootstrapError(f"Canonical credential verification failed: {exc}") from exc
+            safe_meta = " ".join(
+                f"{key}={canonical_metadata[key]}"
+                for key in (
+                    "sha256",
+                    "size",
+                    "owner",
+                    "group",
+                    "mode",
+                    "parent_mode",
+                    "readable_by_gflow",
+                )
+            )
+            raise BootstrapError(
+                f"Canonical credential verification failed: {exc}; {safe_meta}; "
+                f"failed candidate retained at {stage_path}.failed-candidate"
+            ) from exc
         canonical_verified = True
         _finalize_remote(host, stage_path, credential_sha256)
+    except StagedVerificationRateLimitExhaustedError as exc:
+        try:
+            staged_metadata = _credential_metadata(host, stage_path)
+            _validate_verified_candidate(staged_metadata, credential_sha256)
+        except BootstrapError as metadata_error:
+            try:
+                _cleanup_remote(host, stage_path)
+            except BootstrapError as cleanup_error:
+                raise BootstrapError(
+                    "OAuth bootstrap is on HOLD; rate-limited stage cleanup must be reconciled"
+                ) from cleanup_error
+            raise BootstrapError(
+                "Rate-limited staged credential failed secure metadata validation and was removed"
+            ) from metadata_error
+        raise StagedCredentialDeferredError(stage_path, credential_sha256) from exc
     except Exception as exc:
         # If SSH lost the promotion acknowledgement or the follow-up status
         # probe, ``promoted`` may still be false even though the remote rename
@@ -650,17 +973,122 @@ def _install_verified_remote(host: str, folder_id: str, credential: bytes) -> No
         if isinstance(exc, BootstrapError):
             raise
         raise BootstrapError("Google Workspace credential bootstrap failed safely") from exc
+    return stage_path, credential_sha256
+
+
+def _validate_verified_candidate(metadata: Mapping[str, str], expected_sha256: str) -> None:
+    if metadata["sha256"] != expected_sha256:
+        raise BootstrapError(
+            f"Verified staged credential SHA-256 mismatch (expected {expected_sha256}, "
+            f"actual {metadata['sha256']})"
+        )
+    if metadata["readable_by_gflow"] != "YES":
+        raise BootstrapError(
+            "Verified staged credential is not readable by gflow "
+            f"(owner={metadata['owner']} group={metadata['group']} mode={metadata['mode']} "
+            f"parent_mode={metadata['parent_mode']})"
+        )
+    if (metadata["owner"], metadata["group"], metadata["mode"]) != ("gflow", "gflow", "600"):
+        raise BootstrapError(
+            "Verified staged credential owner/mode defect "
+            f"(owner={metadata['owner']} group={metadata['group']} mode={metadata['mode']})"
+        )
+    if metadata["parent_mode"] != "750":
+        raise BootstrapError(
+            "Verified staged credential parent directory mode defect "
+            f"(expected=750 actual={metadata['parent_mode']})"
+        )
+
+
+def _resume_verified_stage(
+    host: str,
+    folder_id: str,
+    staged_path: str,
+    expected_sha256: str,
+) -> None:
+    """Promote only an explicitly named, unchanged, fully re-verified stage."""
+    _validate_stage_path(staged_path)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise BootstrapError("Expected staged SHA-256 is required and must be lowercase hex")
+    if folder_id != OUTPUT_FOLDER_ID:
+        raise BootstrapError("Only the approved V2 output folder is permitted")
+    promoted = False
+    canonical_verified = False
+    try:
+        staged_metadata = _credential_metadata(host, staged_path)
+        _validate_verified_candidate(staged_metadata, expected_sha256)
+        verify_google_workspace_credential(host, folder_id, staged_path)
+        try:
+            _promote_remote(host, staged_path, expected_sha256)
+            promoted = True
+        except BootstrapError:
+            promoted = _promotion_status(host, staged_path, expected_sha256)
+            if not promoted:
+                raise
+        canonical_metadata = _require_promoted_parity(host, expected_sha256, staged_metadata)
+        try:
+            verify_google_workspace_credential(host, folder_id, _CANONICAL_PATH)
+        except BootstrapError as exc:
+            safe_meta = " ".join(
+                f"{key}={canonical_metadata[key]}"
+                for key in (
+                    "sha256",
+                    "size",
+                    "owner",
+                    "group",
+                    "mode",
+                    "parent_mode",
+                    "readable_by_gflow",
+                )
+            )
+            raise BootstrapError(
+                f"Canonical credential verification failed: {exc}; {safe_meta}; "
+                f"failed candidate retained at {staged_path}.failed-candidate"
+            ) from exc
+        canonical_verified = True
+        _finalize_remote(host, staged_path, expected_sha256)
+    except Exception as exc:
+        if promoted and not canonical_verified:
+            try:
+                _restore_remote(host, staged_path, expected_sha256)
+            except BootstrapError as restore_exc:
+                raise BootstrapError(
+                    "Resume promotion is on HOLD; canonical rollback must be reconciled"
+                ) from restore_exc
+        if isinstance(exc, BootstrapError):
+            raise
+        raise BootstrapError("Verified staged credential promotion failed safely") from exc
 
 
 def _run(
-    oauth_client_path: Path,
+    oauth_client_path: Path | None,
     *,
     repository_root: Path,
     spreadsheet_id: str = APPROVED_SPREADSHEET_ID,
     folder_id: str = OUTPUT_FOLDER_ID,
     ssh_host: str = "gflow-vps",
     output: Callable[[str], None] = print,
+    stop_after_staged_verify: bool = False,
+    resume_staged_path: str | None = None,
+    expected_staged_sha256: str | None = None,
+    pickerless_reuse_test: bool = False,
 ) -> None:
+    if resume_staged_path is not None or expected_staged_sha256 is not None:
+        if resume_staged_path is None or expected_staged_sha256 is None:
+            raise BootstrapError(
+                "Resume requires both --resume-staged-path and --expected-staged-sha256"
+            )
+        if oauth_client_path is not None or stop_after_staged_verify:
+            raise BootstrapError(
+                "Resume cannot be combined with OAuth client input or stage-only mode"
+            )
+        _resume_verified_stage(ssh_host, folder_id, resume_staged_path, expected_staged_sha256)
+        output("D5_RESUME_PROMOTION=FINALIZED")
+        return
+    if pickerless_reuse_test and not stop_after_staged_verify:
+        raise BootstrapError("Pickerless previous-grant test requires stage-only mode")
+    if oauth_client_path is None:
+        raise BootstrapError("--oauth-client-json is required unless resuming a staged credential")
     if spreadsheet_id != APPROVED_SPREADSHEET_ID or folder_id != OUTPUT_FOLDER_ID:
         raise BootstrapError("Only the approved V2 spreadsheet and output folder are permitted")
     client_config = _safe_client_config(oauth_client_path, repository_root)
@@ -669,18 +1097,34 @@ def _run(
     server, callback_result = _create_callback_server()
     host, port = cast(tuple[str, int], server.server_address[:2])
     redirect_uri = f"http://{host}:{port}/oauth2callback"
-    url = _authorization_url(client_config["client_id"], redirect_uri, state, challenge)
-    output("Open this URL in a browser and manually complete Google consent and Picker:")
+    url = _authorization_url(
+        client_config["client_id"],
+        redirect_uri,
+        state,
+        challenge,
+        include_picker=not pickerless_reuse_test,
+    )
+    output("CALLBACK_LISTENER_ACTIVE=YES")
+    output(
+        "Open this URL and complete Google consent:"
+        if pickerless_reuse_test
+        else "Open this URL in a browser and manually complete Google consent and Picker:"
+    )
     output(url)
     try:
         query = _receive_callback(server, callback_result)
     finally:
         server.server_close()
-    code = _validate_callback(
-        query,
-        expected_state=state,
-        expected_ids={spreadsheet_id, folder_id},
+    code = (
+        _validate_pickerless_callback(query, expected_state=state)
+        if pickerless_reuse_test
+        else _validate_callback(
+            query,
+            expected_state=state,
+            expected_ids={spreadsheet_id, folder_id},
+        )
     )
+    grant_report: dict[str, str] = {}
     try:
         with httpx.Client(timeout=20.0, follow_redirects=False) as client:
             token = _exchange_code(
@@ -690,17 +1134,45 @@ def _run(
                 redirect_uri=redirect_uri,
                 code_verifier=verifier,
             )
-            _verify_grants(
-                client,
-                access_token=cast(str, token["access_token"]),
-                spreadsheet_id=spreadsheet_id,
-                folder_id=folder_id,
-            )
-        _install_verified_remote(ssh_host, folder_id, _authorized_user_json(token, client_config))
+            if pickerless_reuse_test:
+                grant_report = _verify_previous_file_grants(
+                    client,
+                    access_token=cast(str, token["access_token"]),
+                    repository_root=repository_root,
+                )
+            else:
+                _verify_grants(
+                    client,
+                    access_token=cast(str, token["access_token"]),
+                    spreadsheet_id=spreadsheet_id,
+                    folder_id=folder_id,
+                )
+        stage_path, credential_sha256 = _install_verified_remote(
+            ssh_host,
+            folder_id,
+            _authorized_user_json(token, client_config),
+            stop_after_staged_verify=stop_after_staged_verify,
+        )
+        if pickerless_reuse_test:
+            grant_report["schema_34_verify"] = "PASS"
     except BootstrapError:
         raise
     except Exception as exc:  # noqa: BLE001 — suppress all credential-bearing details
         raise BootstrapError("Google Workspace credential bootstrap failed") from exc
+    if stop_after_staged_verify:
+        if pickerless_reuse_test:
+            output("AUTH_MODE=PICKERLESS")
+            output("PREVIOUS_FILE_GRANTS_REUSABLE=YES")
+            for key, value in grant_report.items():
+                output(f"{key.upper()}={value}")
+        output("D5_STAGE_STATUS=VERIFIED")
+        output(f"STAGED_CREDENTIAL_PATH={stage_path}")
+        output(f"STAGED_CREDENTIAL_SHA256={credential_sha256}")
+        output("CANONICAL_CREDENTIAL_CHANGED=NO")
+        output("PROMOTION_RUN=NO")
+        output("FINALIZATION_RUN=NO")
+        output("BOOTSTRAP_STATE=STAGED_VERIFIED_NOT_PROMOTED")
+        return
     output(f"Credential installed and verified at {TARGET_PATH} (owner gflow:gflow, mode 0600).")
 
 
@@ -708,15 +1180,64 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Bootstrap the dedicated V2 Google Workspace OAuth credential."
     )
-    parser.add_argument("--oauth-client-json", type=Path, required=True)
+    parser.add_argument("--oauth-client-json", type=Path)
     parser.add_argument("--ssh-host", default="gflow-vps")
+    parser.add_argument("--resume-staged-path")
+    parser.add_argument("--expected-staged-sha256")
+    parser.add_argument(
+        "--pickerless-reuse-test",
+        action="store_true",
+        help=(
+            "reauthorize with only drive.file, directly test the two approved IDs, "
+            "and require --stop-after-staged-verify"
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-staged-verify",
+        action="store_true",
+        help=(
+            "retain the service-verified staged credential and stop before canonical "
+            "promotion or finalization"
+        ),
+    )
     args = parser.parse_args()
     try:
         _run(
             args.oauth_client_json,
             repository_root=Path(__file__).resolve().parents[2],
             ssh_host=args.ssh_host,
+            stop_after_staged_verify=args.stop_after_staged_verify,
+            resume_staged_path=args.resume_staged_path,
+            expected_staged_sha256=args.expected_staged_sha256,
+            pickerless_reuse_test=args.pickerless_reuse_test,
         )
+    except StagedCredentialDeferredError as exc:
+        print(
+            json.dumps(
+                {
+                    "state": "HOLD",
+                    "reason_code": "GOOGLE_SHEETS_RATE_LIMIT_DEFERRED",
+                    "detail": str(exc),
+                    "STAGED_VERIFY": "DEFERRED_RATE_LIMIT",
+                    "STAGED_CREDENTIAL_PATH": exc.stage_path,
+                    "STAGED_CREDENTIAL_SHA256": exc.credential_sha256,
+                    "STAGED_OWNER": "gflow",
+                    "STAGED_GROUP": "gflow",
+                    "STAGED_MODE": "0600",
+                    "PROMOTION": "NOT_RUN",
+                    "FINALIZATION": "NOT_RUN",
+                    "OAUTH_RERUN_REQUIRED": "NO",
+                    "RESUME_COMMAND": (
+                        "uv run python scripts/operations/bootstrap_google_workspace_auth.py "
+                        f"--resume-staged-path {exc.stage_path} "
+                        f"--expected-staged-sha256 {exc.credential_sha256} "
+                        f"--ssh-host {args.ssh_host}"
+                    ),
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 2
     except BootstrapError as exc:
         print(
             json.dumps(

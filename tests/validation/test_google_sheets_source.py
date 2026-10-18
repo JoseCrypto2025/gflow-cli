@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -45,6 +45,7 @@ class FakeTransport:
     def __init__(self, values: Sequence[Sequence[object]] | None = None) -> None:
         self.values = values if values is not None else [["Record_ID", "Value"], ["ID_0001", "ok"]]
         self.calls: list[tuple[str, str, str]] = []
+        self.batch_calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
         self.failure = False
 
     def read_values(
@@ -54,6 +55,14 @@ class FakeTransport:
         if self.failure:
             raise RuntimeError("contains fake token=never-print")
         return self.values
+
+    def read_values_batch(
+        self, spreadsheet_id: str, ranges: Mapping[str, str]
+    ) -> Mapping[str, Sequence[Sequence[object]]]:
+        self.batch_calls.append((spreadsheet_id, tuple(ranges.items())))
+        if self.failure:
+            raise RuntimeError("contains fake token=never-print")
+        return {name: self.values for name in ranges}
 
 
 def test_source_reads_only_approved_spreadsheet_and_sets_producer_timestamp(tmp_path: Path) -> None:
@@ -70,7 +79,8 @@ def test_source_reads_only_approved_spreadsheet_and_sets_producer_timestamp(tmp_
     assert snapshot.read_at == "2026-10-18T12:00:00Z"
     assert snapshot.source == SOURCE_LIVE_GOOGLE_SHEETS
     assert snapshot.tables["DEMO"] == [{"Record_ID": "ID_0001", "Value": "ok"}]
-    assert transport.calls == [(APPROVED_SPREADSHEET_ID, "DEMO", "A1:AZ1001")]
+    assert transport.calls == []
+    assert transport.batch_calls == [(APPROVED_SPREADSHEET_ID, (("DEMO", "A1:AZ1001"),))]
     assert not hasattr(transport, "write_values")
 
 
@@ -230,6 +240,216 @@ def test_rest_transport_uses_scoped_token_and_only_gets_approved_values() -> Non
     assert not hasattr(adapter, "write_values")
     assert GOOGLE_DRIVE_FILE_SCOPE == "https://www.googleapis.com/auth/drive.file"
     adapter.close()
+    client.close()
+
+
+def test_batch_get_uses_one_ordered_request_and_maps_every_range() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "valueRanges": [
+                    {"range": "FIRST!A1:AZ1001", "values": [["ID", "Value"]]},
+                    {"range": "SECOND!A1:AZ1001", "values": [["ID", "Value"]]},
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(Tokens(), client=client)
+    values = adapter.read_values_batch(
+        APPROVED_SPREADSHEET_ID,
+        {"FIRST": "A1:AZ1001", "SECOND": "A1:AZ1001"},
+    )
+    assert values == {
+        "FIRST": [["ID", "Value"]],
+        "SECOND": [["ID", "Value"]],
+    }
+    assert len(seen) == 1
+    assert seen[0].method == "GET"
+    assert seen[0].url.path.endswith("/values:batchGet")
+    assert seen[0].url.params.get_list("ranges") == [
+        "FIRST!A1:AZ1001",
+        "SECOND!A1:AZ1001",
+    ]
+    assert seen[0].headers["Authorization"] == "Bearer secret-token"
+    adapter.close()
+    client.close()
+
+
+def test_full_34_schema_snapshot_uses_one_batch_and_keeps_validation(tmp_path: Path) -> None:
+    schema_dir = Path(__file__).resolve().parents[2] / "schemas"
+    from gflow_cli.v2_runtime.google_sheets import load_schema_headers
+
+    headers = load_schema_headers(schema_dir)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        ranges = request.url.params.get_list("ranges")
+        value_ranges = []
+        for a1_range in ranges:
+            sheet_name = a1_range.split("!", 1)[0].strip("'")
+            value_ranges.append({"range": a1_range, "values": [list(headers[sheet_name])]})
+        return httpx.Response(200, json={"valueRanges": value_ranges})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(Tokens(), client=client)
+    snapshot = GoogleSheetsSnapshotSource(adapter, schema_dir).read()
+    assert len(snapshot.tables) == 34
+    assert all(rows == [] for rows in snapshot.tables.values())
+    assert len(seen) == 1
+    assert len(seen[0].url.params.get_list("ranges")) == 34
+    adapter.close()
+    client.close()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_unauthorized_and_forbidden_reads_are_not_retried(status: int) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status, text="secret-token")
+
+    sleeps: list[float] = []
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(Tokens(), client=client, sleeper=sleeps.append)
+    with pytest.raises(GoogleSheetsReadError):
+        adapter.read_values(APPROVED_SPREADSHEET_ID, "DEMO", "A1:AZ1001")
+    assert calls == 1
+    assert sleeps == []
+    adapter.close()
+    client.close()
+
+
+def test_429_retries_with_retry_after_and_succeeds() -> None:
+    statuses = [429, 429, 200]
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        status = statuses[calls]
+        calls += 1
+        if status == 429:
+            return httpx.Response(status, headers={"Retry-After": "3"})
+        return httpx.Response(200, json={"values": [["ID", "Value"]]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(
+        Tokens(), client=client, sleeper=sleeps.append, random_uniform=lambda low, _high: low
+    )
+    assert adapter.read_values(APPROVED_SPREADSHEET_ID, "DEMO", "A1:AZ1001") == [["ID", "Value"]]
+    assert calls == 3
+    assert sleeps == [3.0, 3.0]
+    adapter.close()
+    client.close()
+
+
+def test_retry_after_http_date_is_honored() -> None:
+    now = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"Retry-After": "Sun, 18 Oct 2026 12:00:04 GMT"})
+        return httpx.Response(200, json={"values": [["ID", "Value"]]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(
+        Tokens(), client=client, sleeper=sleeps.append, now=lambda: now
+    )
+    assert adapter.read_values(APPROVED_SPREADSHEET_ID, "DEMO", "A1:AZ1001")
+    assert calls == 2
+    assert sleeps == [4.0]
+    adapter.close()
+    client.close()
+
+
+def test_transient_5xx_retries_but_stops_after_success() -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"values": [["ID", "Value"]]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(
+        Tokens(), client=client, sleeper=sleeps.append, random_uniform=lambda low, _high: low
+    )
+    assert adapter.read_values(APPROVED_SPREADSHEET_ID, "DEMO", "A1:AZ1001")
+    assert calls == 2
+    assert sleeps == [0.8]
+    adapter.close()
+    client.close()
+
+
+def test_429_fallback_backoff_is_bounded_and_exhaustion_is_typed() -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    class Tokens:
+        def access_token(self) -> str:
+            return "secret-token"
+
+    adapter = GoogleSheetsApiTransport(
+        Tokens(), client=client, sleeper=sleeps.append, random_uniform=lambda low, _high: low
+    )
+    with pytest.raises(GoogleSheetsReadError) as exc:
+        adapter.read_values(APPROVED_SPREADSHEET_ID, "DEMO", "A1:AZ1001")
+    assert getattr(exc.value, "status_code", None) == 429
+    assert calls == 7
+    assert sleeps == [0.8, 1.6, 3.2, 6.4, 12.8, 25.6]
+    assert sum(sleeps) <= 90
     client.close()
 
 

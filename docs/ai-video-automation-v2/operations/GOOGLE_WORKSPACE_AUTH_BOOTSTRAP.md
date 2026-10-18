@@ -95,6 +95,7 @@ claims that Picker IDs prove the Flow account identity.
    cd D:\Gflow-CLI
    uv run python scripts/operations/bootstrap_google_workspace_auth.py `
      --oauth-client-json "C:\path\outside-repository\oauth-client.json" `
+     --stop-after-staged-verify `
      --ssh-host gflow-vps
    ```
 
@@ -112,15 +113,44 @@ claims that Picker IDs prove the Flow account identity.
    as the canonical path, owned by `gflow:gflow`, mode `0600`. It runs the
    deployed V2 source as `gflow` against that staged file, checks all 34 local
    schemas and the exact spreadsheet title, then checks the exact existing
-   `Job_Artifacts` folder identity, type, and `canAddChildren` capability.
-7. Only after staged verification passes does the installer atomically promote
-   the staged file to the canonical path and verify owner/mode/digest. Promotion
-   is serialized with a file lock; the previous canonical file is backed up
-   until canonical verification succeeds. A failed promotion or canonical
-   verification attempts a digest-guarded rollback and removes the staged file.
-   If the SSH acknowledgement is lost, the client performs a bounded status
-   check and attempts safe rollback if canonical state cannot be proven; inspect
-   file status before any rerun. Output contains only safe status text.
+   `Job_Artifacts` folder identity, type, and `canAddChildren` capability. The
+   schema snapshot uses one ordered `values.batchGet` request with 34 explicit,
+   bounded `TAB!A1:AZ1001` ranges; the existing header, overflow, row, secret,
+   key, foreign-key, and semantic checks still run for every table. The
+   pickerless pre-stage check verifies file grants and Sheet identity, then
+   leaves the one full schema snapshot to staged-credential verification.
+   Safe Google API GETs retry HTTP 429 and 5xx responses sequentially, up to
+   seven attempts, honoring a valid `Retry-After` value within a 90-second
+   total wait budget; fallback delays use bounded jitter around 1, 2, 4, 8,
+   16, and 32 seconds. HTTP 401/403, writes, and OAuth token exchange are not
+   retried.
+7. The controlled D5 run uses `--stop-after-staged-verify`. After staged
+   verification, it prints `D5_STAGE_STATUS=VERIFIED`, the staged path and
+   SHA-256, and confirms canonical credentials were not changed. The staged
+   file is retained as `gflow:gflow`, mode `0600`; record its path and SHA
+   securely, then stop for explicit promotion approval.
+8. After approval, resume without OAuth using both the exact staged path and
+   its reviewed SHA-256:
+
+   ```powershell
+   uv run python scripts/operations/bootstrap_google_workspace_auth.py `
+     --resume-staged-path "/etc/gflow-v2/.google-authorized-user.staged-<32-hex>.json" `
+     --expected-staged-sha256 "<64-lowercase-hex>" `
+     --ssh-host gflow-vps
+   ```
+
+   Resume rechecks the stage digest, ownership, mode, parent directory, and
+   readability as `gflow`, then uses the same Sheet/schema/folder verifier as
+   the staged pass. It refuses a missing, changed, unsafe, or arbitrary file.
+   It does not load OAuth client configuration or start consent.
+9. Promotion is serialized with a file lock. Before and after promotion the
+   tool compares SHA-256 and safe metadata, and requires the canonical file to
+   be readable by `gflow` before making Google API calls. Remote failures retain
+   bounded stdout/stderr after secret redaction. If canonical API verification
+   fails, metadata and sanitized diagnostics are reported, rollback is
+   digest-guarded, and the failed candidate is retained at mode `0600` for
+   diagnosis when safe. Never print or copy that file's contents. Inspect its
+   state before any subsequent operation.
 
 The local bootstrap script runs on the Windows workstation; the remote install
 contract is Linux-specific and targets only the configured `gflow-vps` host.
@@ -142,11 +172,22 @@ material and is treated as a credential.
 - Missing/wrong Picker IDs, wrong Sheet title/tab count, inaccessible output
   folder, scope drift, state mismatch, timeout, API failure, unsafe remote
   directory, or stage/promotion permission mismatch blocks installation.
-- OAuth/API errors are reduced to stable safe status text; raw response bodies,
-  authorization codes, access/refresh tokens, and client secrets are not logged.
+- OAuth/API errors retain bounded diagnostic text after redacting credential
+  JSON, authorization codes, access/refresh tokens, bearer values, and client
+  secrets; review output before sharing it.
 - If remote staged verification fails, the candidate is removed and the prior
   canonical credential remains untouched. D5 remains held. Do not attempt Flow
   or Generate.
+- If staged verification exhausts retries on HTTP 429, the bootstrap reports
+  `STAGED_VERIFY=DEFERRED_RATE_LIMIT` and retains the unpromoted staged
+  credential only after checking that its SHA-256 is unchanged, its owner and
+  group are `gflow:gflow`, its mode is `0600`, its parent mode is `0750`, and
+  `gflow` can read it. The report includes the stage path and digest, states
+  `OAUTH_RERUN_REQUIRED=NO`, and gives the existing `--resume-staged-path` /
+  `--expected-staged-sha256` command to retry verification later. Resume always
+  reruns complete staged verification before promotion. No promotion or
+  finalization occurs on the deferred run. Other verification failures retain
+  the existing candidate cleanup and canonical rollback behavior.
 - Revoke and replace the OAuth grant after suspected exposure. Keep the V2
   credential readable only by `gflow`.
 - The D5 live source re-reads and validates all schema tables before opening

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import stat
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import quote
@@ -31,6 +34,93 @@ _SECRET_FIELD_RE = re.compile(
 
 class GoogleSheetsReadError(ValueError):
     """Safe failure raised without exposing credential or API response content."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class GoogleSheetsRateLimitExhaustedError(GoogleSheetsReadError):
+    """A bounded Google API GET retry budget ended on HTTP 429."""
+
+    def __init__(self) -> None:
+        super().__init__("Google API rate limit retry budget exhausted", status_code=429)
+
+
+_MAX_GET_ATTEMPTS = 7
+_MAX_RETRY_WAIT_SECONDS = 90.0
+_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+
+
+def google_api_get_with_retry(
+    client: httpx.Client,
+    endpoint: str,
+    *,
+    params: Mapping[str, str] | tuple[tuple[str, str], ...],
+    headers: Mapping[str, str],
+    sleeper: Callable[[float], None] = time.sleep,
+    random_uniform: Callable[[float, float], float] = random.uniform,
+    monotonic: Callable[[], float] = time.monotonic,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> httpx.Response:
+    """Issue a safe Google API GET with bounded 429/5xx retry handling."""
+    started = monotonic()
+    waited = 0.0
+    for attempt in range(_MAX_GET_ATTEMPTS):
+        response = client.get(endpoint, params=params, headers=headers)
+        if response.status_code != 429 and not 500 <= response.status_code <= 599:
+            return response
+        if attempt == _MAX_GET_ATTEMPTS - 1:
+            if response.status_code == 429:
+                raise GoogleSheetsRateLimitExhaustedError()
+            raise GoogleSheetsReadError(
+                "Google API transient server error retry budget exhausted",
+                status_code=response.status_code,
+            )
+
+        remaining = min(
+            _MAX_RETRY_WAIT_SECONDS - waited,
+            _MAX_RETRY_WAIT_SECONDS - (monotonic() - started),
+        )
+        retry_after = _retry_after_seconds(response.headers.get("Retry-After"), now())
+        base = _BACKOFF_SECONDS[attempt]
+        delay = retry_after if retry_after is not None else random_uniform(base * 0.8, base * 1.2)
+        if delay > remaining:
+            if response.status_code == 429:
+                raise GoogleSheetsRateLimitExhaustedError()
+            raise GoogleSheetsReadError(
+                "Google API transient server error retry budget exhausted",
+                status_code=response.status_code,
+            )
+        sleeper(delay)
+        waited += delay
+    raise AssertionError("bounded GET retry loop must return or raise")
+
+
+def _retry_after_seconds(value: str | None, current_time: datetime) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return max(0.0, (retry_at - current_time).total_seconds())
+
+
+def _values_from_payload(payload: object) -> Sequence[Sequence[object]]:
+    payload_mapping = cast(Mapping[str, object], payload) if isinstance(payload, dict) else None
+    values: object = payload_mapping.get("values", []) if payload_mapping is not None else None
+    if not isinstance(values, list):
+        raise GoogleSheetsReadError("Google Sheets response shape is invalid")
+    rows = cast(list[object], values)
+    if any(not isinstance(row, list) for row in rows):
+        raise GoogleSheetsReadError("Google Sheets response shape is invalid")
+    return cast(Sequence[Sequence[object]], rows)
 
 
 class SheetsReadTransport(Protocol):
@@ -102,10 +192,18 @@ class GoogleSheetsApiTransport:
         token_provider: AccessTokenProvider,
         *,
         client: httpx.Client | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        random_uniform: Callable[[float, float], float] = random.uniform,
+        monotonic: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._token_provider = token_provider
         self._client = client or httpx.Client(timeout=20.0, follow_redirects=False)
         self._owns_client = client is None
+        self._sleeper = sleeper
+        self._random_uniform = random_uniform
+        self._monotonic = monotonic
+        self._now = now
 
     def read_values(
         self, spreadsheet_id: str, sheet_name: str, value_range: str
@@ -122,15 +220,139 @@ class GoogleSheetsApiTransport:
             f"{quote(sheet_name + '!' + value_range, safe='!:$')}"
         )
         try:
-            response = self._client.get(
+            response = google_api_get_with_retry(
+                self._client,
                 endpoint,
                 params={"valueRenderOption": "FORMATTED_VALUE"},
                 headers={"Authorization": f"Bearer {self._token_provider.access_token()}"},
+                sleeper=self._sleeper,
+                random_uniform=self._random_uniform,
+                monotonic=self._monotonic,
+                now=self._now,
             )
-            response.raise_for_status()
+            if not response.is_success:
+                raise GoogleSheetsReadError(
+                    "Google Sheets read failed", status_code=response.status_code
+                )
             payload: object = response.json()
+        except GoogleSheetsReadError:
+            raise
         except Exception as exc:  # noqa: BLE001 — never echo HTTP/OAuth exception text
             raise GoogleSheetsReadError("Google Sheets read failed") from exc
+        return _values_from_payload(payload)
+
+    def read_values_batch(
+        self, spreadsheet_id: str, ranges: Mapping[str, str]
+    ) -> Mapping[str, Sequence[Sequence[object]]]:
+        if spreadsheet_id != APPROVED_SPREADSHEET_ID:
+            raise GoogleSheetsReadError("unapproved spreadsheet ID")
+        if not ranges:
+            raise GoogleSheetsReadError("empty Google Sheets batch range set")
+        requested: dict[str, str] = {}
+        for sheet_name, value_range in ranges.items():
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", sheet_name):
+                raise GoogleSheetsReadError("invalid Sheet tab name")
+            if value_range != "A1:AZ1001":
+                raise GoogleSheetsReadError("invalid bounded Sheet range")
+            if sheet_name in requested:
+                raise GoogleSheetsReadError("duplicate Sheet tab in batch range set")
+            requested[sheet_name] = value_range
+        endpoint = (
+            "https://sheets.googleapis.com/v4/spreadsheets/"
+            f"{quote(spreadsheet_id, safe='')}/values:batchGet"
+        )
+        params = tuple(
+            [
+                ("ranges", f"{sheet_name}!{value_range}")
+                for sheet_name, value_range in requested.items()
+            ]
+            + [("valueRenderOption", "FORMATTED_VALUE")]
+        )
+        try:
+            response = google_api_get_with_retry(
+                self._client,
+                endpoint,
+                params=params,
+                headers={"Authorization": f"Bearer {self._token_provider.access_token()}"},
+                sleeper=self._sleeper,
+                random_uniform=self._random_uniform,
+                monotonic=self._monotonic,
+                now=self._now,
+            )
+            if not response.is_success:
+                raise GoogleSheetsReadError(
+                    "Google Sheets batch read failed", status_code=response.status_code
+                )
+            payload: object = response.json()
+        except GoogleSheetsReadError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — response details may contain secrets
+            raise GoogleSheetsReadError("Google Sheets batch read failed") from exc
+        if not isinstance(payload, dict):
+            raise GoogleSheetsReadError("Google Sheets batch response shape is invalid")
+        payload_mapping = cast(Mapping[str, object], payload)
+        raw_value_ranges = payload_mapping.get("valueRanges")
+        if not isinstance(raw_value_ranges, list):
+            raise GoogleSheetsReadError("Google Sheets batch response shape is invalid")
+        value_ranges = cast(list[object], raw_value_ranges)
+        if len(value_ranges) != len(requested):
+            raise GoogleSheetsReadError("Google Sheets batch response range count is invalid")
+        result: dict[str, Sequence[Sequence[object]]] = {}
+        for item in value_ranges:
+            if not isinstance(item, dict):
+                raise GoogleSheetsReadError("Google Sheets batch response range is invalid")
+            item_mapping = cast(Mapping[str, object], item)
+            returned_range = item_mapping.get("range")
+            if not isinstance(returned_range, str):
+                raise GoogleSheetsReadError("Google Sheets batch response range is invalid")
+            range_match = re.fullmatch(r"'?([A-Z][A-Z0-9_]{0,63})'?!A1:AZ1001", returned_range)
+            if range_match is None:
+                raise GoogleSheetsReadError("Google Sheets batch response range is invalid")
+            sheet_name = range_match.group(1)
+            if sheet_name not in requested or sheet_name in result:
+                raise GoogleSheetsReadError(
+                    "Google Sheets batch response contains an unexpected range"
+                )
+            raw_values = item_mapping.get("values", [])
+            if not isinstance(raw_values, list):
+                raise GoogleSheetsReadError("Google Sheets batch response shape is invalid")
+            rows = cast(list[object], raw_values)
+            if any(not isinstance(row, list) for row in rows):
+                raise GoogleSheetsReadError("Google Sheets batch response shape is invalid")
+            result[sheet_name] = cast(Sequence[Sequence[object]], rows)
+        if set(result) != set(requested):
+            raise GoogleSheetsReadError("Google Sheets batch response is incomplete")
+        return {sheet_name: result[sheet_name] for sheet_name in requested}
+
+    def read_metadata(self) -> Mapping[str, object]:
+        """Read approved spreadsheet identity using the same bounded GET policy."""
+        endpoint = (
+            "https://sheets.googleapis.com/v4/spreadsheets/"
+            f"{quote(APPROVED_SPREADSHEET_ID, safe='')}"
+        )
+        try:
+            response = google_api_get_with_retry(
+                self._client,
+                endpoint,
+                params={"fields": "spreadsheetId,properties(title)"},
+                headers={"Authorization": f"Bearer {self._token_provider.access_token()}"},
+                sleeper=self._sleeper,
+                random_uniform=self._random_uniform,
+                monotonic=self._monotonic,
+                now=self._now,
+            )
+            if not response.is_success:
+                raise GoogleSheetsReadError(
+                    "Google Sheets metadata read failed", status_code=response.status_code
+                )
+            payload: object = response.json()
+        except GoogleSheetsReadError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — response details may contain secrets
+            raise GoogleSheetsReadError("Google Sheets metadata read failed") from exc
+        if not isinstance(payload, dict):
+            raise GoogleSheetsReadError("Google Sheets metadata response shape is invalid")
+        return cast(Mapping[str, object], payload)
         values: object = (
             cast(Mapping[str, object], payload).get("values", [])
             if isinstance(payload, dict)
@@ -171,12 +393,42 @@ class GoogleSheetsSnapshotSource:
     def read(self) -> GoogleSheetsSnapshot:
         schemas = load_schema_headers(self._schema_dir)
         tables: TableRows = {}
-        for table_name, headers in schemas.items():
+        batch_reader = cast(
+            Callable[
+                [str, Mapping[str, str]],
+                Mapping[str, Sequence[Sequence[object]]],
+            ]
+            | None,
+            getattr(self._transport, "read_values_batch", None),
+        )
+        if callable(batch_reader):
             try:
-                values = self._transport.read_values(self.spreadsheet_id, table_name, "A1:AZ1001")
+                batch_values_raw = batch_reader(
+                    self.spreadsheet_id,
+                    {table_name: "A1:AZ1001" for table_name in schemas},
+                )
+            except GoogleSheetsReadError:
+                raise
             except Exception as exc:  # noqa: BLE001 — transport details are sensitive
                 raise GoogleSheetsReadError("Google Sheets read failed") from exc
-            tables[table_name] = _rows_from_values(table_name, headers, values)
+            if set(batch_values_raw) != set(schemas):
+                raise GoogleSheetsReadError("Google Sheets batch response is incomplete")
+            batch_values = batch_values_raw
+            for table_name, headers in schemas.items():
+                tables[table_name] = _rows_from_values(
+                    table_name, headers, batch_values[table_name]
+                )
+        else:
+            for table_name, headers in schemas.items():
+                try:
+                    values = self._transport.read_values(
+                        self.spreadsheet_id, table_name, "A1:AZ1001"
+                    )
+                except GoogleSheetsReadError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — transport details are sensitive
+                    raise GoogleSheetsReadError("Google Sheets read failed") from exc
+                tables[table_name] = _rows_from_values(table_name, headers, values)
         if _contains_secret_field(tables):
             raise GoogleSheetsReadError("V2 snapshot contains a prohibited secret field")
         errors = tuple(self._validator(self._schema_dir, tables))
