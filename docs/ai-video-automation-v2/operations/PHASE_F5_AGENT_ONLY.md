@@ -118,6 +118,13 @@ create a production/scene job execution attempt.
 
 - D2 is `HOLD` at `UNKNOWN_SUBMISSION_STATE` after one Generate click without
   attributable acceptance evidence. Do not retry and do not claim D2 PASS.
+  If complete forensics cannot reconstruct its provider/billing outcome, the
+  old attempt may only be terminally closed as `FORENSICALLY_CLOSED_UNKNOWN`
+  through the dry-run-first, SHA-guarded operator documented in
+  `architecture/PHASE_G_D2_CONTROLLED_EXECUTION.md`. That closure preserves
+  its 50-credit ledger reservation and keeps D6 blocked; it does not mean
+  no-charge or generation failure. A fresh distinct D2 attempt must pass fully
+  before D6 can proceed.
 - D3 VPS installation is verified for the exact D2-tested application SHA.
 - D4 is verified: the isolated `gflow-prod` profile is authenticated as the
   intended Google account; Master data resolves PROD account `PVA_0002` and

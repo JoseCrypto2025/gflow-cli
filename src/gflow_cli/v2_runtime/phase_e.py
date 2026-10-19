@@ -1445,9 +1445,18 @@ def preflight_scene(
     try:
         source_hash = sha256_json(source_context)
         prompt_hash = sha256_json({"prompt": compiled, "negative_prompt": compiled_negative})
+        model_compatibility_hash = sha256_json(
+            {
+                "model": source_context["model"],
+                "capabilities": source_context["capabilities"],
+                "parameter_maps": source_context["parameter_maps"],
+                "generation_mode": profile.generation_mode,
+            }
+        )
     except (TypeError, ValueError):
         source_hash = None
         prompt_hash = None
+        model_compatibility_hash = None
         errors.append(
             PreflightIssue("CONTEXT_HASH_FAILED", "canonical context serialization failed")
         )
@@ -1456,6 +1465,7 @@ def preflight_scene(
             "provider_id": provider.provider_id,
             "provider_account_id": account.provider_account_id,
             "model_id": model.model_id,
+            "model_compatibility_sha256": model_compatibility_hash,
             "generation_mode": profile.generation_mode,
             "prompt_template_id": template_id,
         }

@@ -48,6 +48,7 @@ def request_for(tmp_path: Path, *, status: str = "APPROVED") -> FlowPresubmitReq
             "provider_id": "PRV_0001",
             "provider_account_id": "PVA_0001",
             "model_id": "MDL_0001",
+            "model_compatibility_sha256": "c" * 64,
             "generation_mode": "TEXT_TO_VIDEO",
         },
         technical_configuration={
@@ -362,7 +363,7 @@ async def test_phase_g_uses_shared_production_credit_guard_before_confirmation(
         "SCN_000001",
         "GPR_0001",
         "SPV_000002",
-        "D6_prod-run-0001",
+        "D2_prod-run-0001",
         CreditBudgetContext(provider_remaining_free=Decimal("50")),
     )
     request = PhaseGExecutionRequest.from_presubmit(
@@ -402,7 +403,7 @@ async def test_phase_g_credit_balance_failure_does_not_approve_or_reserve(
         "SCN_000001",
         "GPR_0001",
         "SPV_000002",
-        "D6_prod-run-0002",
+        "D2_prod-run-0002",
         CreditBudgetContext(provider_remaining_free=Decimal("5")),
     )
     request = PhaseGExecutionRequest.from_presubmit(

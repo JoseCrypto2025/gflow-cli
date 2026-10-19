@@ -146,11 +146,14 @@ in-memory store is test-only. No live Google Sheets transaction writer or
 atomic compare-and-set implementation exists, and no Production Job or Scene
 Job rows were written. D7 live remains dependent on D2, D4, D5, and D6 PASS.
 
-D6 production execution is not generalized offline. The current Phase G executor
-and its credit ledger are explicitly D2-scoped, while D2's post-submit credit
-state remains unresolved. Reusing that TEST-only runner or opening a second
-credit ledger could violate cumulative accounting; keep D6 live on HOLD until
-D2 is reconciled and a reviewed production budget path exists.
+D6 production execution is not generalized offline. D6-shaped run IDs are now
+rejected by generic Phase G ledger creation; the dedicated release-gated path
+requires one exact, artifact-verified `D2_SUCCEEDED` prerequisite and stores
+that run ID with the D6 record. The shared executor also refuses D6 without a
+PROD execution context and shared production credit guard. This authorization
+check does not provide a generalized D6 runtime or budget path. Keep D6 live on HOLD until D2 is
+reconciled through a new successful D2 and a reviewed production budget/runtime
+path exists. Forensic closure of an unknown D2 does not satisfy the gate.
 
 ## Current autonomous-run checkpoint — 2026-10-18
 

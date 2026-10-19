@@ -56,6 +56,7 @@ def build_phase_g_request(
     runtime_state_root: Path,
     temp_root: Path,
     execution_context: ProductionExecutionContext | None = None,
+    prerequisite_d2_run_id: str | None = None,
 ) -> PhaseGExecutionRequest:
     """Re-run Phase E and require one exact approval for the chosen environment."""
     scene_id = execution_context.scene_id if execution_context else _SCENE_ID
@@ -176,10 +177,22 @@ def build_phase_g_request(
             raise PhaseGError(
                 "PHASE_G_EXECUTION_CONTEXT_MISMATCH", "attempt ID differs from context"
             )
+        if (
+            prerequisite_d2_run_id is not None
+            and prerequisite_d2_run_id != execution_context.prerequisite_d2_run_id
+        ):
+            raise PhaseGError(
+                "D6_PREREQUISITE_REQUIRED", "D6 prerequisite differs from execution context"
+            )
         return PhaseGExecutionRequest.from_presubmit(
-            request, d2_run_id, execution_context=execution_context
+            request,
+            d2_run_id,
+            execution_context=execution_context,
+            prerequisite_d2_run_id=execution_context.prerequisite_d2_run_id,
         )
-    return PhaseGExecutionRequest.from_presubmit(request, d2_run_id)
+    return PhaseGExecutionRequest.from_presubmit(
+        request, d2_run_id, prerequisite_d2_run_id=prerequisite_d2_run_id
+    )
 
 
 async def run_fresh_presubmit(request: PhaseGExecutionRequest, *, expected_email: str) -> None:

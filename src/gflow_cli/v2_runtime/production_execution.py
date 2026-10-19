@@ -69,6 +69,7 @@ class ProductionExecutionContext:
     scene_prompt_id: str
     attempt_id: str
     credit_budget_context: CreditBudgetContext
+    prerequisite_d2_run_id: str | None = None
 
     def validate(self, resolved: dict[str, str]) -> None:
         if self.environment not in {"DEV", "TEST", "PROD"}:

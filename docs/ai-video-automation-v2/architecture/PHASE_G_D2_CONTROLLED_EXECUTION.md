@@ -108,6 +108,76 @@ deployment, or edits to production Sheets. A post-submit timeout is
 `UNKNOWN_SUBMISSION_STATE`; reconcile the same attempt without clicking
 Generate again.
 
+### Forensic closure of irrecoverable unknown attempts
+
+`UNKNOWN_SUBMISSION_STATE` is an active unresolved safety hold. When a bounded
+forensic investigation is complete but cannot reconstruct the historical
+provider outcome, an operator may propose `FORENSICALLY_CLOSED_UNKNOWN` using
+`scripts/operations/close_unknown_d2_forensic.py`. The command is dry-run by
+default. Applying requires `--apply`, the exact D2 run ID, the expected current
+state, the expected ledger SHA-256, the expected canonical evidence SHA-256,
+the implementation commit, and a complete sanitized evidence JSON. Store the
+immutable evidence package outside Git at
+`<runtime-state-root>/phase-g/forensic-evidence/<D2-run-id>.json`.
+The ledger lock and SHA check protect the transition from concurrent updates.
+Provider IDs, a changed ledger, a non-unknown or terminal state, a Generate
+count other than one, or incomplete evidence fail closed.
+
+Forensic closure permanently disables retry of that same run ID. It preserves
+the historical accounted-credit reservation and records provider billing as
+`UNKNOWN`; it does not establish `RECONCILED_NO_CHARGE` or prove
+`GENERATION_FAILED`. A distinct future D2 run ID may be created, but it must
+complete the normal controlled-D2 path as `D2_SUCCEEDED` before D6 is eligible.
+The closed attempt stores `forensic_closed_at`, `forensic_reason`,
+`forensic_evidence_sha256`, `forensic_implementation_commit`,
+`provider_outcome=UNKNOWN`, and `credit_outcome=UNKNOWN`, alongside the
+sanitized evidence summary. Existing ledger records remain readable.
+`UNKNOWN_SUBMISSION_STATE`, `FORENSICALLY_CLOSED_UNKNOWN`,
+`RECONCILED_NO_CHARGE`, and `D2_SUCCEEDED` therefore have different meanings.
+
+### D6 release prerequisite
+
+Every D6 request must name one exact `prerequisite_d2_run_id`. The centralized
+read-only `evaluate_d6_release()` checks that ID against the authoritative D2
+ledger and accepts only a record whose submission and terminal states are both
+`D2_SUCCEEDED`, whose remote artifact verification is present, and whose local
+and remote-redownload SHA-256 values match. The D2 row must also carry the
+current `d6_release_contract_version`; older success rows without this
+compatibility marker fail closed and cannot authorize D6. A terminal state alone, including
+`FORENSICALLY_CLOSED_UNKNOWN`, never qualifies. Generic `create_attempt()`
+rejects all D6 IDs; the dedicated `create_d6_attempt()` rechecks the proof while
+holding the D2 and D6 ledger locks in deterministic order, then persists the
+exact prerequisite ID and proof summary on the D6 row.
+
+The compatibility fingerprint binds Scene/workload ID, provider, generation
+mode, exact model ID, a Phase E digest of the model row plus active model
+capabilities and parameter maps, requested duration, aspect ratio, and output
+count under release-contract version 1. Exact model matching is conservative
+because this repository has no explicit model-family compatibility catalog.
+The compatibility digest pins model version/capability configuration even
+when the model ID remains stable. TEST/PROD environment, account, project, auth
+profile, generation profile, and prompt version are deliberately excluded
+because those identities are expected to differ between validation and
+production lanes; the bound workload semantics remain identical. The digest
+is derived from the fresh Phase E snapshot and persisted D2 row, never caller
+success claims. Older D2 rows without the contract marker or compatibility
+digest fail closed.
+
+This adds an authorization gate to the shared programmatic Phase G path; no
+dedicated D6 CLI or operational runner exists. For PROD, that path stores D6
+attempts in `<runtime-state-root>/production/phase-g/d2-credit-ledger.json` and
+requires a PROD execution context plus the shared production credit guard. The
+generic result and artifact pipeline remains D2-shaped and has not been live
+validated for D6. After historical forensic closure, D6 remains blocked until a
+distinct D2 run completes the full verified artifact path and reaches
+`D2_SUCCEEDED`; D6 must then cite that exact run ID.
+
+Persistent Chrome forensic inspection may update browser-managed profile
+metadata even when no authentication or application settings are intentionally
+changed. Do not restore or roll back those browser-managed files. The safety
+invariants are no auth login, profile creation/copy, cookie copying, Flow
+settings change, or prompt change.
+
 The one-shot live regression is
 [`tests/e2e/test_phase_g_d2_live.py`](../../../tests/e2e/test_phase_g_d2_live.py).
 It is opt-in via `GFLOW_CLI_E2E_RUN_PHASE_G=I_CONFIRM_ONE_D2_GENERATION`, requires

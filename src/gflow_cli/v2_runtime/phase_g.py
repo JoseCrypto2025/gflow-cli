@@ -6,11 +6,13 @@ contains no browser or provider calls; the concrete executor owns those edges.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -33,6 +35,7 @@ from .timestamps import format_utc_timestamp
 _RUN_ID_RE = re.compile(r"^(?:D2|D6)_[A-Za-z0-9_-]{8,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_D6_RELEASE_CONTRACT_VERSION = 1
 _LEDGER_SCHEMA = 1
 _BANGKOK = timezone(timedelta(hours=7), name="Asia/Bangkok")
 _SUBMISSION_STATES = frozenset(
@@ -52,6 +55,7 @@ _SUBMISSION_STATES = frozenset(
         "PERSISTENCE_FAILED",
         "UNKNOWN_SUBMISSION_STATE",
         "RECONCILED_NO_CHARGE",
+        "FORENSICALLY_CLOSED_UNKNOWN",
     }
 )
 _TERMINAL_STATES = frozenset(
@@ -64,6 +68,7 @@ _TERMINAL_STATES = frozenset(
         "MEDIA_VALIDATION_FAILED",
         "PERSISTENCE_FAILED",
         "RECONCILED_NO_CHARGE",
+        "FORENSICALLY_CLOSED_UNKNOWN",
     }
 )
 
@@ -76,6 +81,31 @@ class PhaseGError(V2RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class D6PrerequisiteProof:
+    """Read-only proof that one exact successful D2 matches a D6 request."""
+
+    prerequisite_d2_run_id: str
+    prerequisite_state: str
+    d2_fingerprint_sha256: str
+    d6_fingerprint_sha256: str
+    prerequisite_ledger_sha256: str
+    contract_version: int
+    verified_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class D6ReleaseResult:
+    """Structured fail-closed result for one explicit D6 prerequisite check."""
+
+    eligible: bool
+    prerequisite_d2_run_id: str | None
+    prerequisite_state: str | None
+    binding_match: bool
+    failure_code: str | None
+    proof: D6PrerequisiteProof | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +130,8 @@ class PhaseGExecutionRequest:
     d2_run_id: str
     presubmit_request: FlowPresubmitRequest
     execution_context: ProductionExecutionContext | None = None
+    prerequisite_d2_run_id: str | None = None
+    model_compatibility_sha256: str | None = None
 
     @classmethod
     def from_presubmit(
@@ -107,6 +139,8 @@ class PhaseGExecutionRequest:
         request: FlowPresubmitRequest,
         d2_run_id: str,
         execution_context: ProductionExecutionContext | None = None,
+        *,
+        prerequisite_d2_run_id: str | None = None,
     ) -> PhaseGExecutionRequest:
         """Construct a pinned Phase G request from a Phase F input."""
         result = request.preflight
@@ -140,6 +174,8 @@ class PhaseGExecutionRequest:
             d2_run_id,
             request,
             execution_context,
+            prerequisite_d2_run_id,
+            cast(str | None, result.resolved.get("model_compatibility_sha256")),
         )
         validate_phase_g_request(value)
         return value
@@ -240,6 +276,31 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 "PHASE_G_EXECUTION_CONTEXT_REQUIRED",
                 "production execution context and shared credit guard must be supplied together",
             )
+        d6_proof: D6PrerequisiteProof | None = None
+        if request.d2_run_id.startswith("D6_"):
+            assert request.prerequisite_d2_run_id is not None
+            d2_ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
+            release = evaluate_d6_release(
+                prerequisite_d2_run_id=request.prerequisite_d2_run_id,
+                d6_request=request,
+                ledger=d2_ledger,
+            )
+            if not release.eligible or release.proof is None:
+                failure = release.failure_code or "D6_PREREQUISITE_NOT_SUCCEEDED"
+                raise PhaseGError(
+                    failure,
+                    "identified D2 prerequisite does not authorize this D6 request",
+                )
+            d6_proof = release.proof
+            if (
+                request.execution_context is None
+                or self.production_credit_guard is None
+                or request.execution_context.environment != "PROD"
+            ):
+                raise PhaseGError(
+                    "D6_PRODUCTION_CONTEXT_REQUIRED",
+                    "D6 requires a PROD execution context and shared production credit guard",
+                )
         try:
             self.recovery_journal.require_clean_or_missing()
         except RecoveryJournalError as exc:
@@ -278,7 +339,10 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             if request.execution_context is not None and self.production_credit_guard is not None:
                 self.production_credit_guard.prepare(request.execution_context)
             try:
-                self.ledger.create_attempt(request)
+                if d6_proof is not None:
+                    self.ledger.create_d6_attempt(request, proof=d6_proof)
+                else:
+                    self.ledger.create_attempt(request)
             except BaseException:
                 if (
                     request.execution_context is not None
@@ -590,6 +654,25 @@ def validate_phase_g_request(request: PhaseGExecutionRequest) -> None:
     prompt = presubmit.prompt_version
     if not _RUN_ID_RE.fullmatch(request.d2_run_id):
         raise PhaseGError("PHASE_G_RUN_ID_INVALID", "Phase G attempt ID is invalid")
+    if request.d2_run_id.startswith("D6_"):
+        prerequisite_id = request.prerequisite_d2_run_id
+        if not prerequisite_id:
+            raise PhaseGError(
+                "D6_PREREQUISITE_REQUIRED", "D6 requires an explicit prerequisite D2 run ID"
+            )
+        if not re.fullmatch(r"D2_[A-Za-z0-9_-]{8,64}", prerequisite_id):
+            raise PhaseGError("D6_PREREQUISITE_NOT_FOUND", "D6 prerequisite must identify a D2 run")
+        if not isinstance(request.model_compatibility_sha256, str) or not _SHA256_RE.fullmatch(
+            request.model_compatibility_sha256
+        ):
+            raise PhaseGError(
+                "D6_MODEL_COMPATIBILITY_REQUIRED",
+                "D6 requires a Phase E model/capability compatibility fingerprint",
+            )
+    elif request.prerequisite_d2_run_id is not None:
+        raise PhaseGError(
+            "PHASE_G_PREREQUISITE_INVALID", "D2 attempts cannot carry a D6 prerequisite"
+        )
     context = request.execution_context
     if context is not None and (
         context.attempt_id != request.d2_run_id
@@ -599,6 +682,7 @@ def validate_phase_g_request(request: PhaseGExecutionRequest) -> None:
         or context.provider_id != request.provider_id
         or context.provider_account_id != request.provider_account_id
         or context.provider_project_id != request.provider_project_id
+        or context.prerequisite_d2_run_id != request.prerequisite_d2_run_id
     ):
         raise PhaseGError(
             "PHASE_G_EXECUTION_CONTEXT_MISMATCH",
@@ -682,6 +766,148 @@ def validate_phase_g_request(request: PhaseGExecutionRequest) -> None:
         raise PhaseGError("PHASE_G_PROJECT_MISMATCH", "provider project ID is invalid")
 
 
+def _d6_semantic_fingerprint(values: Mapping[str, object]) -> str:
+    """Hash only the workload/provider contract shared across TEST and PROD lanes."""
+    raw = {
+        "contract_version": _D6_RELEASE_CONTRACT_VERSION,
+        "scene_id": values.get("scene_id"),
+        "provider_id": values.get("provider_id"),
+        "generation_mode": values.get("generation_mode"),
+        "model_id": values.get("model_id"),
+        "model_compatibility_sha256": values.get("model_compatibility_sha256"),
+        "duration_sec": str(values.get("requested_duration_sec")),
+        "aspect_ratio": values.get("requested_aspect_ratio"),
+        "output_count": values.get("requested_output_count"),
+    }
+    encoded = json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _d6_request_semantics(request: PhaseGExecutionRequest) -> dict[str, object]:
+    return {
+        "scene_id": request.scene_id,
+        "provider_id": request.provider_id,
+        "generation_mode": request.generation_mode,
+        "model_id": request.model_id,
+        "model_compatibility_sha256": request.model_compatibility_sha256,
+        "requested_duration_sec": request.duration_sec,
+        "requested_aspect_ratio": request.aspect_ratio,
+        "requested_output_count": request.output_count,
+    }
+
+
+def _evaluate_d6_release_rows(
+    prerequisite_d2_run_id: str | None,
+    d6_request: PhaseGExecutionRequest,
+    attempts: Sequence[Mapping[str, object]],
+    *,
+    ledger_sha256: str,
+) -> D6ReleaseResult:
+    if not prerequisite_d2_run_id or not d6_request.prerequisite_d2_run_id:
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_REQUIRED"
+        )
+    if prerequisite_d2_run_id != d6_request.prerequisite_d2_run_id:
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_REQUIRED"
+        )
+    if not re.fullmatch(r"D2_[A-Za-z0-9_-]{8,64}", prerequisite_d2_run_id):
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_NOT_FOUND"
+        )
+    prerequisite = next(
+        (row for row in attempts if row.get("d2_run_id") == prerequisite_d2_run_id), None
+    )
+    if prerequisite is None:
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_NOT_FOUND"
+        )
+    state = str(prerequisite.get("submission_state", ""))
+    if state != "D2_SUCCEEDED" or prerequisite.get("terminal_state") != "D2_SUCCEEDED":
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, state, False, "D6_PREREQUISITE_NOT_SUCCEEDED"
+        )
+    local_sha = prerequisite.get("local_sha256")
+    remote_sha = prerequisite.get("remote_redownload_sha256")
+    model_compatibility_sha256 = prerequisite.get("model_compatibility_sha256")
+    artifact_verified = (
+        prerequisite.get("d6_release_contract_version") == _D6_RELEASE_CONTRACT_VERSION
+        and prerequisite.get("remote_verified") is True
+        and isinstance(model_compatibility_sha256, str)
+        and _SHA256_RE.fullmatch(model_compatibility_sha256) is not None
+        and isinstance(prerequisite.get("provider_media_id"), str)
+        and bool(prerequisite.get("provider_media_id"))
+        and isinstance(prerequisite.get("remote_file_id"), str)
+        and bool(prerequisite.get("remote_file_id"))
+        and isinstance(local_sha, str)
+        and _SHA256_RE.fullmatch(local_sha) is not None
+        and local_sha == remote_sha
+    )
+    if not artifact_verified:
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, state, False, "D6_PREREQUISITE_NOT_SUCCEEDED"
+        )
+    d2_fingerprint = _d6_semantic_fingerprint(prerequisite)
+    d6_fingerprint = _d6_semantic_fingerprint(_d6_request_semantics(d6_request))
+    if d2_fingerprint != d6_fingerprint:
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, state, False, "D6_PREREQUISITE_BINDING_MISMATCH"
+        )
+    proof = D6PrerequisiteProof(
+        prerequisite_d2_run_id=prerequisite_d2_run_id,
+        prerequisite_state=state,
+        d2_fingerprint_sha256=d2_fingerprint,
+        d6_fingerprint_sha256=d6_fingerprint,
+        prerequisite_ledger_sha256=ledger_sha256,
+        contract_version=_D6_RELEASE_CONTRACT_VERSION,
+        verified_at=_utc_now(),
+    )
+    return D6ReleaseResult(True, prerequisite_d2_run_id, state, True, None, proof)
+
+
+def evaluate_d6_release(
+    *,
+    prerequisite_d2_run_id: str | None,
+    d6_request: PhaseGExecutionRequest,
+    ledger: D2DailyCreditLedger,
+) -> D6ReleaseResult:
+    """Read-only check of an exact, artifact-verified D2 prerequisite for D6."""
+    if not d6_request.d2_run_id.startswith("D6_"):
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_REQUIRED"
+        )
+    if (
+        not prerequisite_d2_run_id
+        or not d6_request.prerequisite_d2_run_id
+        or prerequisite_d2_run_id != d6_request.prerequisite_d2_run_id
+    ):
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_REQUIRED"
+        )
+    if not re.fullmatch(r"D2_[A-Za-z0-9_-]{8,64}", prerequisite_d2_run_id):
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_NOT_FOUND"
+        )
+    authoritative_path = (
+        d6_request.presubmit_request.runtime_state_root / "phase-g" / "d2-credit-ledger.json"
+    )
+    if ledger.path.resolve() != authoritative_path.resolve():
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_NOT_FOUND"
+        )
+    snapshot = ledger.d6_prerequisite_snapshot()
+    if snapshot is None:
+        return D6ReleaseResult(
+            False, prerequisite_d2_run_id, None, False, "D6_PREREQUISITE_NOT_FOUND"
+        )
+    attempts, digest = snapshot
+    return _evaluate_d6_release_rows(
+        prerequisite_d2_run_id, d6_request, attempts, ledger_sha256=digest
+    )
+
+
 class D2DailyCreditLedger:
     """Atomic task-local ledger enforcing a 50-credit Bangkok-day ceiling."""
 
@@ -702,7 +928,91 @@ class D2DailyCreditLedger:
     def create_attempt(self, request: PhaseGExecutionRequest) -> dict[str, object]:
         """Persist a zero-action attempt before any UI mutation."""
         validate_phase_g_request(request)
+        if request.d2_run_id.startswith("D6_"):
+            code = (
+                "D6_PREREQUISITE_REQUIRED"
+                if not request.prerequisite_d2_run_id
+                else "D6_RELEASE_PATH_REQUIRED"
+            )
+            raise PhaseGError(
+                code, "D6 attempts must use create_d6_attempt with a verified D2 release proof"
+            )
         return self._mutate(lambda payload: self._create(payload, request))
+
+    def create_d6_attempt(
+        self, request: PhaseGExecutionRequest, *, proof: D6PrerequisiteProof | None
+    ) -> dict[str, object]:
+        """Atomically verify and persist a D6 attempt linked to one successful D2."""
+        validate_phase_g_request(request)
+        if not request.d2_run_id.startswith("D6_"):
+            raise PhaseGError(
+                "PHASE_G_RUN_ID_INVALID", "dedicated D6 creation requires a D6 run ID"
+            )
+        prerequisite_id = request.prerequisite_d2_run_id
+        if not prerequisite_id:
+            raise PhaseGError(
+                "D6_PREREQUISITE_REQUIRED", "D6 requires an explicit prerequisite D2 run ID"
+            )
+        if proof is None:
+            raise PhaseGError(
+                "D6_PREREQUISITE_REQUIRED", "D6 requires a fresh read-only prerequisite proof"
+            )
+        d2_ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
+        if d2_ledger.path.is_symlink() or not d2_ledger.path.is_file():
+            raise PhaseGError("D6_PREREQUISITE_NOT_FOUND", "authoritative D2 ledger is unavailable")
+        ledgers = {str(ledger.path.resolve()): ledger for ledger in (self, d2_ledger)}
+        with ExitStack() as stack:
+            for key in sorted(ledgers):
+                stack.enter_context(ledgers[key]._locked_file())
+            payload = self._read()
+            d2_payload = (
+                payload if self.path.resolve() == d2_ledger.path.resolve() else d2_ledger._read()
+            )
+            try:
+                d2_sha = sha256_file(d2_ledger.path)
+            except OSError as exc:
+                raise PhaseGError(
+                    "D6_PREREQUISITE_NOT_FOUND", "authoritative D2 ledger could not be verified"
+                ) from exc
+            rows = cast(list[dict[str, object]], d2_payload["attempts"])
+            release = _evaluate_d6_release_rows(
+                prerequisite_id, request, rows, ledger_sha256=d2_sha
+            )
+            if not release.eligible or release.proof is None:
+                failure = release.failure_code or "D6_PREREQUISITE_NOT_SUCCEEDED"
+                raise PhaseGError(
+                    failure, "identified D2 prerequisite does not authorize this D6 request"
+                )
+            if (
+                release.proof.prerequisite_d2_run_id != proof.prerequisite_d2_run_id
+                or release.proof.prerequisite_state != proof.prerequisite_state
+                or release.proof.d2_fingerprint_sha256 != proof.d2_fingerprint_sha256
+                or release.proof.d6_fingerprint_sha256 != proof.d6_fingerprint_sha256
+                or release.proof.prerequisite_ledger_sha256 != proof.prerequisite_ledger_sha256
+                or release.proof.contract_version != proof.contract_version
+            ):
+                raise PhaseGError(
+                    "D6_PREREQUISITE_CHANGED",
+                    "D2 prerequisite changed after eligibility evaluation",
+                )
+            attempts = cast(list[dict[str, object]], payload["attempts"])
+            if any(row.get("d2_run_id") == request.d2_run_id for row in attempts):
+                raise PhaseGError(
+                    "PHASE_G_DUPLICATE_RUN_ID", "D6 run ID already exists in the ledger"
+                )
+            attempt = self._new_attempt(request)
+            attempt["prerequisite_d2_run_id"] = release.proof.prerequisite_d2_run_id
+            attempt["d6_prerequisite_proof"] = {
+                "prerequisite_state": release.proof.prerequisite_state,
+                "d2_fingerprint_sha256": release.proof.d2_fingerprint_sha256,
+                "d6_fingerprint_sha256": release.proof.d6_fingerprint_sha256,
+                "prerequisite_ledger_sha256": release.proof.prerequisite_ledger_sha256,
+                "contract_version": release.proof.contract_version,
+                "verified_at": release.proof.verified_at,
+            }
+            attempts.append(attempt)
+            self._write(payload)
+            return dict(attempt)
 
     def mark_generate_action(self, d2_run_id: str) -> dict[str, object]:
         """Durably consume the attempt's sole Generate action before clicking."""
@@ -899,6 +1209,11 @@ class D2DailyCreditLedger:
         def update(payload: dict[str, object]) -> dict[str, object]:
             attempt = self._attempt(payload, d2_run_id)
             current_state = str(attempt["submission_state"])
+            if submission_state == "FORENSICALLY_CLOSED_UNKNOWN":
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_OPERATOR_REQUIRED",
+                    "forensic closure requires the SHA-guarded evidence operator",
+                )
             if current_state in _TERMINAL_STATES:
                 raise PhaseGError(
                     "PHASE_G_ATTEMPT_TERMINAL", "terminal D2 attempt cannot be changed"
@@ -958,6 +1273,7 @@ class D2DailyCreditLedger:
                     "MEDIA_VALIDATION_FAILED",
                     "PERSISTENCE_FAILED",
                     "RECONCILED_NO_CHARGE",
+                    "FORENSICALLY_CLOSED_UNKNOWN",
                 },
                 "GENERATION_SUCCEEDED": {
                     "GENERATION_SUCCEEDED",
@@ -1010,12 +1326,127 @@ class D2DailyCreditLedger:
 
         return self._mutate(update)
 
+    def close_unknown_forensic(
+        self,
+        d2_run_id: str,
+        *,
+        expected_ledger_sha256: str,
+        evidence_sha256: str,
+        implementation_commit: str,
+        evidence: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Permanently close an irrecoverable unknown attempt without claiming billing outcome."""
+        if not _SHA256_RE.fullmatch(expected_ledger_sha256):
+            raise PhaseGError("PHASE_G_LEDGER_SHA_INVALID", "expected ledger SHA-256 is invalid")
+        if not _SHA256_RE.fullmatch(evidence_sha256):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_HASH_INVALID", "evidence SHA-256 is invalid"
+            )
+        if not re.fullmatch(r"[0-9a-f]{40,64}", implementation_commit):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_COMMIT_INVALID", "implementation commit SHA is invalid"
+            )
+
+        from .phase_g_forensic_closure import (
+            forensic_evidence_digest,
+            validate_forensic_evidence,
+        )
+
+        summary = validate_forensic_evidence(evidence)
+        if summary["D2_RUN_ID"] != d2_run_id:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INVALID", "evidence belongs to a different D2 run"
+            )
+        if summary["CANONICAL_LEDGER_SHA256"] != expected_ledger_sha256:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INVALID",
+                "evidence names a different canonical ledger SHA",
+            )
+        if forensic_evidence_digest(summary) != evidence_sha256:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_HASH_MISMATCH",
+                "forensic evidence SHA differs from canonical evidence content",
+            )
+        with self._locked_file():
+            if self.path.is_symlink() or not self.path.is_file():
+                raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "D2 ledger is missing or unsafe")
+            try:
+                current_sha256 = sha256_file(self.path)
+            except OSError as exc:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_READ_FAILED", "D2 ledger could not be hashed"
+                ) from exc
+            if current_sha256 != expected_ledger_sha256:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CHANGED", "D2 ledger changed since operator review"
+                )
+            payload = self._read()
+            attempt = self._attempt(payload, d2_run_id)
+            if attempt.get("submission_state") != "UNKNOWN_SUBMISSION_STATE":
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_STATE_MISMATCH",
+                    "forensic closure requires UNKNOWN_SUBMISSION_STATE",
+                )
+            if attempt.get("terminal_state") is not None:
+                raise PhaseGError("PHASE_G_ATTEMPT_TERMINAL", "D2 attempt is already terminal")
+            if attempt.get("provider_media_id") or attempt.get("provider_execution_id"):
+                raise PhaseGError(
+                    "PHASE_G_PROVIDER_OUTCOME_PRESENT",
+                    "provider identities require provider-outcome reconciliation",
+                )
+            if attempt.get("provider_media_ids"):
+                raise PhaseGError(
+                    "PHASE_G_PROVIDER_OUTCOME_PRESENT",
+                    "provider media identities require provider-outcome reconciliation",
+                )
+            if _counter(attempt.get("generate_action_count")) != 1:
+                raise PhaseGError(
+                    "PHASE_G_GENERATE_COUNT_MISMATCH",
+                    "forensic closure requires exactly one Generate action",
+                )
+            if attempt.get("accounted_credit_cost") is None:
+                raise PhaseGError(
+                    "PHASE_G_ACCOUNTING_MISSING", "historical credit reservation is missing"
+                )
+            attempt.update(
+                submission_state="FORENSICALLY_CLOSED_UNKNOWN",
+                terminal_state="FORENSICALLY_CLOSED_UNKNOWN",
+                provider_billing_outcome="UNKNOWN",
+                provider_outcome="UNKNOWN",
+                credit_outcome="UNKNOWN",
+                forensic_closed_at=summary["FORENSIC_COMPLETED_AT"],
+                forensic_reason=summary["FORENSIC_REASON"],
+                forensic_evidence_sha256=evidence_sha256,
+                forensic_implementation_commit=implementation_commit,
+                forensic_closure_evidence=summary,
+                updated_at=_utc_now(),
+            )
+            self._write(payload)
+            return dict(attempt)
+
     def attempts(self) -> tuple[Mapping[str, object], ...]:
         """Return a defensive snapshot of the sanitized attempt records."""
         with self._locked_file():
             payload = self._read()
             rows = cast(list[dict[str, object]], payload["attempts"])
             return tuple({key: value for key, value in row.items()} for row in rows)
+
+    def d6_prerequisite_snapshot(
+        self,
+    ) -> tuple[tuple[Mapping[str, object], ...], str] | None:
+        """Read authoritative D2 rows and their digest under one shared lock."""
+        with self._locked_file():
+            if self.path.is_symlink() or not self.path.is_file():
+                return None
+            try:
+                digest = sha256_file(self.path)
+            except OSError as exc:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_READ_FAILED", "D2 ledger could not be hashed"
+                ) from exc
+            payload = self._read()
+            rows = cast(list[dict[str, object]], payload["attempts"])
+            return tuple({key: value for key, value in row.items()} for row in rows), digest
 
     def record_artifact_recovered(self, d2_run_id: str) -> Mapping[str, object]:
         """Resume the same run after its exact stored media ID is revalidated."""
@@ -1189,6 +1620,10 @@ class D2DailyCreditLedger:
                 raise PhaseGError(
                     "PHASE_G_ATTEMPT_UNRESOLVED", "prior D2 attempt requires reconciliation"
                 )
+            if state == "FORENSICALLY_CLOSED_UNKNOWN":
+                # The old run remains permanently non-retryable, but its
+                # explicit terminal closure permits a distinct future run ID.
+                continue
             if state == "PERSISTENCE_FAILED":
                 raise PhaseGError(
                     "PHASE_G_ARTIFACT_RECOVERY_REQUIRED",
@@ -1211,9 +1646,19 @@ class D2DailyCreditLedger:
                 )
             if state not in _TERMINAL_STATES:
                 raise PhaseGError("PHASE_G_ATTEMPT_UNRESOLVED", "prior D2 attempt is not terminal")
+        attempt = self._new_attempt(request)
+        attempts.append(attempt)
+        return dict(attempt)
+
+    @staticmethod
+    def _new_attempt(request: PhaseGExecutionRequest) -> dict[str, object]:
         now = _utc_now()
         attempt: dict[str, object] = {
             "d2_run_id": request.d2_run_id,
+            "prerequisite_d2_run_id": None,
+            "d6_prerequisite_proof": None,
+            "d6_release_contract_version": _D6_RELEASE_CONTRACT_VERSION,
+            "model_compatibility_sha256": request.model_compatibility_sha256,
             "scene_id": request.scene_id,
             "scene_prompt_id": request.scene_prompt_id,
             "generation_profile_id": request.generation_profile_id,
@@ -1254,8 +1699,7 @@ class D2DailyCreditLedger:
             "terminal_state": None,
             "updated_at": now,
         }
-        attempts.append(attempt)
-        return dict(attempt)
+        return attempt
 
     def _accounted(self, payload: Mapping[str, object], date: str) -> Decimal:
         total = Decimal(0)
