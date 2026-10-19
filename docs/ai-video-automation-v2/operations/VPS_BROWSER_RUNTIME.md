@@ -109,7 +109,7 @@ active PROD account `PVA_0002` for project
 `aafe9282-071f-4333-baa4-92b9f76a9c27`. TEST profile and personal browser data
 were not copied or reused.
 
-## D5 presubmit wrapper — live-source implementation, awaiting credential
+## D5 presubmit wrapper — live-source implementation and current gate
 
 `scripts/operations/vps_flow_presubmit.py` now reads the approved Sheet through
 the V2 Google Workspace credential and a read-only Sheets API transport. The
@@ -120,19 +120,22 @@ under runtime state with mode 0600, then removes it after presubmit. The
 production entry point does not accept caller-provided JSON; `load_snapshot()`
 is retained only for offline tests.
 
-No V2 Google Workspace credential is currently installed. The source is
-implemented and tested with fake transports, but live reads remain
-`WAITING_FOR_HUMAN_AUTH_SETUP`; D5 must hold before opening Flow until the
-dedicated OAuth credential is installed as documented in
-`GOOGLE_WORKSPACE_AUTH_BOOTSTRAP.md`.
+The canonical V2 Google Workspace credential is installed at
+`/etc/gflow-v2/google-authorized-user.json`, owned by `gflow:gflow` with mode
+`0600`, and its authenticated API access is verified. An earlier 2026-10-18
+F5 attempt stopped before Flow because `SPV_000006` version 6 differed from
+fresh Phase E. Prompt lifecycle work produced and approved `SPV_000007` after
+exact Phase E validation. On 2026-10-19, the production wrapper resolved that
+unique approval and completed a live non-generating F5 presubmit.
 
 The wrapper requires `RUNTIME_ENV=production`, explicit runtime roots,
 `GFLOW_EXPECTED_GOOGLE_EMAIL`, and `GFLOW_GOOGLE_WORKSPACE_CREDENTIALS`; it
-calls F5 `prepare_live_flow()` only after current live Sheet validation. It
-never performs login or calls Phase G. The report always records
-`generate_clicked=false` and `credits_used=0`. D5 is held only on the missing
-V2 Google Workspace API credential; D4 and PROD project/account identity are
-verified.
+calls F5 `prepare_live_flow()` only after current live Sheet validation and
+exact prompt matching. It never performs login or calls Phase G. The 2026-10-19
+F5 report verified the PROD account/project, Agent-only surface, prepared model,
+9:16 aspect, one output, exact provider UI prompt digest, enabled Generate
+control without clicking it, and a `CLEAN` recovery journal. It recorded
+`generate_clicked=false` and `credits_used=0`.
 
 ## D7 transaction coordinator — offline implementation
 
@@ -155,10 +158,10 @@ The statements above describe the earlier 2026-10-18 D7 audit and are
 superseded for current source-code capability by the `automation-v2` checkpoint
 validated at `94c15a5b9fe07fac64cea7bc71d246b47d1d36c0`:
 
-- OAuth bootstrap stages a candidate credential, verifies the approved Sheet
-  and Drive folder as `gflow`, then atomically promotes it with digest-guarded
-  recovery. The canonical VPS credential is still absent; human OAuth consent
-  is required.
+- D5 OAuth is DONE. The canonical credential exists and is verified; the
+  Master Sheet, all 34 schemas, and `Job_Artifacts` checks passed. A fresh
+  2026-10-18 PROD snapshot found one approved prompt, but its source-context
+  hash is stale against Phase E; the supported presubmit stopped before Flow.
 - Phase G now has explicit environment/provider/account/project identity and a
   single shared provider/day credit guard. This is offline engineering only;
   it does not make D5 pass or resolve the historical D2 attempt.
@@ -169,7 +172,8 @@ validated at `94c15a5b9fe07fac64cea7bc71d246b47d1d36c0`:
   `ProductionJobCoordinator`; current approved tabs do not persist transition
   history or provider media ID. Drive uses multipart rather than resumable
   upload, and its caller must supply a freshly verified output-folder identity.
-- No live Sheets/Drive write, D5 presubmit, Flow Generate, or media generation
-  was run. At the time of this checkpoint, `/opt/gflow-v2` still held
+- No live Sheets/Drive write, Flow Generate, or media generation was run. The
+  non-generating D5 presubmit was run and held at `APPROVED_PROMPT_STALE` before
+  opening Flow. At the time of this checkpoint, `/opt/gflow-v2` still held
   `9bb6e88b4805d63a59d0ff218e24b38f3117db0a`; the validated source update had
   been pushed but not yet deployed.

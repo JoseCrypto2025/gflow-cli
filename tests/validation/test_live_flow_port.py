@@ -7,6 +7,7 @@ from gflow_cli.v2_runtime.live_flow import (
     GoogleFlowAgentOnlyPort,
     _contenteditable_prompt_text,
     classify_agent_surface_evidence,
+    resolve_model_id_from_display,
 )
 
 
@@ -35,6 +36,33 @@ def test_contenteditable_prompt_readback_preserves_paragraphs_and_blank_lines() 
     assert _contenteditable_prompt_text(["first line", "", "third line"]) == (
         "first line\n\nthird line"
     )
+
+
+def test_model_display_mapping_allows_hyphen_spacing_and_rejects_ambiguity() -> None:
+    assert resolve_model_id_from_display("Veo 3.1 - Lite", {"MDL_0001": "Veo 3.1 Lite"}) == (
+        "MDL_0001"
+    )
+    assert (
+        resolve_model_id_from_display(
+            "Veo 3.1 - Lite",
+            {"MDL_0001": "Veo 3.1 Lite", "MDL_0002": "Veo 3.1-Lite"},
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("observed", "configured", "expected"),
+    [
+        ("Veo 3.1 Lite", "Veo 3.1 - Lite", "MDL_0001"),
+        ("Veo 3.1 - Fast", "Veo 3.1 Lite", None),
+        ("Veo 3.2 - Lite", "Veo 3.1 Lite", None),
+    ],
+)
+def test_model_display_mapping_preserves_version_and_tier(
+    observed: str, configured: str, expected: str | None
+) -> None:
+    assert resolve_model_id_from_display(observed, {"MDL_0001": configured}) == expected
 
 
 def test_live_port_rejects_personal_or_unmapped_auth_profile_names() -> None:

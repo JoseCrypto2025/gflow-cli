@@ -133,6 +133,7 @@ class FakeAgentPort(FakePort):
 
     async def apply_settings(self, settings: dict[str, object]) -> dict[str, object]:
         self.preparation_settings = dict(settings)
+        self.generate_enabled = True
         return await super().apply_settings(settings)
 
     async def snapshot_settings(self) -> dict[str, object]:
@@ -275,6 +276,65 @@ async def test_agent_only_settings_are_journaled_restored_and_marked_clean(
     assert journal.read() is not None
     assert journal.read().state == "CLEAN"
     assert "FLOW_SUBMISSION_ENABLED" not in dir(port)
+
+
+@pytest.mark.asyncio
+async def test_agent_transaction_reconciles_baseline_prepared_and_restored_states(
+    tmp_path: Path,
+) -> None:
+    port = FakeAgentPort()
+    port.original_settings["aspect_ratio"] = "16:9"
+    port.applied = dict(port.original_settings)
+    port.generate_present = True
+    port.generate_enabled = False
+    request = agent_request_for(tmp_path)
+    request = replace(
+        request,
+        preflight=replace(
+            request.preflight,
+            technical_configuration={
+                **request.preflight.technical_configuration,
+                "aspect_ratio": "9:16",
+                "canonical_parameters": {
+                    **request.preflight.technical_configuration["canonical_parameters"],
+                    "ASPECT_RATIO": "9:16",
+                },
+            },
+        ),
+    )
+    expected_provider_prompt = flow.build_agent_only_directive(
+        request.prompt_version.compiled_prompt_text,
+        request.preflight.technical_configuration,
+    )
+    port.prompt = "stale baseline prompt"
+    baseline = dict(port.original_settings)
+    baseline_generate_enabled = port.generate_enabled
+
+    outcome = await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
+
+    journal = AgentSettingsRecoveryJournal(
+        request.runtime_state_root, request.provider_account_id, request.provider_project_id
+    )
+    assert baseline["model_id"] == "MDL_0001"
+    assert baseline["aspect_ratio"] == "16:9"
+    assert baseline["output_count"] == 1
+    assert baseline_generate_enabled is False
+    assert port.preparation_settings is not None
+    assert port.preparation_settings["model_id"] == "MDL_0001"
+    assert port.preparation_settings["generation_mode"] == "TEXT_TO_VIDEO"
+    assert port.preparation_settings["aspect_ratio"] == "9:16"
+    assert port.preparation_settings["output_count"] == 1
+    assert port.bound == ()
+    assert port.prompt == expected_provider_prompt
+    assert outcome.generate_present is True
+    assert outcome.generate_enabled is True
+    assert outcome.state == "FLOW_PRESUBMIT_READY"
+    assert "click_generate" not in port.calls
+    assert not any(hasattr(port, name) for name in ("submit", "generate", "click_generate"))
+    assert port.applied == baseline
+    assert port.applied["aspect_ratio"] == "16:9"
+    record = journal.read()
+    assert record is not None and record.state == "CLEAN"
 
 
 @pytest.mark.asyncio

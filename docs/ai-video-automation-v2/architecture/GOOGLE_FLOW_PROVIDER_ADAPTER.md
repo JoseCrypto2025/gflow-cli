@@ -12,7 +12,17 @@ The adapter is keyed by the configured `Provider_ID`; it does not assume a fixed
 
 The request must contain a persisted prompt version with `Prompt_Status=APPROVED`. VALIDATED, SUPERSEDED, or other statuses are held before any browser call. Scene, profile, source-context hash, exact positive and negative prompt text, and the canonical Phase E prompt hash must all match. Phase F does not approve or persist prompt rows.
 
-The reusable row-transition guard lives in `gflow_cli.v2_runtime.prompt_approval`. A persisted `APPROVED` row may be rewritten only with identical values, or transitioned to `SUPERSEDED` while changing only `Prompt_Status` and `Updated_At`. Any other edit raises `APPROVED_PROMPT_IMMUTABLE`. Reapproval creates a distinct `VALIDATED` version, then requires a fresh, error-free Phase E result to match Scene/profile, exact positive/negative text, and both hashes before approval. A Scene/profile pair must finish with exactly one `APPROVED` row. Google Sheets writers must invoke this guard before writing; the Phase F provider adapter remains read-only with respect to prompt rows.
+For Agent-only preparation, distinguish `BASELINE` (settings observed before
+mutation), `PREPARED` (request settings and provider prompt verified by exact
+readback), and `RESTORED` (original persistent defaults read back after the
+transaction). Baseline differences such as 16:9 aspect or an old composer
+prompt are expected preparation inputs; only a PREPARED mismatch blocks F5.
+The transaction restores the settings snapshot and marks the recovery journal
+`CLEAN` only after restoration readback succeeds. The approved creative prompt
+SHA remains separate from the provider UI prompt SHA, which includes the
+deterministic Agent duration instruction.
+
+The reusable row-transition guard lives in `gflow_cli.v2_runtime.prompt_approval`, with the operator lifecycle in `gflow_cli.v2_runtime.prompt_version_lifecycle` and its dedicated Sheets adapter in `google_sheets_transactions`. A persisted `APPROVED` row may be superseded only while preserving its prompt payload and hashes. Reapproval persists a distinct `DRAFT`, validates it against a fresh, error-free Phase E result, then requires another fresh exact match before approval. The two-row approval update uses one `spreadsheets.batchUpdate` request; the implementation re-reads both rows and verifies exactly one `APPROVED` row. Google Sheets has no server-side compare-and-swap, so any detected drift or uncertain readback is a HOLD. Current approval is represented by `Prompt_Status=APPROVED`; this 14-column schema has no `Is_Current` field. The Phase F provider adapter remains read-only with respect to prompt rows.
 
 ## Dedicated project and session
 

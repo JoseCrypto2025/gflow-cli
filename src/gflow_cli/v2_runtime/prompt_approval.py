@@ -9,6 +9,7 @@ from .phase_e import PreflightResult
 _APPROVED_STATUS = "APPROVED"
 _SUPERSEDED_STATUS = "SUPERSEDED"
 _VALIDATED_STATUS = "VALIDATED"
+_DRAFT_STATUS = "DRAFT"
 _APPROVAL_FIELDS = (
     "Scene_Prompt_ID",
     "Scene_ID",
@@ -30,6 +31,12 @@ _ROW_FIELDS = frozenset(
         "Updated_At",
     }
 )
+_IMMUTABLE_FIELDS = _ROW_FIELDS - {
+    "Prompt_Status",
+    "Validation_Message",
+    "Approved_At",
+    "Updated_At",
+}
 
 
 class PromptApprovalIntegrityError(ValueError):
@@ -44,37 +51,66 @@ def guard_scene_prompt_version_update(
     *,
     fresh_phase_e: PreflightResult | None = None,
 ) -> None:
-    """Validate one row transition before any Sheets or storage write.
-
-    An APPROVED row accepts only an exact idempotent rewrite or a status-only
-    transition to SUPERSEDED with its update timestamp. A VALIDATED row can be
-    approved only against an exact, successful fresh Phase E result.
-    """
+    """Validate one row transition against the immutable payload and status matrix."""
     if frozenset(proposed) != _ROW_FIELDS:
         raise PromptApprovalIntegrityError("prompt row does not match the known schema")
-
     next_status = proposed.get("Prompt_Status")
     prior_status = previous.get("Prompt_Status") if previous is not None else None
 
+    if previous is None:
+        if next_status != _DRAFT_STATUS:
+            raise PromptApprovalIntegrityError("new prompt versions must begin in DRAFT")
+        required = {
+            "Scene_Prompt_ID",
+            "Scene_ID",
+            "Prompt_Version",
+            "Generation_Profile_ID",
+            "Compiled_Prompt_Text",
+            "Compiler_Version",
+            "Source_Context_SHA256",
+            "Prompt_SHA256",
+        }
+        if any(not proposed.get(field) for field in required):
+            raise PromptApprovalIntegrityError(
+                "new prompt version is missing immutable payload fields"
+            )
+        return
+    if frozenset(previous) != _ROW_FIELDS:
+        raise PromptApprovalIntegrityError("existing prompt row is incomplete")
+    if any(previous.get(field) != proposed.get(field) for field in _IMMUTABLE_FIELDS):
+        raise PromptApprovalIntegrityError("persisted prompt payload and hashes are immutable")
+    if dict(previous) == dict(proposed):
+        return
+
     if prior_status == _APPROVED_STATUS:
-        if frozenset(previous or {}) != _ROW_FIELDS:
-            raise PromptApprovalIntegrityError("existing approved prompt row is incomplete")
-        assert previous is not None
-        if dict(previous) == dict(proposed):
-            return
-        if next_status == _SUPERSEDED_STATUS and all(
-            previous[field] == proposed[field]
+        if next_status != _SUPERSEDED_STATUS or any(
+            previous.get(field) != proposed.get(field)
             for field in _ROW_FIELDS - {"Prompt_Status", "Updated_At"}
         ):
-            return
-        raise PromptApprovalIntegrityError("approved prompt approval contract is immutable")
-
-    if next_status == _APPROVED_STATUS:
-        if prior_status != _VALIDATED_STATUS or fresh_phase_e is None:
             raise PromptApprovalIntegrityError(
-                "approval requires a VALIDATED row and fresh Phase E"
+                "approved prompt permits only immutable supersession"
             )
+        return
+
+    if prior_status == _DRAFT_STATUS and next_status == _VALIDATED_STATUS:
+        if fresh_phase_e is None:
+            raise PromptApprovalIntegrityError("validation requires fresh Phase E")
         _require_exact_fresh_phase_e(proposed, fresh_phase_e)
+        if proposed.get("Approved_At"):
+            raise PromptApprovalIntegrityError("unapproved prompt cannot have Approved_At")
+        return
+
+    if prior_status == _VALIDATED_STATUS and next_status == _APPROVED_STATUS:
+        if fresh_phase_e is None:
+            raise PromptApprovalIntegrityError("approval requires fresh Phase E")
+        if not proposed.get("Approved_At"):
+            raise PromptApprovalIntegrityError("approved prompt requires Approved_At")
+        if previous.get("Approved_At"):
+            raise PromptApprovalIntegrityError("validated prompt must not already have Approved_At")
+        _require_exact_fresh_phase_e(proposed, fresh_phase_e)
+        return
+
+    raise PromptApprovalIntegrityError("unsupported prompt lifecycle transition")
 
 
 def _require_exact_fresh_phase_e(row: Mapping[str, object], result: PreflightResult) -> None:

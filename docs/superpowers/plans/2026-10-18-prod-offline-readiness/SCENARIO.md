@@ -37,7 +37,7 @@ Active dimensions: D1 auth/session lifecycle (OAuth candidate promotion and refr
 ## Deferred
 
 - True distributed compare-and-swap is unavailable through ordinary Sheets values/batchUpdate calls; use one VPS writer lock and document that external writers can still race.
-- Live API behavior, D5, generation, and Drive persistence stay blocked until the human installs the dedicated OAuth grant and all live gates pass.
+- The D5 OAuth grant and canonical credential are verified. The earlier D5 F5 attempt held because `SPV_000006` failed fresh Phase E; after `SPV_000007` was approved, the 2026-10-19 non-generating F5 presubmit passed. D6 generation and Drive persistence remain gated on D2 reconciliation.
 - Browser-only UI behavior is unchanged; no e2e generation test is run or needed for this offline state/store work.
 
 ## Suggested BDD scenarios

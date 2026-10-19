@@ -63,6 +63,7 @@ def test_identical_approved_rewrite_is_idempotent() -> None:
         ("Scene_ID", "SCN_000002"),
         ("Prompt_Version", 2),
         ("Compiler_Version", "phase-e/2"),
+        ("Created_At", "2026-10-18T00:00:00Z"),
     ],
 )
 def test_approved_semantic_mutation_is_rejected(field: str, value: object) -> None:

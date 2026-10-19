@@ -206,12 +206,16 @@ canonical UTC RFC3339 timestamps ending in one `Z`.
 
 ## Current status
 
-As of 2026-10-18, the VPS canonical credential file is absent and the deployed
-application SHA is `9bb6e88b4805d63a59d0ff218e24b38f3117db0a`; the V2 runtime
-doctor passes. Bootstrap cannot complete until the human has configured the
-Cloud OAuth project and completed manual consent plus Picker grants. D5 remains
-held before Flow until the staged service-user verification and D5 live
-presubmit pass. No D6 generation has occurred.
+As of 2026-10-19, the canonical credential exists at
+`/etc/gflow-v2/google-authorized-user.json`, owned by `gflow:gflow` with mode
+`0600`, and canonical Google API verification passes. Fresh live verification
+confirmed Master Sheet access, all 34 schema validations, and `Job_Artifacts`
+access. The deployed build manifest reports version `0.85.0` at commit
+`42787383505b43394b3657b5138d137a259c3185`. The earlier F5 attempt stopped
+before Flow because `SPV_000006` version 6 had a stale `Source_Context_SHA256`.
+After the immutable prompt lifecycle produced and approved `SPV_000007`, the
+2026-10-19 live F5 presubmit passed against fresh Phase E. OAuth does not need
+to be rerun. No Generate action or D6 generation has occurred.
 
 ## Official Google references
 

@@ -59,6 +59,19 @@ def _contenteditable_prompt_text(blocks: Sequence[str]) -> str:
     return "\n".join(blocks)
 
 
+def resolve_model_id_from_display(
+    display_text: str, model_display_names: Mapping[str, str]
+) -> str | None:
+    """Resolve Flow's model label despite harmless hyphen/spacing presentation drift."""
+    normalized_display = re.sub(r"[\s-]+", " ", display_text.casefold()).strip()
+    matches = [
+        model_id
+        for model_id, label in model_display_names.items()
+        if re.sub(r"[\s-]+", " ", label.casefold()).strip() == normalized_display
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 async def _read_prompt_field(locator: Locator) -> str:
     """Read the current prompt value without confusing DOM text with input value."""
     raw_value: object = await locator.evaluate(
@@ -462,10 +475,7 @@ class GoogleFlowAgentOnlyPort:
         await view.wait_for(state="visible", timeout=10_000)
         model_button = view.locator(_VIDEO_MODEL_BUTTON)
         model_text = (await model_button.inner_text()).strip().splitlines()[0]
-        model_id = next(
-            (key for key, label in self.model_display_names.items() if label == model_text),
-            None,
-        )
+        model_id = resolve_model_id_from_display(model_text, self.model_display_names)
         if model_id is None:
             raise FlowPresubmitError(
                 "FLOW_MODEL_UNMAPPED", "live Agent model is absent from validated model mapping"

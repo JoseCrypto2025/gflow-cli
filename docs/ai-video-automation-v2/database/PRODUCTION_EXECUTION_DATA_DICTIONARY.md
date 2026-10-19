@@ -10,6 +10,10 @@ Primary key: `Scene_Prompt_ID`
 
 Unique: Scene_ID + Prompt_Version
 
+Current-version rule: `Prompt_Status=APPROVED` identifies the current row for
+one Scene/Profile pair. This approved 14-column schema has no persisted
+`Is_Current` field; no extra column is written.
+
 | Field | Type | Required | FK | Allowed values | Definition / rule |
 |---|---|---:|---|---|---|
 | `Scene_Prompt_ID` | STRING | Yes | — | — | Scene Prompt ID Must match ^SPV_[0-9]{6}$ and be unique. |

@@ -54,6 +54,13 @@ persist the candidate. See [Prompt Builder Architecture](architecture/PROMPT_BUI
 and [Preflight Contract](architecture/PREFLIGHT_CONTRACT.md). The live Sheet
 remains unchanged and the phase ends before provider execution.
 
+Persisting a candidate is a separate operator action implemented by
+`scripts/operations/reconcile_prompt_version.py`. It creates a new immutable
+`DRAFT`, validates it against fresh Phase E, and approves only after another
+fresh exact match. Approval switches the prior/current status cells through one
+atomic Sheets batch and verifies readback. In the approved 14-column schema,
+`Prompt_Status=APPROVED` is the current marker; there is no `Is_Current` column.
+
 ## Phase G: controlled local execution foundation
 
 The new Phase G domain controller is distinct from the submission-free F5

@@ -14,18 +14,24 @@ from pathlib import Path
 from typing import Any, cast
 
 from gflow_cli.v2_runtime.config import RuntimeSettings, load_runtime_settings
-from gflow_cli.v2_runtime.google_flow import FlowPresubmitRequest, PersistedPromptVersion
-from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, Row, preflight_scene
+from gflow_cli.v2_runtime.errors import FlowPresubmitError
+from gflow_cli.v2_runtime.google_flow import (
+    FlowPresubmitRequest,
+    PersistedPromptVersion,
+    build_agent_only_directive,
+    prompt_sha256,
+)
 from gflow_cli.v2_runtime.google_sheets import (
     APPROVED_SPREADSHEET_ID,
+    SOURCE_LIVE_GOOGLE_SHEETS,
     GoogleSheetsApiTransport,
     GoogleSheetsReadError,
     GoogleSheetsSnapshot,
     GoogleSheetsSnapshotSource,
     GoogleWorkspaceCredentialProvider,
-    SOURCE_LIVE_GOOGLE_SHEETS,
     write_snapshot_atomic,
 )
+from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, Row, preflight_scene
 from gflow_cli.v2_runtime.timestamps import parse_utc_timestamp
 
 SPREADSHEET_ID = APPROVED_SPREADSHEET_ID
@@ -40,9 +46,30 @@ _SECRET_FIELD_RE = re.compile(
 class PresubmitInputError(ValueError):
     """Stable, safe-to-report rejection for an invalid D5 input."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, subreason: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.subreason = subreason
+
+
+def _flow_failure_report(exc: FlowPresubmitError) -> dict[str, str]:
+    """Keep stable Flow failure codes while excluding exception messages and secrets."""
+    code = exc.code if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", exc.code) else "FLOW_PRESUBMIT_FAILED"
+    cause = exc.__cause__
+    cause_type = type(cause).__name__ if cause is not None else ""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", cause_type):
+        cause_type = ""
+    report = {
+        "state": "HOLD",
+        "reason_code": code,
+        "failure_class": code,
+        "exception_type": type(exc).__name__,
+        "phase": "FLOW_PREPARATION",
+        "detail": "Flow preparation failed safely",
+    }
+    if cause_type:
+        report["original_exception_type"] = cause_type
+    return report
 
 
 def _utc_datetime(value: object) -> datetime:
@@ -140,14 +167,31 @@ def build_prod_presubmit_request(
         for row in tables.get("GENERATION_PROFILE_MASTER", [])
         if row.get("Generation_Profile_ID") == profile_id
     ]
-    if len(profiles) != 1:
-        raise PresubmitInputError("PROD_PROFILE_INVALID", "one production profile must resolve")
+    if not profiles:
+        raise PresubmitInputError(
+            "PROD_PROFILE_INVALID",
+            "one production profile must resolve",
+            subreason="profile_not_found",
+        )
+    if len(profiles) > 1:
+        raise PresubmitInputError(
+            "PROD_PROFILE_INVALID",
+            "one production profile must resolve",
+            subreason="profile_duplicate",
+        )
     profile = profiles[0]
-    if (
-        str(profile.get("Environment", "")).upper() != "PROD"
-        or str(profile.get("Status", "")).upper() != "ACTIVE"
-    ):
-        raise PresubmitInputError("PROD_PROFILE_INVALID", "profile must be active and production")
+    if str(profile.get("Environment", "")).upper() != "PROD":
+        raise PresubmitInputError(
+            "PROD_PROFILE_INVALID",
+            "profile must be active and production",
+            subreason="profile_environment_invalid",
+        )
+    if str(profile.get("Status", "")).upper() != "ACTIVE":
+        raise PresubmitInputError(
+            "PROD_PROFILE_INVALID",
+            "profile must be active and production",
+            subreason="profile_status_invalid",
+        )
     account_id = str(profile.get("Provider_Account_ID", ""))
     accounts = [
         row
@@ -268,11 +312,21 @@ async def run_prod_presubmit(
         raise PresubmitInputError(
             "F5_NOT_READY", "non-submitting Flow presubmit did not reach READY"
         )
+    provider_ui_prompt = build_agent_only_directive(
+        request.prompt_version.compiled_prompt_text,
+        request.preflight.technical_configuration,
+    )
     return {
         "state": result.state,
         "provider_account_id": result.provider_account_id,
         "provider_project_id": result.provider_project_id,
-        "prompt_sha256": result.prompt_sha256,
+        "approved_prompt_sha256": result.prompt_sha256,
+        "prepared_model_id": result.settings.get("model_id"),
+        "prepared_generation_mode": result.settings.get("generation_mode"),
+        "prepared_aspect_ratio": result.settings.get("aspect_ratio"),
+        "prepared_output_count": result.settings.get("output_count"),
+        "prepared_reference_count": result.reference_count,
+        "prepared_provider_ui_prompt_sha256": prompt_sha256(provider_ui_prompt, ""),
         "generate_present": result.generate_present,
         "generate_enabled": result.generate_enabled,
         "generate_clicked": False,
@@ -283,9 +337,7 @@ async def run_prod_presubmit(
 def _read_live_snapshot(credential_path: Path, schema_dir: Path) -> GoogleSheetsSnapshot:
     """Build a live read source from an external credential file and close its transport."""
     repo_root = Path(__file__).resolve().parents[2]
-    token_provider = GoogleWorkspaceCredentialProvider(
-        credential_path, repository_root=repo_root
-    )
+    token_provider = GoogleWorkspaceCredentialProvider(credential_path, repository_root=repo_root)
     transport = GoogleSheetsApiTransport(token_provider)
     try:
         return GoogleSheetsSnapshotSource(transport, schema_dir).read()
@@ -310,7 +362,10 @@ def main() -> int:
             )
         schema_dir = Path(__file__).resolve().parents[2] / "schemas"
         snapshot = _read_live_snapshot(Path(credential_value), schema_dir)
-        if snapshot.source != SOURCE_LIVE_GOOGLE_SHEETS or snapshot.spreadsheet_id != SPREADSHEET_ID:
+        if (
+            snapshot.source != SOURCE_LIVE_GOOGLE_SHEETS
+            or snapshot.spreadsheet_id != SPREADSHEET_ID
+        ):
             raise PresubmitInputError(
                 "SNAPSHOT_SOURCE_UNTRUSTED", "snapshot did not come from the approved live source"
             )
@@ -321,7 +376,9 @@ def main() -> int:
         if os.name == "posix":
             os.chmod(snapshot_dir, 0o700)
         snapshot_path = snapshot_dir / f"{args.scene_id}-{args.profile_id}.json"
-        write_snapshot_atomic(snapshot, snapshot_path, runtime_root=Path(settings.runtime_state_root))
+        write_snapshot_atomic(
+            snapshot, snapshot_path, runtime_root=Path(settings.runtime_state_root)
+        )
         request, model_names = build_prod_presubmit_request(
             snapshot.tables,
             scene_id=args.scene_id,
@@ -335,7 +392,10 @@ def main() -> int:
             )
         )
     except PresubmitInputError as exc:
-        print(json.dumps({"state": "HOLD", "reason_code": exc.code, "detail": str(exc)}))
+        report = {"state": "HOLD", "reason_code": exc.code, "detail": str(exc)}
+        if exc.subreason is not None:
+            report["subreason"] = exc.subreason
+        print(json.dumps(report))
         return 2
     except GoogleSheetsReadError:
         print(
@@ -348,12 +408,18 @@ def main() -> int:
             )
         )
         return 2
-    except Exception:
+    except FlowPresubmitError as exc:
+        print(json.dumps(_flow_failure_report(exc), sort_keys=True))
+        return 2
+    except Exception as exc:
         print(
             json.dumps(
                 {
                     "state": "HOLD",
                     "reason_code": "PRESUBMIT_FAILED",
+                    "failure_class": "UNEXPECTED_RUNTIME_EXCEPTION",
+                    "exception_type": type(exc).__name__,
+                    "phase": "D5_OPERATOR",
                     "detail": "presubmit failed safely",
                 }
             )

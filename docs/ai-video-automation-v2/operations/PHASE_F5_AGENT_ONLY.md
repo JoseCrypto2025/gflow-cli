@@ -36,6 +36,17 @@ mode is text-to-video.
 Reference inputs, Agent instructions, and negative-prompt entry are outside
 this F5 contract.
 
+### F5 state evidence
+
+Capture `BASELINE` before the transaction, verify the expected settings and
+provider UI prompt as `PREPARED`, then inspect restored persistent defaults as
+`RESTORED`. Baseline aspect, prompt, or Generate readiness differences are
+not presubmit failures; F5 is responsible for preparing the request and
+checking that prepared readback. A pass requires exact prepared values,
+Generate present and enabled without a click, restored settings equal to the
+baseline, and a `CLEAN` recovery journal. Report the approved creative prompt
+SHA separately from the provider UI prompt SHA.
+
 Before any persistent setting change, F5 captures the observed defaults and
 atomically writes a credential-free recovery record under
 `RUNTIME_STATE_ROOT/recovery/agent-settings/`. The journal enters `DIRTY`
@@ -108,12 +119,18 @@ create a production/scene job execution attempt.
 - D2 is `HOLD` at `UNKNOWN_SUBMISSION_STATE` after one Generate click without
   attributable acceptance evidence. Do not retry and do not claim D2 PASS.
 - D3 VPS installation is verified for the exact D2-tested application SHA.
-- D4 is `WAITING_FOR_HUMAN_LOGIN`; the isolated production auth profile,
-  production Flow project, and production provider account have not been
-  verified. The production login handoff is documented in
-  `VPS_BROWSER_RUNTIME.md`.
-- D5 has an offline-only production snapshot resolver and invocation wrapper.
-  It calls `prepare_live_flow()` only and is not yet run live.
+- D4 is verified: the isolated `gflow-prod` profile is authenticated as the
+  intended Google account; Master data resolves PROD account `PVA_0002` and
+  project `aafe9282-071f-4333-baa4-92b9f76a9c27`.
+- D5 OAuth and canonical Workspace verification are DONE. A fresh 34-schema
+  snapshot and `Job_Artifacts` access pass. That checkpoint's F5 attempt
+  stopped before Flow because its then-current approved prompt differed from
+  fresh Phase E; later prompt lifecycle work reconciled the current approval.
+  On 2026-10-19, a fresh production run selected `SPV_000007`, passed Phase E,
+  prepared the Agent-only UI, restored baseline settings, and finished with a
+  `CLEAN` recovery journal. F5 passed without clicking Generate or using
+  credits. Re-resolve the unique current approved version from live Master
+  data for every new F5 run.
 - D7 has an offline-only idempotent transaction contract and schema-shaped
   serializers. The in-memory store is test-only; no live transaction backend
   exists and no Sheets rows were written.

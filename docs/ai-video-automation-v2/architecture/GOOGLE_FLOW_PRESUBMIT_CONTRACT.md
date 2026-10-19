@@ -14,6 +14,19 @@
 
 Any check may exit to HOLD/FAILED. There are no submission or rendering states in this phase.
 
+## Agent-only transaction evidence
+
+F5 reports three separate observations. `BASELINE` is the live UI state before
+F5 changes anything. A baseline value that differs from the request is input
+to the preparation transaction, not a presubmit failure. `PREPARED` is the
+state after F5 applies the expected settings, binds references, fills the
+provider prompt, and verifies the complete readback. `RESTORED` is the
+persistent Agent settings state after F5 restores and reads back the original
+defaults. A successful Agent-only transaction requires PREPARED to match the
+request, RESTORED to match BASELINE, and the recovery journal to be `CLEAN`.
+The operator report must keep these states distinct and identify the provider
+UI prompt digest separately from the approved creative prompt digest.
+
 ## Adapter facade
 
 The `FlowPreparationPort` is deliberately limited to inspection and preparation operations. It owns no Generate click, submit, upload, or generation call. Existing transport methods with those capabilities are not reachable through this interface. A later concrete facade may call only reviewed methods from the repository-owned browser and centralized Flow surface modules.
