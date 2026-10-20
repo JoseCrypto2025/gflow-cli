@@ -60,6 +60,9 @@ Persisting a candidate is a separate operator action implemented by
 fresh exact match. Approval switches the prior/current status cells through one
 atomic Sheets batch and verifies readback. In the approved 14-column schema,
 `Prompt_Status=APPROVED` is the current marker; there is no `Is_Current` column.
+The operator resolves `TEST` or `PROD` from the selected ACTIVE generation
+profile in its fresh live snapshot and rejects missing, duplicate, inactive, or
+unsupported profile environments.
 
 ## Phase G: controlled local execution foundation
 

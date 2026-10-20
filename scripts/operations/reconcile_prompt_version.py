@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from gflow_cli.v2_runtime.config import load_runtime_settings
@@ -46,9 +47,48 @@ def _read_snapshot(credential_path: Path, schema_dir: Path):
     return snapshot
 
 
+def _profile_environment(
+    tables: Mapping[str, Sequence[Mapping[str, object]]], profile_id: str
+) -> str:
+    """Resolve Phase E environment from one active Master profile, never caller defaults."""
+    profiles = [
+        row
+        for row in tables.get("GENERATION_PROFILE_MASTER", ())
+        if row.get("Generation_Profile_ID") == profile_id
+    ]
+    if not profiles:
+        raise PromptVersionLifecycleError(
+            "PROFILE_NOT_FOUND", "generation profile was not found in the live Master snapshot"
+        )
+    if len(profiles) != 1:
+        raise PromptVersionLifecycleError(
+            "PROFILE_DUPLICATE", "generation profile is not unique in the live Master snapshot"
+        )
+    profile = profiles[0]
+    if profile.get("Status") != "ACTIVE":
+        raise PromptVersionLifecycleError(
+            "PROFILE_INACTIVE", "generation profile is not ACTIVE"
+        )
+    raw_environment = profile.get("Environment")
+    if not isinstance(raw_environment, str) or not raw_environment.strip():
+        raise PromptVersionLifecycleError(
+            "PROFILE_ENVIRONMENT_MISSING", "generation profile environment is blank"
+        )
+    environment = raw_environment.strip()
+    if environment not in {"TEST", "PROD"}:
+        raise PromptVersionLifecycleError(
+            "PROFILE_ENVIRONMENT_UNSUPPORTED",
+            "generation profile environment must be TEST or PROD",
+        )
+    return environment
+
+
 def _fresh_phase_e(credential_path: Path, schema_dir: Path, scene_id: str, profile_id: str):
     snapshot = _read_snapshot(credential_path, schema_dir)
-    return preflight_scene(InMemorySceneCatalog(snapshot.tables), scene_id, profile_id, "PROD")
+    environment = _profile_environment(snapshot.tables, profile_id)
+    return preflight_scene(
+        InMemorySceneCatalog(snapshot.tables), scene_id, profile_id, environment
+    )
 
 
 def _safe_preview(preview) -> dict[str, object]:
