@@ -200,6 +200,28 @@ the five other mirror axes), which no command here can check and no CI gate can 
 
 These rules exist because docs alone don't bind under momentum: a "check open PRs first" rule was already written and still got skipped, and a PR was merged without seeing an entangled open one. Follow them on every task.
 
+### Canonical execution contracts — HARD RULE
+
+Before any AI Video Automation V2 technical execution or recovery task, read these sources in
+order:
+
+1. `AGENTS.md`.
+2. The applicable canonical execution contract.
+3. Current repository function and CLI signatures that implement the operation.
+4. The latest persisted execution evidence and operator report for the target attempt.
+
+Never guess function names, function arguments, CLI flags, state names, error codes, ledger fields,
+profile/project/path names, retry semantics, or recovery ordering. If the contract, current code, and
+persisted evidence disagree, **STOP**; do not improvise. If required evidence is missing or cannot
+be verified, stop before execution or recovery.
+
+When a canonical contract exists, execution prompts must be **PARAMETERS-ONLY / DELTA-ONLY**.
+Workflow logic belongs in the canonical contract and committed code; do not rewrite it in every
+prompt. Keep execution, debugging, code modification, and paid approval in separate tasks.
+
+Before any D2 same-attempt recovery execution, also read
+[`docs/ai-video-automation-v2/operations/D2_SAME_ATTEMPT_RECOVERY_V1.md`](docs/ai-video-automation-v2/operations/D2_SAME_ATTEMPT_RECOVERY_V1.md).
+
 ### The Iron Law — done means verified by a run
 
 ```
