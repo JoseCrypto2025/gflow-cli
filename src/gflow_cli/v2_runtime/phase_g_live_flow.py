@@ -87,6 +87,8 @@ async () => {
 """
 _LIVE_GATE = "flow-permission-message:has(div[role='radio'].option-row:not(.read-only))"
 _APPROVE_ROW = "div[role='radio'].option-row:not(.read-only):has(mat-icon:text-is('check'))"
+_RECOVERY_GATE_HYDRATION_TIMEOUT_SECONDS = 15.0
+_RECOVERY_GATE_POLL_INTERVAL_SECONDS = 1.0
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", re.I)
 _VIDEO_QUOTE_RE = re.compile(r"\b(\d+)\s+videos?\b", re.I)
 _CREDIT_QUOTE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s+credits?\b", re.I)
@@ -408,12 +410,29 @@ class GoogleFlowAgentOnlyGenerationPort:
     async def read_current_confirmation(
         self, baseline: FlowSubmissionBaseline
     ) -> FlowConfirmationGate:
-        """Read exactly one currently visible post-baseline gate without waiting or clicking."""
+        """Read one post-baseline gate, allowing Flow up to 15s to hydrate its DOM.
+
+        The TEST project gate appeared about 10s after project load in live
+        observation; polling once per second allows for that UI hydration while
+        keeping the gate check bounded and read-only.
+        """
         gates = self._require_page().locator(_LIVE_GATE)
-        if await gates.count() != 1:
-            raise PhaseGError(
-                "PHASE_G_CONFIRMATION_NOT_ATTRIBUTABLE", "exactly one live confirmation is required"
-            )
+        deadline = time.monotonic() + _RECOVERY_GATE_HYDRATION_TIMEOUT_SECONDS
+        while True:
+            count = await gates.count()
+            if count > 1:
+                raise PhaseGError(
+                    "PHASE_G_CONFIRMATION_NOT_ATTRIBUTABLE",
+                    f"observed count = {count}; exactly one live confirmation is required",
+                )
+            if count == 1:
+                break
+            if time.monotonic() >= deadline:
+                raise PhaseGError(
+                    "PHASE_G_CONFIRMATION_NOT_ATTRIBUTABLE",
+                    "observed count = 0 after 15s recovery gate hydration timeout",
+                )
+            await asyncio.sleep(_RECOVERY_GATE_POLL_INTERVAL_SECONDS)
         gate = gates.first
         gate_id = _gate_digest(await gate.evaluate("el => el.outerHTML"))
         if gate_id in baseline.confirmation_ids:

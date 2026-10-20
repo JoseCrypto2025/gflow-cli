@@ -49,7 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The submit path observes for a bounded window instead of failing after a mandatory 30-second
   gate wait. A SHA-guarded recovery records one exact late quote, preserves the prior conservative
   reservation as evidence, permits at most one approval, and never resubmits Generate. Missing
-  quote or provider charge remains explicitly unknown.
+  quote or provider charge remains explicitly unknown. Same-attempt recovery allows a bounded
+  15-second permission-DOM hydration window; it rejects multiple live gates immediately and
+  fails closed when no gate appears.
 
 
 ## [0.85.0] — 2026-10-14

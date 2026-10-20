@@ -67,7 +67,9 @@ continues to report provider billing as `UNKNOWN`; a quote is not evidence of an
 actual provider charge. The dedicated same-attempt recovery operator requires
 the expected ledger hash, unknown non-terminal state, one Generate action, zero
 prior approvals, exact TEST identity, and an exact live gate fingerprint. It
-cannot fill a prompt or click Generate.
+cannot fill a prompt or click Generate. Its read-only gate lookup waits up to
+15 seconds for Flow's permission DOM to hydrate, polling once per second; zero
+gates at timeout and multiple gates fail closed under the same error contract.
 WAF refusal, unresolved attempts, already successful D2 output, and every
 recorded Generate action prevent another paid attempt. An already generated
 media ID may be recovered and validated again under the same D2 run ID; this
