@@ -11,6 +11,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -217,6 +218,7 @@ class FlowConfirmationGate:
     video_count: int | None
     credit_cost: Decimal | None
     visible_balance: Decimal | None = None
+    progress_before_confirmation: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,11 +246,18 @@ class FlowGenerationPort(Protocol):
     async def capture_submission_baseline(self) -> FlowSubmissionBaseline: ...
     async def click_generate_once(self) -> None: ...
     async def await_confirmation(
+        self, baseline: FlowSubmissionBaseline, *, observation_deadline: float
+    ) -> FlowConfirmationGate | None: ...
+    async def read_current_confirmation(
         self, baseline: FlowSubmissionBaseline
     ) -> FlowConfirmationGate: ...
     async def approve_confirmation(self, confirmation_id: str) -> None: ...
     async def observe_attempt(
-        self, baseline: FlowSubmissionBaseline, confirmation_id: str
+        self,
+        baseline: FlowSubmissionBaseline,
+        confirmation_id: str | None,
+        *,
+        observation_deadline: float,
     ) -> PhaseGAttemptEvidence: ...
 
 
@@ -384,74 +393,86 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                     request.execution_context.attempt_id
                 )
             await self.port.click_generate_once()
-            gate = await self.port.await_confirmation(baseline)
-            if (
-                not gate.confirmation_id
-                or gate.confirmation_id in baseline.confirmation_ids
-                or gate.project_id != request.provider_project_id
-            ):
-                self._record_no_charge(request)
-                raise PhaseGError(
-                    "PHASE_G_CONFIRMATION_NOT_ATTRIBUTABLE", "confirmation is stale or mismatched"
-                )
-            self.ledger.observe_confirmation(
-                request.d2_run_id,
-                confirmation_id=gate.confirmation_id,
-                video_count=gate.video_count,
-                credit_cost=gate.credit_cost,
-                visible_balance=gate.visible_balance,
+            observation_deadline = time.monotonic() + 240
+            gate = await self.port.await_confirmation(
+                baseline, observation_deadline=observation_deadline
             )
-            if gate.video_count != 1 or gate.credit_cost is None or gate.credit_cost <= 0:
-                self._record_no_charge(request)
-                code = (
-                    "PHASE_G_VIDEO_COUNT_UNPROVEN"
-                    if gate.video_count != 1
-                    else "PHASE_G_CREDIT_COST_UNKNOWN"
-                )
-                raise PhaseGError(code, "confirmation must prove one video and known positive cost")
-            try:
+            confirmation_id: str | None = None
+            if gate is not None and not gate.progress_before_confirmation:
                 if (
-                    request.execution_context is not None
-                    and self.production_credit_guard is not None
+                    not gate.confirmation_id
+                    or gate.confirmation_id in baseline.confirmation_ids
+                    or gate.project_id != request.provider_project_id
                 ):
-                    budget = request.execution_context.credit_budget_context
-                    if (
-                        gate.visible_balance is not None
-                        and budget.provider_remaining_free != gate.visible_balance
-                    ):
-                        raise ProductionExecutionError(
-                            "provider free balance changed since the execution context was read"
-                        )
-                    self.production_credit_guard.reserve_quote(
-                        request.execution_context.attempt_id,
-                        video_count=gate.video_count,
-                        quoted_credits=gate.credit_cost,
-                        budget=budget,
+                    self._record_no_charge(request)
+                    raise PhaseGError(
+                        "PHASE_G_CONFIRMATION_NOT_ATTRIBUTABLE",
+                        "confirmation is stale or mismatched",
                     )
-                self.ledger.approve_gate(
+                confirmation_id = gate.confirmation_id
+                self.ledger.observe_confirmation(
                     request.d2_run_id,
+                    confirmation_id=gate.confirmation_id,
                     video_count=gate.video_count,
                     credit_cost=gate.credit_cost,
                     visible_balance=gate.visible_balance,
-                    confirmation_id=gate.confirmation_id,
                 )
-            except ProductionExecutionError as exc:
-                # The confirmation has not been approved yet, so a failed
-                # quote/budget gate is a confirmed pre-charge stop.
-                self._record_no_charge(request)
-                raise PhaseGError(
-                    "PHASE_G_CREDIT_GUARD_HOLD", "shared production credit gate refused approval"
-                ) from exc
-            except PhaseGError as exc:
-                if exc.code in {
-                    "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
-                    "PHASE_G_VISIBLE_BALANCE_INSUFFICIENT",
-                }:
+                if gate.video_count != 1 or gate.credit_cost is None or gate.credit_cost <= 0:
                     self._record_no_charge(request)
-                raise
-            gate_approved = True
-            await self.port.approve_confirmation(gate.confirmation_id)
-            evidence = await self.port.observe_attempt(baseline, gate.confirmation_id)
+                    code = (
+                        "PHASE_G_VIDEO_COUNT_UNPROVEN"
+                        if gate.video_count != 1
+                        else "PHASE_G_CREDIT_COST_UNKNOWN"
+                    )
+                    raise PhaseGError(
+                        code, "confirmation must prove one video and known positive cost"
+                    )
+                try:
+                    if (
+                        request.execution_context is not None
+                        and self.production_credit_guard is not None
+                    ):
+                        budget = request.execution_context.credit_budget_context
+                        if (
+                            gate.visible_balance is not None
+                            and budget.provider_remaining_free != gate.visible_balance
+                        ):
+                            raise ProductionExecutionError(
+                                "provider free balance changed since the execution context was read"
+                            )
+                        self.production_credit_guard.reserve_quote(
+                            request.execution_context.attempt_id,
+                            video_count=gate.video_count,
+                            quoted_credits=gate.credit_cost,
+                            budget=budget,
+                        )
+                    self.ledger.approve_gate(
+                        request.d2_run_id,
+                        video_count=gate.video_count,
+                        credit_cost=gate.credit_cost,
+                        visible_balance=gate.visible_balance,
+                        confirmation_id=gate.confirmation_id,
+                    )
+                except ProductionExecutionError as exc:
+                    self._record_no_charge(request)
+                    raise PhaseGError(
+                        "PHASE_G_CREDIT_GUARD_HOLD",
+                        "shared production credit gate refused approval",
+                    ) from exc
+                except PhaseGError as exc:
+                    if exc.code in {
+                        "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
+                        "PHASE_G_VISIBLE_BALANCE_INSUFFICIENT",
+                    }:
+                        self._record_no_charge(request)
+                    raise
+                gate_approved = True
+                await self.port.approve_confirmation(gate.confirmation_id)
+            evidence = await self.port.observe_attempt(
+                baseline,
+                confirmation_id,
+                observation_deadline=observation_deadline,
+            )
             if evidence.d2_run_id != request.d2_run_id:
                 raise PhaseGError(
                     "PHASE_G_ATTEMPT_ATTRIBUTION_FAILED", "provider evidence belongs to another run"
@@ -460,7 +481,10 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 raise PhaseGError(
                     "PHASE_G_PROJECT_MISMATCH", "provider result belongs to another project"
                 )
-            if evidence.attributed_confirmation_id != gate.confirmation_id:
+            if (
+                confirmation_id is not None
+                and evidence.attributed_confirmation_id != confirmation_id
+            ):
                 raise PhaseGError(
                     "PHASE_G_ATTEMPT_ATTRIBUTION_FAILED",
                     "provider evidence is not tied to this confirmation",
@@ -547,7 +571,7 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             return PhaseGExecutionResult(
                 request.d2_run_id,
                 evidence.submission_state,
-                gate.confirmation_id,
+                confirmation_id or "",
                 evidence.provider_execution_id,
                 evidence.provider_media_id,
                 evidence.provider_project_id,
@@ -1097,7 +1121,10 @@ class D2DailyCreditLedger:
                 raise PhaseGError(
                     "UNEXPECTED_SECOND_CONFIRMATION", "attempt already approved one confirmation"
                 )
-            if attempt["submission_state"] != "GENERATE_ACTION_RECORDED":
+            late_reconciled = attempt.get("late_confirmation_reconciled") is True
+            if attempt["submission_state"] != "GENERATE_ACTION_RECORDED" and not (
+                attempt["submission_state"] == "UNKNOWN_SUBMISSION_STATE" and late_reconciled
+            ):
                 raise PhaseGError(
                     "PHASE_G_ATTEMPT_STATE_INVALID",
                     "attempt is not awaiting its first confirmation",
@@ -1122,6 +1149,8 @@ class D2DailyCreditLedger:
                 )
             date = datetime.now(_BANGKOK).date().isoformat()
             cumulative = self._accounted(payload, date)
+            if late_reconciled and attempt.get("accounting_date") == date:
+                cumulative -= _decimal(attempt.get("accounted_credit_cost")) or Decimal(0)
             if cumulative + quoted > self.daily_budget:
                 raise PhaseGError(
                     "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
@@ -1134,6 +1163,7 @@ class D2DailyCreditLedger:
                 )
             attempt.update(
                 approval_action_count=1,
+                late_confirmation_reconciled=False,
                 confirmation_id=confirmation_id,
                 quoted_video_count=video_count,
                 quoted_credit_cost=str(quoted),
@@ -1187,6 +1217,89 @@ class D2DailyCreditLedger:
 
         return self._mutate(update)
 
+    def record_late_confirmation(
+        self,
+        d2_run_id: str,
+        *,
+        expected_ledger_sha256: str,
+        confirmation_id: str,
+        project_id: str,
+        video_count: int | None,
+        credit_cost: Decimal | int | float | str | None,
+        visible_balance: Decimal | int | float | str | None = None,
+    ) -> dict[str, object]:
+        """Reconcile one late gate against an exact non-terminal unknown attempt."""
+        if not _SHA256_RE.fullmatch(expected_ledger_sha256):
+            raise PhaseGError("PHASE_G_LEDGER_SHA_INVALID", "expected ledger SHA-256 is invalid")
+        quoted = _decimal(credit_cost, allow_none=True)
+        balance = _decimal(visible_balance, allow_none=True)
+        if video_count != 1 or quoted is None or quoted <= 0:
+            raise PhaseGError("PHASE_G_CREDIT_GATE_UNPROVEN", "late gate quote is not safe")
+        with self._locked_file():
+            if self.path.is_symlink() or not self.path.is_file():
+                raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "D2 ledger is missing or unsafe")
+            if sha256_file(self.path) != expected_ledger_sha256:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CHANGED", "D2 ledger changed since recovery review"
+                )
+            payload = self._read()
+            attempt = self._attempt(payload, d2_run_id)
+            baseline_ids = attempt.get("baseline_confirmation_ids")
+            date = datetime.now(_BANGKOK).date().isoformat()
+            if (
+                attempt.get("submission_state") != "UNKNOWN_SUBMISSION_STATE"
+                or attempt.get("terminal_state") is not None
+                or _counter(attempt.get("generate_action_count")) != 1
+                or _counter(attempt.get("approval_action_count")) != 0
+                or attempt.get("provider_project_id") != project_id
+                or not isinstance(baseline_ids, list)
+                or attempt.get("baseline_captured") is not True
+                or not confirmation_id
+                or confirmation_id in baseline_ids
+                or attempt.get("observed_confirmation_id") is not None
+                or attempt.get("confirmation_id") is not None
+                or attempt.get("provider_media_id") is not None
+                or attempt.get("provider_execution_id") is not None
+                or attempt.get("provider_media_ids")
+                or attempt.get("accounting_date") != date
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LATE_CONFIRMATION_NOT_ATTRIBUTABLE",
+                    "late gate does not match a recoverable one-submit unknown attempt",
+                )
+            current_date = attempt.get("accounting_date")
+            previous_reservation = _decimal(attempt.get("accounted_credit_cost")) or Decimal(0)
+            other_reservations = self._accounted(payload, date)
+            if current_date == date:
+                other_reservations -= previous_reservation
+            if other_reservations + quoted > self.daily_budget:
+                raise PhaseGError(
+                    "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
+                    "late quote exceeds the remaining D2 daily budget",
+                )
+            if balance is not None and quoted > balance:
+                raise PhaseGError(
+                    "PHASE_G_VISIBLE_BALANCE_INSUFFICIENT",
+                    "late quote exceeds visible Flow balance",
+                )
+            attempt.update(
+                observed_confirmation_id=confirmation_id,
+                observed_video_count=video_count,
+                observed_credit_cost=str(quoted),
+                observed_visible_balance=str(balance) if balance is not None else None,
+                late_confirmation_reconciled=True,
+                prior_unknown_reservation_credit_cost=str(previous_reservation),
+                prior_unknown_reservation_accounting_date=current_date,
+                quoted_video_count=video_count,
+                quoted_credit_cost=str(quoted),
+                accounted_credit_cost=str(quoted),
+                accounting_date=date,
+                provider_billing_outcome="UNKNOWN",
+                updated_at=_utc_now(),
+            )
+            self._write(payload)
+            return dict(attempt)
+
     def record_state(
         self,
         d2_run_id: str,
@@ -1224,6 +1337,7 @@ class D2DailyCreditLedger:
                     "GENERATE_ACTION_RECORDED",
                     "SUBMISSION_ACKNOWLEDGED",
                     "GENERATION_PENDING",
+                    "GENERATION_SUCCEEDED",
                     "PROVIDER_REFUSED",
                     "WAF_REJECTED",
                     "UNKNOWN_SUBMISSION_STATE",
@@ -1307,7 +1421,16 @@ class D2DailyCreditLedger:
                 if attempt.get("accounting_date") is None and cost > 0:
                     attempt["accounting_date"] = datetime.now(_BANGKOK).date().isoformat()
                 attempt["accounted_credit_cost"] = str(cost)
-            if submission_state == "UNKNOWN_SUBMISSION_STATE":
+            if submission_state in {
+                "UNKNOWN_SUBMISSION_STATE",
+                "SUBMISSION_ACKNOWLEDGED",
+                "GENERATION_PENDING",
+                "GENERATION_SUCCEEDED",
+                "GENERATION_FAILED",
+                "UNEXPECTED_MULTI_OUTPUT",
+                "MEDIA_VALIDATION_FAILED",
+                "PERSISTENCE_FAILED",
+            }:
                 # Once a submit may have reached Flow, reserve the entire
                 # remaining task budget when no trustworthy quote was captured.
                 # This blocks accidental same-day paid retries until reconciled.
@@ -1319,6 +1442,7 @@ class D2DailyCreditLedger:
                     attempt["accounted_credit_cost"] = str(
                         max(Decimal(0), Decimal(self.daily_budget) - already)
                     )
+                attempt["provider_billing_outcome"] = "UNKNOWN"
             attempt["submission_state"] = submission_state
             attempt["terminal_state"] = terminal_state
             attempt["updated_at"] = _utc_now()

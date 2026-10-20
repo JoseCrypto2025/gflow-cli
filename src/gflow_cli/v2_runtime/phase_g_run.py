@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
+
+from gflow_cli.errors import WafRejectionError
 
 from .agent_recovery import AgentSettingsRecoveryJournal
 from .errors import AssetVerificationError, FlowPresubmitError
@@ -17,6 +22,7 @@ from .live_flow import prepare_live_flow
 from .phase_e import InMemorySceneCatalog, Row, preflight_scene
 from .phase_g import (
     D2DailyCreditLedger,
+    FlowSubmissionBaseline,
     GoogleFlowAgentOnlyGenerationExecutor,
     PhaseGError,
     PhaseGExecutionRequest,
@@ -24,6 +30,7 @@ from .phase_g import (
 )
 from .phase_g_artifacts import (
     ValidatedVideo,
+    sha256_file,
     validate_video,
 )
 from .phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
@@ -296,6 +303,223 @@ async def _open_generation_port(
         project_name=project_name,
         model_display_names=_MODEL_DISPLAY_NAMES,
     )
+
+
+async def recover_late_confirmation_same_attempt(
+    request: PhaseGExecutionRequest,
+    *,
+    expected_email: str,
+    expected_state: str,
+    expected_ledger_sha256: str,
+    expected_confirmation_id: str,
+    expected_video_count: int,
+    expected_credit_cost: int,
+) -> PhaseGExecutionResult:
+    """Approve one revalidated late gate and observe only the existing TEST submit."""
+    if expected_state != "UNKNOWN_SUBMISSION_STATE":
+        raise PhaseGError("PHASE_G_RECOVERY_STATE_MISMATCH", "recovery requires an unknown attempt")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", expected_confirmation_id)
+        or expected_video_count != 1
+        or expected_credit_cost <= 0
+    ):
+        raise PhaseGError("PHASE_G_CREDIT_GATE_UNPROVEN", "expected late gate quote is invalid")
+    if (
+        request.provider_id != "PRV_0001"
+        or request.provider_account_id != "PVA_0001"
+        or request.provider_project_id != "34e60953-e534-46e9-ac65-993893e61065"
+        or (
+            request.execution_context is not None
+            and request.execution_context.environment != "TEST"
+        )
+    ):
+        raise PhaseGError(
+            "PHASE_G_RECOVERY_IDENTITY_MISMATCH", "recovery is restricted to the exact TEST lane"
+        )
+    ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
+    if not ledger.path.is_file() or sha256_file(ledger.path) != expected_ledger_sha256:
+        raise PhaseGError("PHASE_G_LEDGER_CHANGED", "D2 ledger changed since recovery review")
+    attempt = next(
+        (row for row in ledger.attempts() if row.get("d2_run_id") == request.d2_run_id), None
+    )
+    if attempt is None or (
+        attempt.get("submission_state") != expected_state
+        or attempt.get("terminal_state") is not None
+        or attempt.get("generate_action_count") != 1
+        or attempt.get("approval_action_count") != 0
+        or attempt.get("provider_execution_id") is not None
+        or attempt.get("provider_media_id") is not None
+        or attempt.get("provider_media_ids")
+        or attempt.get("scene_id") != request.scene_id
+        or attempt.get("scene_prompt_id") != request.scene_prompt_id
+        or attempt.get("generation_profile_id") != request.generation_profile_id
+        or attempt.get("provider_account_id") != request.provider_account_id
+        or attempt.get("provider_project_id") != request.provider_project_id
+        or attempt.get("prompt_sha256") != request.prompt_sha256
+    ):
+        raise PhaseGError("PHASE_G_RECOVERY_IDENTITY_MISMATCH", "stored attempt is not recoverable")
+    baseline_ids = _string_list(attempt.get("baseline_media_ids"))
+    execution_ids = _string_list(attempt.get("baseline_execution_ids"))
+    confirmation_ids = _string_list(attempt.get("baseline_confirmation_ids"))
+    agent_turn_id = attempt.get("baseline_agent_turn_id")
+    pending_count = attempt.get("baseline_pending_count")
+    if (
+        attempt.get("baseline_captured") is not True
+        or baseline_ids is None
+        or execution_ids is None
+        or confirmation_ids is None
+        or isinstance(pending_count, bool)
+        or not isinstance(pending_count, int)
+        or pending_count != 0
+        or agent_turn_id != "0:"
+    ):
+        raise PhaseGError("PHASE_G_BASELINE_INVALID", "persisted submit baseline is invalid")
+    baseline = FlowSubmissionBaseline(
+        request.provider_project_id,
+        frozenset(baseline_ids),
+        frozenset(execution_ids),
+        pending_count,
+        frozenset(confirmation_ids),
+        str(agent_turn_id),
+    )
+    journal = AgentSettingsRecoveryJournal(
+        request.presubmit_request.runtime_state_root,
+        request.provider_account_id,
+        request.provider_project_id,
+    )
+    try:
+        journal.require_clean_or_missing()
+    except Exception as exc:
+        raise PhaseGError(
+            "PHASE_G_RECOVERY_REQUIRED", "settings recovery journal is not clean"
+        ) from exc
+    port = await _open_generation_port(request, expected_email=expected_email)
+    try:
+        await port.bind_request(request)
+        gate = await port.read_current_confirmation(baseline)
+        if (
+            gate.confirmation_id != expected_confirmation_id
+            or gate.project_id != request.provider_project_id
+            or gate.video_count != expected_video_count
+            or gate.credit_cost != expected_credit_cost
+            or gate.progress_before_confirmation
+        ):
+            raise PhaseGError(
+                "PHASE_G_LATE_GATE_CHANGED", "live gate differs from reviewed evidence"
+            )
+        ledger.record_late_confirmation(
+            request.d2_run_id,
+            expected_ledger_sha256=expected_ledger_sha256,
+            confirmation_id=gate.confirmation_id,
+            project_id=gate.project_id,
+            video_count=gate.video_count,
+            credit_cost=gate.credit_cost,
+            visible_balance=gate.visible_balance,
+        )
+        ledger.approve_gate(
+            request.d2_run_id,
+            video_count=gate.video_count,
+            credit_cost=gate.credit_cost,
+            visible_balance=gate.visible_balance,
+            confirmation_id=gate.confirmation_id,
+        )
+        try:
+            await port.approve_confirmation(gate.confirmation_id)
+            evidence = await port.observe_attempt(
+                baseline,
+                gate.confirmation_id,
+                observation_deadline=time.monotonic() + 240,
+            )
+        except WafRejectionError:
+            ledger.record_state(
+                request.d2_run_id,
+                submission_state="WAF_REJECTED",
+                terminal_state="WAF_REJECTED",
+                provider_project_id=request.provider_project_id,
+            )
+            raise
+        except Exception:
+            ledger.record_state(
+                request.d2_run_id,
+                submission_state="UNKNOWN_SUBMISSION_STATE",
+                provider_project_id=request.provider_project_id,
+            )
+            raise
+        if (
+            evidence.d2_run_id != request.d2_run_id
+            or evidence.provider_project_id != request.provider_project_id
+            or evidence.attributed_confirmation_id != gate.confirmation_id
+        ):
+            ledger.record_state(
+                request.d2_run_id,
+                submission_state="UNKNOWN_SUBMISSION_STATE",
+                provider_project_id=request.provider_project_id,
+            )
+            raise PhaseGError(
+                "PHASE_G_ATTEMPT_ATTRIBUTION_FAILED", "recovered result is not attributable"
+            )
+        media_ids = evidence.new_provider_media_ids or (
+            (evidence.provider_media_id,) if evidence.provider_media_id else ()
+        )
+        if any(media_id in baseline.media_ids for media_id in media_ids) or (
+            evidence.provider_execution_id in baseline.execution_ids
+        ):
+            ledger.record_state(
+                request.d2_run_id,
+                submission_state="UNKNOWN_SUBMISSION_STATE",
+                provider_project_id=request.provider_project_id,
+            )
+            raise PhaseGError(
+                "PHASE_G_ATTEMPT_ATTRIBUTION_FAILED",
+                "recovered provider identity existed in the submit baseline",
+            )
+        if len(media_ids) > 1:
+            ledger.record_state(
+                request.d2_run_id,
+                submission_state="UNEXPECTED_MULTI_OUTPUT",
+                terminal_state="UNEXPECTED_MULTI_OUTPUT",
+                provider_execution_id=evidence.provider_execution_id,
+                provider_media_ids=media_ids,
+                provider_project_id=request.provider_project_id,
+            )
+            raise PhaseGError(
+                "UNEXPECTED_MULTI_OUTPUT", "recovered result violates one-output attribution"
+            )
+        if evidence.submission_state == "GENERATION_SUCCEEDED" and len(media_ids) != 1:
+            raise PhaseGError(
+                "PHASE_G_ATTEMPT_ATTRIBUTION_FAILED", "success has no exact new media ID"
+            )
+        ledger.record_state(
+            request.d2_run_id,
+            submission_state=evidence.submission_state,
+            terminal_state=evidence.terminal_state,
+            provider_execution_id=evidence.provider_execution_id,
+            provider_media_id=evidence.provider_media_id,
+            provider_media_ids=media_ids,
+            provider_project_id=evidence.provider_project_id,
+            accounted_credit_cost=evidence.accounted_credit_cost,
+        )
+        return PhaseGExecutionResult(
+            request.d2_run_id,
+            evidence.submission_state,
+            gate.confirmation_id,
+            evidence.provider_execution_id,
+            evidence.provider_media_id,
+            evidence.provider_project_id,
+        )
+    finally:
+        await port.close()
+
+
+def _string_list(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    result: list[str] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, str):
+            return None
+        result.append(item)
+    return result
 
 
 async def recover_and_validate_existing(

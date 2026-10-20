@@ -10,7 +10,9 @@ import gflow_cli.v2_runtime.phase_g_run as phase_g_run
 from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, preflight_scene
 from gflow_cli.v2_runtime.phase_g import (
     D2DailyCreditLedger,
+    FlowConfirmationGate,
     FlowSubmissionBaseline,
+    PhaseGAttemptEvidence,
     PhaseGError,
     PhaseGExecutionRequest,
 )
@@ -19,6 +21,7 @@ from gflow_cli.v2_runtime.phase_g_run import (
     build_phase_g_request,
     finalize_remote_artifact,
     recover_and_validate_existing,
+    recover_late_confirmation_same_attempt,
 )
 from gflow_cli.v2_runtime.production_execution import (
     CreditBudgetContext,
@@ -243,6 +246,114 @@ async def test_recovery_resumes_after_generation_success_without_resubmitting(
     assert recovered.result.submission_state == "GENERATION_SUCCEEDED"
     assert ledger.attempts()[0]["generate_action_count"] == 1
     assert ledger.attempts()[0]["local_artifact_sha256"] == video.sha256
+
+
+@pytest.mark.asyncio
+async def test_late_confirmation_operator_approves_without_generate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-run-0001")
+    ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
+    ledger.create_attempt(request)
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.record_state(request.d2_run_id, submission_state="UNKNOWN_SUBMISSION_STATE")
+    expected_sha = sha256_file(ledger.path)
+    gate = FlowConfirmationGate("a" * 64, request.provider_project_id, 1, 10)
+    calls: list[str] = []
+
+    class FakePort:
+        @classmethod
+        async def open(cls, *, expected_email: str) -> FakePort:
+            assert expected_email == "flow-test@example.com"
+            return cls()
+
+        async def bind_request(self, bound_request: PhaseGExecutionRequest) -> None:
+            assert bound_request is request
+
+        async def read_current_confirmation(
+            self, baseline: FlowSubmissionBaseline
+        ) -> FlowConfirmationGate:
+            assert baseline.project_id == request.provider_project_id
+            calls.append("read_gate")
+            return gate
+
+        async def approve_confirmation(self, confirmation_id: str) -> None:
+            assert confirmation_id == gate.confirmation_id
+            calls.append("approve")
+
+        async def observe_attempt(
+            self,
+            baseline: FlowSubmissionBaseline,
+            confirmation_id: str | None,
+            *,
+            observation_deadline: float,
+        ) -> PhaseGAttemptEvidence:
+            assert confirmation_id == gate.confirmation_id
+            assert observation_deadline > 0
+            calls.append("observe")
+            return PhaseGAttemptEvidence(
+                request.d2_run_id,
+                "GENERATION_PENDING",
+                provider_execution_id="exec-1",
+                provider_project_id=request.provider_project_id,
+                attributed_confirmation_id=confirmation_id,
+            )
+
+        async def close(self) -> None:
+            calls.append("close")
+
+    monkeypatch.setattr(phase_g_run, "GoogleFlowAgentOnlyGenerationPort", FakePort)
+    result = await recover_late_confirmation_same_attempt(
+        request,
+        expected_email="flow-test@example.com",
+        expected_state="UNKNOWN_SUBMISSION_STATE",
+        expected_ledger_sha256=expected_sha,
+        expected_confirmation_id=gate.confirmation_id,
+        expected_video_count=1,
+        expected_credit_cost=10,
+    )
+
+    attempt = ledger.attempts()[0]
+    assert result.submission_state == "GENERATION_PENDING"
+    assert attempt["generate_action_count"] == 1
+    assert attempt["approval_action_count"] == 1
+    assert attempt["submission_state"] == "GENERATION_PENDING"
+    assert calls == ["read_gate", "approve", "observe", "close"]
+
+
+@pytest.mark.asyncio
+async def test_late_recovery_wrong_ledger_hash_does_not_open_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-run-0001")
+    called = False
+
+    class ForbiddenPort:
+        @classmethod
+        async def open(cls, **_kwargs: object) -> ForbiddenPort:
+            nonlocal called
+            called = True
+            raise AssertionError("browser must not open on a ledger mismatch")
+
+    monkeypatch.setattr(phase_g_run, "GoogleFlowAgentOnlyGenerationPort", ForbiddenPort)
+    with pytest.raises(PhaseGError) as changed:
+        await recover_late_confirmation_same_attempt(
+            request,
+            expected_email="flow-test@example.com",
+            expected_state="UNKNOWN_SUBMISSION_STATE",
+            expected_ledger_sha256="0" * 64,
+            expected_confirmation_id="a" * 64,
+            expected_video_count=1,
+            expected_credit_cost=10,
+        )
+    assert changed.value.code == "PHASE_G_LEDGER_CHANGED"
+    assert called is False
 
 
 def test_drive_finalizer_requires_remote_hash_match_before_cleanup(tmp_path: Path) -> None:

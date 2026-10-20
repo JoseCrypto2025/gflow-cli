@@ -190,6 +190,113 @@ def test_unknown_post_submit_state_reserves_remaining_daily_budget(tmp_path: Pat
     assert duplicate.value.code == "PHASE_G_DUPLICATE_SUBMIT_FORBIDDEN"
 
 
+def test_late_gate_reconciles_unknown_reservation_without_claiming_provider_charge(
+    tmp_path: Path,
+) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(phase_g_request(tmp_path))
+    _capture_ledger_baseline(ledger)
+    ledger.mark_generate_action("D2_test-run-0001")
+    ledger.record_state("D2_test-run-0001", submission_state="UNKNOWN_SUBMISSION_STATE")
+    expected_sha = sha256_file(ledger.path)
+
+    reconciled = ledger.record_late_confirmation(
+        "D2_test-run-0001",
+        expected_ledger_sha256=expected_sha,
+        confirmation_id="late-gate",
+        project_id="34e60953-e534-46e9-ac65-993893e61065",
+        video_count=1,
+        credit_cost=10,
+    )
+
+    assert reconciled["prior_unknown_reservation_credit_cost"] == "50"
+    assert reconciled["quoted_credit_cost"] == "10"
+    assert reconciled["accounted_credit_cost"] == "10"
+    assert reconciled["provider_billing_outcome"] == "UNKNOWN"
+    assert ledger.accounted_today() == Decimal("10")
+
+    approved = ledger.approve_gate(
+        "D2_test-run-0001", video_count=1, credit_cost=10, confirmation_id="late-gate"
+    )
+    assert approved["approval_action_count"] == 1
+    assert approved["submission_state"] == "COST_RESERVED_AWAITING_APPROVAL"
+    assert ledger.accounted_today() == Decimal("10")
+    with pytest.raises(PhaseGError, match="already approved"):
+        ledger.approve_gate(
+            "D2_test-run-0001", video_count=1, credit_cost=10, confirmation_id="late-gate"
+        )
+
+
+def test_late_gate_reconciliation_requires_exact_ledger_hash(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(phase_g_request(tmp_path))
+    _capture_ledger_baseline(ledger)
+    ledger.mark_generate_action("D2_test-run-0001")
+    ledger.record_state("D2_test-run-0001", submission_state="UNKNOWN_SUBMISSION_STATE")
+    with pytest.raises(PhaseGError) as changed:
+        ledger.record_late_confirmation(
+            "D2_test-run-0001",
+            expected_ledger_sha256="0" * 64,
+            confirmation_id="late-gate",
+            project_id="34e60953-e534-46e9-ac65-993893e61065",
+            video_count=1,
+            credit_cost=10,
+        )
+    assert changed.value.code == "PHASE_G_LEDGER_CHANGED"
+
+
+@pytest.mark.asyncio
+async def test_optional_confirmation_can_complete_same_single_submit(tmp_path: Path) -> None:
+    port = FakeGenerationPort()
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    async def no_gate(_baseline: FlowSubmissionBaseline, *, observation_deadline: float):
+        del observation_deadline
+        port.calls.append("no_gate")
+        return None
+
+    port.await_confirmation = no_gate  # type: ignore[method-assign]
+    port.evidence = replace(
+        port.evidence,
+        accounted_credit_cost=None,
+        attributed_confirmation_id=None,
+    )
+
+    result = await executor.execute(request)
+
+    attempt = ledger.attempts()[0]
+    assert result.submission_state == "GENERATION_SUCCEEDED"
+    assert result.confirmation_id == ""
+    assert attempt["generate_action_count"] == 1
+    assert attempt["approval_action_count"] == 0
+    assert attempt["accounted_credit_cost"] == "50"
+    assert attempt["provider_billing_outcome"] == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_provider_progress_before_late_gate_is_observed_without_approval(
+    tmp_path: Path,
+) -> None:
+    port = FakeGenerationPort()
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    async def late_gate_after_progress(
+        _baseline: FlowSubmissionBaseline, *, observation_deadline: float
+    ) -> FlowConfirmationGate:
+        del observation_deadline
+        return replace(port.gate, progress_before_confirmation=True)
+
+    port.await_confirmation = late_gate_after_progress  # type: ignore[method-assign]
+    port.evidence = replace(port.evidence, attributed_confirmation_id=None)
+
+    result = await executor.execute(request)
+
+    assert result.submission_state == "GENERATION_SUCCEEDED"
+    assert port.calls.count("generate") == 1
+    assert port.calls.count("approve") == 0
+    assert ledger.attempts()[0]["approval_action_count"] == 0
+
+
 def test_ledger_rejects_over_budget_and_unexpected_state_transitions(tmp_path: Path) -> None:
     ledger = D2DailyCreditLedger(tmp_path / "runtime")
     ledger.create_attempt(phase_g_request(tmp_path))
@@ -304,7 +411,9 @@ class FakeGenerationPort:
         if self.raise_after_click:
             raise TimeoutError("ambiguous post-click timeout")
 
-    async def await_confirmation(self, baseline: FlowSubmissionBaseline) -> FlowConfirmationGate:
+    async def await_confirmation(
+        self, baseline: FlowSubmissionBaseline, *, observation_deadline: float
+    ) -> FlowConfirmationGate | None:
         self.calls.append("gate")
         return self.gate
 
@@ -313,7 +422,11 @@ class FakeGenerationPort:
         assert confirmation_id == self.gate.confirmation_id
 
     async def observe_attempt(
-        self, baseline: FlowSubmissionBaseline, confirmation_id: str
+        self,
+        baseline: FlowSubmissionBaseline,
+        confirmation_id: str | None,
+        *,
+        observation_deadline: float,
     ) -> PhaseGAttemptEvidence:
         self.calls.append("observe")
         if self.raise_waf_on_observe:

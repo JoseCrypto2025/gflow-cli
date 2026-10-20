@@ -20,9 +20,17 @@ applies the pinned model, mode, aspect ratio, output count, and confirmation
 policy `Always`, then verifies readback. The baseline of existing media,
 executions, pending tiles, confirmation IDs, and Agent turn is captured
 immediately before the one allowed Generate action and durably recorded in the
-attempt ledger. The fresh confirmation ID and quote are recorded before
-approval so a later observer can reconcile that same attempt. A pending
-unrelated job blocks the attempt.
+attempt ledger. Confirmation may be late or optional: the executor observes the
+same attempt for one bounded 240-second window, polls for a newly attributable
+gate, retains sanitized pending/media/Agent-turn progress, and does not fail
+merely because a gate did not appear in the first 30 seconds. A newly observed
+gate and quote are recorded before one approval, after which observation
+continues against the same baseline. A missing gate never authorizes a retry;
+provider execution/media evidence is still subject to the same exact
+project/baseline/one-output attribution rules. A pending unrelated job blocks
+the attempt. If provider execution/media/pending evidence appears before a gate,
+the controller stops waiting for approval and observes that same attempt without
+approving a later gate; ambiguous billing remains conservatively reserved.
 
 The live Flow port requires an expected account email. It compares that value
 to the repository auth verifier's observed Google identity before the browser
@@ -52,6 +60,14 @@ Definitive no-charge outcomes account for zero. If submission outcome becomes
 ambiguous, the quoted charge—or the remaining daily budget when no quote is
 known—is reserved until reconciliation. New provider execution IDs are retained
 as pending acknowledgments instead of being discarded on observation timeout.
+When a late quote is revalidated for an UNKNOWN attempt, a SHA-guarded ledger
+operation records the previous conservative reservation separately and replaces
+the task-local reservation with the one-video quote before approval. The ledger
+continues to report provider billing as `UNKNOWN`; a quote is not evidence of an
+actual provider charge. The dedicated same-attempt recovery operator requires
+the expected ledger hash, unknown non-terminal state, one Generate action, zero
+prior approvals, exact TEST identity, and an exact live gate fingerprint. It
+cannot fill a prompt or click Generate.
 WAF refusal, unresolved attempts, already successful D2 output, and every
 recorded Generate action prevent another paid attempt. An already generated
 media ID may be recovered and validated again under the same D2 run ID; this

@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now points at `--refresh` / `gflow auth renew` instead of "check your balance in Flow"; an
   account whose labs session issues no token at all is not helped by renewal, and says so.
 
+### Changed
+
+- **Phase G tolerates late or optional confirmation and reconciles the same unknown D2 attempt.**
+  The submit path observes for a bounded window instead of failing after a mandatory 30-second
+  gate wait. A SHA-guarded recovery records one exact late quote, preserves the prior conservative
+  reservation as evidence, permits at most one approval, and never resubmits Generate. Missing
+  quote or provider charge remains explicitly unknown.
+
 
 ## [0.85.0] — 2026-10-14
 

@@ -163,6 +163,11 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._generate_clicked = False
         self._approved_gate_id: str | None = None
         self._page: Page | None = None
+        self._observed_media_ids: set[str] = set()
+        self._observed_finished_media_ids: set[str] = set()
+        self._observed_peak_pending = 0
+        self._observed_new_turn = False
+        self._observed_head_changed = False
 
     @classmethod
     async def open(
@@ -362,9 +367,11 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._generate_clicked = True
         await submit.click(timeout=5_000)
 
-    async def await_confirmation(self, baseline: FlowSubmissionBaseline) -> FlowConfirmationGate:
-        """Wait for exactly one new gate and parse its count/cost without approving it."""
-        deadline = time.monotonic() + 30
+    async def await_confirmation(
+        self, baseline: FlowSubmissionBaseline, *, observation_deadline: float
+    ) -> FlowConfirmationGate | None:
+        """Observe a late/optional gate for the remainder of the bounded submit window."""
+        deadline = observation_deadline
         while time.monotonic() < deadline:
             await self._raise_wire_refusal()
             gates = self._require_page().locator(_LIVE_GATE)
@@ -375,6 +382,7 @@ class GoogleFlowAgentOnlyGenerationPort:
                     "UNEXPECTED_SECOND_CONFIRMATION", "more than one new Flow gate appeared"
                 )
             if new_count == 1:
+                await self._capture_progress(baseline)
                 gate = gates.last
                 markup = await gate.evaluate("el => el.outerHTML")
                 gate_id = _gate_digest(markup)
@@ -384,11 +392,38 @@ class GoogleFlowAgentOnlyGenerationPort:
                     )
                 text = await gate.inner_text()
                 video_count, cost = parse_confirmation_quote(text)
-                self._approved_gate_id = gate_id
-                return FlowConfirmationGate(gate_id, baseline.project_id, video_count, cost, None)
-            await asyncio.sleep(0.25)
+                progress = self._provider_progress_present(baseline)
+                if not progress:
+                    self._approved_gate_id = gate_id
+                return FlowConfirmationGate(
+                    gate_id, baseline.project_id, video_count, cost, None, progress
+                )
+            await self._capture_progress(baseline)
+            if self._provider_progress_present(baseline):
+                return None
+            await asyncio.sleep(1)
         await self._raise_wire_refusal()
-        raise PhaseGError("PHASE_G_CONFIRMATION_TIMEOUT", "no new Flow confirmation gate appeared")
+        return None
+
+    async def read_current_confirmation(
+        self, baseline: FlowSubmissionBaseline
+    ) -> FlowConfirmationGate:
+        """Read exactly one currently visible post-baseline gate without waiting or clicking."""
+        gates = self._require_page().locator(_LIVE_GATE)
+        if await gates.count() != 1:
+            raise PhaseGError(
+                "PHASE_G_CONFIRMATION_NOT_ATTRIBUTABLE", "exactly one live confirmation is required"
+            )
+        gate = gates.first
+        gate_id = _gate_digest(await gate.evaluate("el => el.outerHTML"))
+        if gate_id in baseline.confirmation_ids:
+            raise PhaseGError("PHASE_G_STALE_CONFIRMATION", "Flow gate matches the baseline")
+        video_count, cost = parse_confirmation_quote(await gate.inner_text())
+        await self._capture_progress(baseline)
+        progress = self._provider_progress_present(baseline)
+        if not progress:
+            self._approved_gate_id = gate_id
+        return FlowConfirmationGate(gate_id, baseline.project_id, video_count, cost, None, progress)
 
     async def approve_confirmation(self, confirmation_id: str) -> None:
         """Approve only the one-time choice after revalidating gate identity and quote."""
@@ -418,15 +453,21 @@ class GoogleFlowAgentOnlyGenerationPort:
         await choices.first.click(timeout=5_000)
 
     async def observe_attempt(
-        self, baseline: FlowSubmissionBaseline, confirmation_id: str
+        self,
+        baseline: FlowSubmissionBaseline,
+        confirmation_id: str | None,
+        *,
+        observation_deadline: float,
     ) -> PhaseGAttemptEvidence:
         """Observe only a new TEST-project media ID tied to the new Agent turn."""
         request = self._require_request()
         if self._approved_gate_id is not None:
             raise PhaseGError("PHASE_G_GATE_NOT_APPROVED", "new gate was not approved")
-        deadline = time.monotonic() + 240
-        peak_pending = 0
-        while time.monotonic() < deadline:
+        deadline = observation_deadline
+        peak_pending = self._observed_peak_pending
+        first_observation = True
+        while first_observation or time.monotonic() < deadline:
+            first_observation = False
             await self._raise_wire_refusal()
             page = self._require_page()
             state = await page.evaluate(_VIDEO_STATE_JS)
@@ -470,7 +511,8 @@ class GoogleFlowAgentOnlyGenerationPort:
                     attributed_confirmation_id=confirmation_id,
                     new_provider_media_ids=ids,
                 )
-            media_ids = set(self._valid_ids(state.get("media_ids")))
+            media_ids = set(self._observed_media_ids)
+            media_ids.update(self._valid_ids(state.get("media_ids")))
             media_ids.update(self._valid_ids(state.get("chat_media_ids")))
             media_ids.difference_update(baseline.media_ids)
             if wire_done:
@@ -478,12 +520,15 @@ class GoogleFlowAgentOnlyGenerationPort:
             baseline_chat_count, _, baseline_chat_hash = (baseline.agent_turn_id or "0:").partition(
                 ":"
             )
-            new_turn = (
+            new_turn = self._observed_new_turn or (
                 self._integer(state.get("chat_count")) > int(baseline_chat_count or "0")
                 and str(state.get("chat_tail_hash") or "") != baseline_chat_hash
             )
-            finished_ids = set(self._valid_ids(state.get("finished_media_ids")))
-            head_changed = self._head_key(state.get("finished_keys")) != self._baseline_head_key
+            finished_ids = set(self._observed_finished_media_ids)
+            finished_ids.update(self._valid_ids(state.get("finished_media_ids")))
+            head_changed = self._observed_head_changed or (
+                self._head_key(state.get("finished_keys")) != self._baseline_head_key
+            )
             if len(media_ids) > 1:
                 ids = tuple(sorted(media_ids))
                 return PhaseGAttemptEvidence(
@@ -521,6 +566,18 @@ class GoogleFlowAgentOnlyGenerationPort:
                     attributed_confirmation_id=confirmation_id,
                     new_provider_media_ids=(media_id,),
                 )
+            if time.monotonic() >= deadline and peak_pending:
+                return PhaseGAttemptEvidence(
+                    request.d2_run_id,
+                    "GENERATION_PENDING",
+                    provider_execution_id=wire_new[0].workflow_id if wire_new else None,
+                    provider_media_id=wire_new[0].media_id if wire_new else None,
+                    provider_project_id=request.provider_project_id,
+                    attributed_confirmation_id=confirmation_id,
+                    new_provider_media_ids=tuple(sorted(media_ids)),
+                )
+            if time.monotonic() >= deadline:
+                break
             await asyncio.sleep(1)
         wire_pending = [
             record
@@ -607,6 +664,42 @@ class GoogleFlowAgentOnlyGenerationPort:
                     "Stop Phase G live testing for this task/day; do not retry or rotate profiles."
                 ),
             )
+
+    async def _capture_progress(self, baseline: FlowSubmissionBaseline) -> None:
+        """Retain sanitized provider progress while a late/optional gate is observed."""
+        state_value = await self._require_page().evaluate(_VIDEO_STATE_JS)
+        if not isinstance(state_value, dict):
+            return
+        state = cast(dict[str, object], state_value)
+        self._observed_peak_pending = max(
+            self._observed_peak_pending, self._integer(state.get("pending"))
+        )
+        media_ids = set(self._valid_ids(state.get("media_ids")))
+        media_ids.update(self._valid_ids(state.get("chat_media_ids")))
+        self._observed_media_ids.update(media_ids - baseline.media_ids)
+        self._observed_finished_media_ids.update(
+            set(self._valid_ids(state.get("finished_media_ids"))) - baseline.media_ids
+        )
+        baseline_count, _, baseline_hash = (baseline.agent_turn_id or "0:").partition(":")
+        self._observed_new_turn = self._observed_new_turn or (
+            self._integer(state.get("chat_count")) > int(baseline_count or "0")
+            and str(state.get("chat_tail_hash") or "") != baseline_hash
+        )
+        self._observed_head_changed = self._observed_head_changed or (
+            self._head_key(state.get("finished_keys")) != self._baseline_head_key
+        )
+
+    def _provider_progress_present(self, baseline: FlowSubmissionBaseline) -> bool:
+        return bool(
+            self._observed_peak_pending
+            or self._observed_media_ids
+            or self._observed_finished_media_ids
+            or any(
+                record.media_id.lower() not in baseline.media_ids
+                or record.workflow_id.lower() not in baseline.execution_ids
+                for record in self._records.values()
+            )
+        )
 
     async def _confirmation_ids(self) -> set[str]:
         gates = self._require_page().locator(_LIVE_GATE)
