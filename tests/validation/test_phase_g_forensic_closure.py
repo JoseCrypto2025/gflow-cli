@@ -73,6 +73,13 @@ def test_evidence_contract_is_complete_and_rejects_unsupported_fields() -> None:
         validate_forensic_evidence(raw_data)
 
 
+def test_v1_contract_still_rejects_any_project_chat() -> None:
+    evidence = _evidence()
+    evidence["CURRENT_PROJECT_CHAT_COUNT"] = 1
+    with pytest.raises(PhaseGError, match="zero observed activity"):
+        validate_forensic_evidence(evidence)
+
+
 def test_dry_run_previews_without_mutating_and_preserves_reservation(tmp_path: Path) -> None:
     ledger, run_id = _unknown_ledger(tmp_path)
     before = ledger.path.read_bytes()

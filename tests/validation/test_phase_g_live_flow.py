@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,6 +53,11 @@ class _Page:
         }
 
 
+class _Base:
+    async def select_project(self, project_id: str) -> SimpleNamespace:
+        return SimpleNamespace(project_id=project_id)
+
+
 def _port(gate_after_polls: int | None) -> GoogleFlowAgentOnlyGenerationPort:
     port = GoogleFlowAgentOnlyGenerationPort.__new__(GoogleFlowAgentOnlyGenerationPort)
     port._page = _Page(_Locator(gate_after_polls))  # type: ignore[assignment]
@@ -88,14 +94,43 @@ async def test_live_adapter_observes_gate_after_initial_30_second_window(
     async def no_wait(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr(live_flow.time, "monotonic", monotonic)
-    monkeypatch.setattr(live_flow.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", no_wait)
     gate = await port.await_confirmation(_baseline(), observation_deadline=500)
 
     assert gate is not None
     assert gate.video_count == 1
     assert gate.credit_cost == 10
     assert gate.confirmation_id == hashlib.sha256(b"<gate>late confirmation</gate>").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_live_adapter_persists_ordered_baseline_chat_hashes() -> None:
+    port = _port(gate_after_polls=None)
+    port._base = _Base()  # type: ignore[assignment]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+    hashes = [hashlib.sha256(b"chat one").hexdigest(), hashlib.sha256(b"chat two").hexdigest()]
+    port._page.evaluate = lambda _script: _async_result(  # type: ignore[method-assign]
+        {
+            "pending": 0,
+            "media_ids": [],
+            "finished_media_ids": [],
+            "finished_keys": [],
+            "chat_count": 2,
+            "chat_tail_hash": "tail",
+            "chat_media_ids": [],
+            "chat_bubble_hashes": hashes,
+        }
+    )
+
+    baseline = await port.capture_submission_baseline()
+
+    assert baseline.agent_turn_id == "2:tail"
+    assert baseline.agent_turn_bubble_hashes == tuple(hashes)
+
+
+async def _async_result(value: dict[str, object]) -> dict[str, object]:
+    return value
 
 
 @pytest.mark.asyncio
@@ -114,8 +149,8 @@ async def test_live_adapter_returns_no_gate_without_failing_after_bounded_wait(
     async def no_wait(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr(live_flow.time, "monotonic", monotonic)
-    monkeypatch.setattr(live_flow.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", no_wait)
     gate = await port.await_confirmation(_baseline(), observation_deadline=4)
 
     assert gate is None
@@ -151,8 +186,8 @@ async def test_read_current_confirmation_waits_for_hydrated_single_gate(
         nonlocal now
         now += seconds
 
-    monkeypatch.setattr(live_flow.time, "monotonic", monotonic)
-    monkeypatch.setattr(live_flow.asyncio, "sleep", advance)
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", advance)
 
     gate = await port.read_current_confirmation(_baseline())
 
@@ -177,8 +212,8 @@ async def test_read_current_confirmation_fails_closed_after_zero_gate_timeout(
         nonlocal now
         now += seconds
 
-    monkeypatch.setattr(live_flow.time, "monotonic", monotonic)
-    monkeypatch.setattr(live_flow.asyncio, "sleep", advance)
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", advance)
 
     with pytest.raises(PhaseGError, match=r"observed count = 0") as error:
         await port.read_current_confirmation(_baseline())
@@ -200,7 +235,7 @@ async def test_read_current_confirmation_rejects_multiple_gates_immediately(
     async def record_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr(live_flow.asyncio, "sleep", record_sleep)
+    monkeypatch.setattr(live_flow, "_async_sleep", record_sleep)
 
     with pytest.raises(PhaseGError, match=r"observed count = 2") as error:
         await port.read_current_confirmation(_baseline())
@@ -250,8 +285,8 @@ async def test_read_current_confirmation_readiness_never_approves_generates_or_m
 
     port.approve_confirmation = forbidden  # type: ignore[method-assign]
     port.click_generate_once = forbidden  # type: ignore[method-assign]
-    monkeypatch.setattr(live_flow.time, "monotonic", monotonic)
-    monkeypatch.setattr(live_flow.asyncio, "sleep", advance)
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", advance)
 
     gate = await port.read_current_confirmation(_baseline())
 

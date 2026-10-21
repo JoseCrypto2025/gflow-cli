@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Versioned D2 forensic closure V2 for chat-only unresolved activity.** Adds
+  sanitized baseline-relative chat evidence and a separate fail-closed dry-run /
+  apply path while leaving V1 closure behavior unchanged. Closure preserves
+  unknown provider and billing outcomes, the existing credit reservation, and
+  D6 ineligibility.
+
 - **OAuth bootstrap stages and verifies Google credentials before promotion.** A candidate is tested as the gflow service user against the approved 34-table Sheet and writable Drive folder before atomic promotion; failed or uncertain promotion is reconciled without discarding the prior canonical credential.
 - **Offline PROD guard and persistence adapters.** Added an explicit production identity context, one shared provider/day free-credit ledger, bounded optimistic Sheet operations for existing job tabs, and an idempotent Drive artifact adapter with exact download verification. OAuth-gated live Sheet/Drive writes and provider generation were not run.
 - **Immutable V2 prompt-version lifecycle.** Added a fail-closed operator workflow to build a fresh Phase E candidate, persist it, validate exact text and hashes, and switch approval status with optimistic checks and readback. Current approval remains status-derived from the existing schema; no provider call is made.

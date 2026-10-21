@@ -76,6 +76,11 @@ async () => {
         : image ? (image.currentSrc || image.src || '') : '';
     }),
     chat_count: chat.length,
+    chat_bubble_hashes: await Promise.all(chat.map(async bubble => {
+      const text = (bubble.innerText || bubble.textContent || '').trim();
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, '0')).join('');
+    })),
     chat_tail_hash: chat.length
       ? [...new Uint8Array(await crypto.subtle.digest(
           'SHA-256', new TextEncoder().encode(chat[chat.length - 1].outerHTML)))].map(
@@ -96,6 +101,16 @@ _AMBIGUOUS_CREDIT_RANGE_RE = re.compile(
     r"\b\d+(?:[.,]\d+)?\s*(?:or|/|to)\s*\d+(?:[.,]\d+)?\s+credits?\b", re.I
 )
 _VIDEO_RPCS = frozenset({"YhhmEf", "eb1hJf", "MZZa6b", "jwpduf", "as29s"})
+
+
+def _monotonic() -> float:
+    """Read the monotonic clock through a module-local test seam."""
+    return time.monotonic()
+
+
+async def _async_sleep(seconds: float) -> None:
+    """Sleep through a module-local seam so tests do not patch asyncio globally."""
+    await asyncio.sleep(seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +331,22 @@ class GoogleFlowAgentOnlyGenerationPort:
         state = cast(dict[str, object], state)
         gate_ids = await self._confirmation_ids()
         chat_ids = state.get("chat_media_ids", [])
+        chat_count = self._integer(state.get("chat_count"))
+        chat_bubble_hashes = state.get("chat_bubble_hashes")
+        bubble_hash_items = (
+            cast(list[object], chat_bubble_hashes) if isinstance(chat_bubble_hashes, list) else []
+        )
+        if (
+            not isinstance(chat_bubble_hashes, list)
+            or len(bubble_hash_items) != chat_count
+            or any(
+                not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in bubble_hash_items
+            )
+        ):
+            raise PhaseGError(
+                "PHASE_G_BASELINE_UNREADABLE", "Flow chat baseline hashes are unreadable"
+            )
         media_ids = set(self._valid_ids(state.get("media_ids")))
         media_ids.update(self._valid_ids(chat_ids))
         media_ids.update(record.media_id.lower() for record in self._records.values())
@@ -327,7 +358,8 @@ class GoogleFlowAgentOnlyGenerationPort:
             frozenset(execution_ids),
             pending,
             frozenset(gate_ids),
-            f"{self._integer(state.get('chat_count'))}:{state.get('chat_tail_hash') or ''}",
+            f"{chat_count}:{state.get('chat_tail_hash') or ''}",
+            tuple(cast(list[str], bubble_hash_items)),
         )
         self._baseline = baseline
         self._baseline_head_key = self._head_key(state.get("finished_keys"))
@@ -374,7 +406,7 @@ class GoogleFlowAgentOnlyGenerationPort:
     ) -> FlowConfirmationGate | None:
         """Observe a late/optional gate for the remainder of the bounded submit window."""
         deadline = observation_deadline
-        while time.monotonic() < deadline:
+        while _monotonic() < deadline:
             await self._raise_wire_refusal()
             gates = self._require_page().locator(_LIVE_GATE)
             count = await gates.count()
@@ -403,7 +435,7 @@ class GoogleFlowAgentOnlyGenerationPort:
             await self._capture_progress(baseline)
             if self._provider_progress_present(baseline):
                 return None
-            await asyncio.sleep(1)
+            await _async_sleep(1)
         await self._raise_wire_refusal()
         return None
 
@@ -417,7 +449,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         keeping the gate check bounded and read-only.
         """
         gates = self._require_page().locator(_LIVE_GATE)
-        deadline = time.monotonic() + _RECOVERY_GATE_HYDRATION_TIMEOUT_SECONDS
+        deadline = _monotonic() + _RECOVERY_GATE_HYDRATION_TIMEOUT_SECONDS
         while True:
             count = await gates.count()
             if count > 1:
@@ -427,12 +459,12 @@ class GoogleFlowAgentOnlyGenerationPort:
                 )
             if count == 1:
                 break
-            if time.monotonic() >= deadline:
+            if _monotonic() >= deadline:
                 raise PhaseGError(
                     "PHASE_G_CONFIRMATION_NOT_ATTRIBUTABLE",
                     "observed count = 0 after 15s recovery gate hydration timeout",
                 )
-            await asyncio.sleep(_RECOVERY_GATE_POLL_INTERVAL_SECONDS)
+            await _async_sleep(_RECOVERY_GATE_POLL_INTERVAL_SECONDS)
         gate = gates.first
         gate_id = _gate_digest(await gate.evaluate("el => el.outerHTML"))
         if gate_id in baseline.confirmation_ids:
@@ -485,13 +517,13 @@ class GoogleFlowAgentOnlyGenerationPort:
         deadline = observation_deadline
         peak_pending = self._observed_peak_pending
         first_observation = True
-        while first_observation or time.monotonic() < deadline:
+        while first_observation or _monotonic() < deadline:
             first_observation = False
             await self._raise_wire_refusal()
             page = self._require_page()
             state = await page.evaluate(_VIDEO_STATE_JS)
             if not isinstance(state, dict):
-                await asyncio.sleep(1)
+                await _async_sleep(1)
                 continue
             state = cast(dict[str, object], state)
             pending = self._integer(state.get("pending"))
@@ -585,7 +617,7 @@ class GoogleFlowAgentOnlyGenerationPort:
                     attributed_confirmation_id=confirmation_id,
                     new_provider_media_ids=(media_id,),
                 )
-            if time.monotonic() >= deadline and peak_pending:
+            if _monotonic() >= deadline and peak_pending:
                 return PhaseGAttemptEvidence(
                     request.d2_run_id,
                     "GENERATION_PENDING",
@@ -595,9 +627,9 @@ class GoogleFlowAgentOnlyGenerationPort:
                     attributed_confirmation_id=confirmation_id,
                     new_provider_media_ids=tuple(sorted(media_ids)),
                 )
-            if time.monotonic() >= deadline:
+            if _monotonic() >= deadline:
                 break
-            await asyncio.sleep(1)
+            await _async_sleep(1)
         wire_pending = [
             record
             for record in self._records.values()

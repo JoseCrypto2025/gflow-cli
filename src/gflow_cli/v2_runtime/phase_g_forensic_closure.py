@@ -7,14 +7,19 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from datetime import datetime
 from pathlib import Path
 from typing import cast
 
 import click
 
 from .phase_g import D2DailyCreditLedger, PhaseGError
-from .phase_g_artifacts import sha256_file
+from .phase_g_forensic_common import (
+    add_operator_arguments,
+    preview_result,
+    sanitized_reason,
+    timestamp_error,
+    verified_ledger_attempt,
+)
 
 _REQUIRED_TRUE = (
     "CANONICAL_LEDGER_FOUND",
@@ -95,20 +100,15 @@ def validate_forensic_evidence(evidence: Mapping[str, object]) -> dict[str, obje
             "evidence must preserve the unknown classification and prohibit retry",
         )
     completed_at = evidence.get("FORENSIC_COMPLETED_AT")
-    if not isinstance(completed_at, str):
+    time_error = timestamp_error(completed_at)
+    if time_error == "invalid":
         raise PhaseGError("PHASE_G_FORENSIC_TIME_INVALID", "forensic completion time is invalid")
-    try:
-        parsed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise PhaseGError(
-            "PHASE_G_FORENSIC_TIME_INVALID", "forensic completion time is invalid"
-        ) from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
+    if time_error == "offset":
         raise PhaseGError(
             "PHASE_G_FORENSIC_TIME_INVALID", "forensic completion time must include a UTC offset"
         )
     reason = evidence.get("FORENSIC_REASON")
-    if not isinstance(reason, str) or not _REASON_RE.fullmatch(reason):
+    if not sanitized_reason(reason, _REASON_RE):
         raise PhaseGError(
             "PHASE_G_FORENSIC_REASON_INVALID", "forensic reason must be a short sanitized statement"
         )
@@ -188,19 +188,9 @@ def forensic_closure_preview(
         )
     if not re.fullmatch(r"[0-9a-f]{40,64}", implementation_commit):
         raise PhaseGError("PHASE_G_FORENSIC_COMMIT_INVALID", "implementation commit SHA is invalid")
-    ledger = D2DailyCreditLedger(runtime_state_root)
-    if ledger.path.is_symlink() or not ledger.path.is_file():
-        raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "D2 ledger is missing or unsafe")
-    actual_sha = sha256_file(ledger.path)
-    if actual_sha != expected_ledger_sha256:
-        raise PhaseGError(
-            "PHASE_G_LEDGER_CHANGED", "D2 ledger SHA differs from operator expectation"
-        )
-    attempt = next((row for row in ledger.attempts() if row.get("d2_run_id") == d2_run_id), None)
-    if attempt is None:
-        raise PhaseGError(
-            "PHASE_G_ATTEMPT_NOT_FOUND", "D2 attempt does not exist in the local ledger"
-        )
+    actual_sha, attempt = verified_ledger_attempt(
+        runtime_state_root, d2_run_id=d2_run_id, expected_sha256=expected_ledger_sha256
+    )
     if (
         expected_state != "UNKNOWN_SUBMISSION_STATE"
         or attempt.get("submission_state") != expected_state
@@ -226,26 +216,19 @@ def forensic_closure_preview(
             "PHASE_G_GENERATE_COUNT_MISMATCH",
             "forensic closure requires exactly one Generate action",
         )
-    return {
-        "ledger_sha256": actual_sha,
-        "evidence_sha256": evidence_sha256,
-        "implementation_commit": implementation_commit,
-        "attempt": dict(attempt),
-        "evidence": summary,
-    }
+    return preview_result(
+        ledger_sha256=actual_sha,
+        evidence_sha256=evidence_sha256,
+        implementation_commit=implementation_commit,
+        attempt=attempt,
+        evidence=summary,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     """Preview by default; mutate only with --apply and an exact concurrency guard."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runtime-state-root", type=Path, required=True)
-    parser.add_argument("--d2-run-id", required=True)
-    parser.add_argument("--expected-current-state", required=True)
-    parser.add_argument("--expected-ledger-sha256", required=True)
-    parser.add_argument("--expected-evidence-sha256", required=True)
-    parser.add_argument("--implementation-commit", required=True)
-    parser.add_argument("--evidence-json", type=Path, required=True)
-    parser.add_argument("--apply", action="store_true", help="apply the reviewed terminal closure")
+    add_operator_arguments(parser, apply_help="apply the reviewed terminal closure")
     args = parser.parse_args(argv)
     try:
         evidence, evidence_sha256 = load_evidence(args.evidence_json)

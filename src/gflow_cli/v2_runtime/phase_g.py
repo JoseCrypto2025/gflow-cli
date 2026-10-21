@@ -207,6 +207,7 @@ class FlowSubmissionBaseline:
     pending_count: int
     confirmation_ids: frozenset[str]
     agent_turn_id: str | None
+    agent_turn_bubble_hashes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1086,6 +1087,7 @@ class D2DailyCreditLedger:
                 baseline_pending_count=baseline.pending_count,
                 baseline_confirmation_ids=sorted(baseline.confirmation_ids),
                 baseline_agent_turn_id=baseline.agent_turn_id,
+                baseline_agent_turn_bubble_hashes=list(baseline.agent_turn_bubble_hashes),
                 updated_at=_utc_now(),
             )
             return dict(attempt)
@@ -1548,6 +1550,148 @@ class D2DailyCreditLedger:
             self._write(payload)
             return dict(attempt)
 
+    def close_unknown_forensic_v2(
+        self,
+        d2_run_id: str,
+        *,
+        expected_ledger_sha256: str,
+        evidence_sha256: str,
+        implementation_commit: str,
+        evidence: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Close a chat-only unknown attempt under the separate V2 evidence contract."""
+        if not _SHA256_RE.fullmatch(expected_ledger_sha256):
+            raise PhaseGError("PHASE_G_LEDGER_SHA_INVALID", "expected ledger SHA-256 is invalid")
+        if not _SHA256_RE.fullmatch(evidence_sha256):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_HASH_INVALID", "evidence SHA-256 is invalid"
+            )
+        if not re.fullmatch(r"[0-9a-f]{40,64}", implementation_commit):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_COMMIT_INVALID", "implementation commit SHA is invalid"
+            )
+
+        from .phase_g_forensic_closure_v2 import (
+            forensic_evidence_digest_v2,
+            validate_forensic_evidence_v2,
+        )
+
+        summary = validate_forensic_evidence_v2(evidence)
+        if summary["D2_RUN_ID"] != d2_run_id:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INVALID", "evidence belongs to a different D2 run"
+            )
+        if summary["CANONICAL_LEDGER_SHA256"] != expected_ledger_sha256:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INVALID",
+                "evidence names a different canonical ledger SHA",
+            )
+        if forensic_evidence_digest_v2(summary) != evidence_sha256:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_HASH_MISMATCH",
+                "V2 evidence SHA differs from canonical evidence content",
+            )
+        with self._locked_file():
+            if self.path.is_symlink() or not self.path.is_file():
+                raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "D2 ledger is missing or unsafe")
+            try:
+                current_sha256 = sha256_file(self.path)
+            except OSError as exc:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_READ_FAILED", "D2 ledger could not be hashed"
+                ) from exc
+            if current_sha256 != expected_ledger_sha256:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CHANGED", "D2 ledger changed since operator review"
+                )
+            payload = self._read()
+            attempt = self._attempt(payload, d2_run_id)
+            if attempt.get("submission_state") != "UNKNOWN_SUBMISSION_STATE":
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_STATE_MISMATCH",
+                    "V2 forensic closure requires UNKNOWN_SUBMISSION_STATE",
+                )
+            if attempt.get("terminal_state") is not None:
+                raise PhaseGError("PHASE_G_ATTEMPT_TERMINAL", "D2 attempt is already terminal")
+            if (
+                attempt.get("provider_media_id")
+                or attempt.get("provider_execution_id")
+                or attempt.get("provider_media_ids")
+            ):
+                raise PhaseGError(
+                    "PHASE_G_PROVIDER_OUTCOME_PRESENT",
+                    "provider identities require provider-outcome reconciliation",
+                )
+            generate_count = attempt.get("generate_action_count")
+            approval_count = attempt.get("approval_action_count")
+            if isinstance(generate_count, bool) or generate_count != 1:
+                raise PhaseGError(
+                    "PHASE_G_GENERATE_COUNT_MISMATCH",
+                    "V2 forensic closure requires exactly one Generate action",
+                )
+            if (
+                isinstance(approval_count, bool)
+                or not isinstance(approval_count, int)
+                or approval_count > 1
+                or approval_count != summary["APPROVAL_ACTION_COUNT"]
+            ):
+                raise PhaseGError(
+                    "PHASE_G_GENERATE_COUNT_MISMATCH",
+                    "V2 approval count differs from persisted attempt",
+                )
+            if attempt.get("provider_billing_outcome") != "UNKNOWN":
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_STATE_MISMATCH",
+                    "provider billing outcome must remain UNKNOWN",
+                )
+            if (
+                attempt.get("provider_outcome", "UNKNOWN") != "UNKNOWN"
+                or attempt.get("credit_outcome", "UNKNOWN") != "UNKNOWN"
+            ):
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_STATE_MISMATCH",
+                    "provider and credit outcomes must remain UNKNOWN",
+                )
+            if attempt.get("accounted_credit_cost") is None:
+                raise PhaseGError(
+                    "PHASE_G_ACCOUNTING_MISSING", "historical credit reservation is missing"
+                )
+            if (
+                attempt.get("accounted_credit_cost") != summary["ACCOUNTED_CREDIT_COST_EXPECTED"]
+                or attempt.get("prompt_sha256") != summary["PROMPT_SHA256"]
+                or attempt.get("baseline_agent_turn_id") != summary["BASELINE_AGENT_TURN_ID"]
+                or attempt.get("baseline_confirmation_ids") != summary["BASELINE_CONFIRMATION_IDS"]
+            ):
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_EVIDENCE_INVALID",
+                    "V2 evidence differs from persisted attempt",
+                )
+            baseline_hashes = attempt.get("baseline_agent_turn_bubble_hashes")
+            if baseline_hashes is None and summary["BASELINE_CHAT_COUNT"] == 0:
+                baseline_hashes = []
+            if baseline_hashes != summary["BASELINE_CHAT_BUBBLE_SHA256S"]:
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                    "persisted ordered baseline chat hashes are missing or differ",
+                )
+            attempt.update(
+                submission_state="FORENSICALLY_CLOSED_UNKNOWN",
+                terminal_state="FORENSICALLY_CLOSED_UNKNOWN",
+                provider_outcome="UNKNOWN",
+                credit_outcome="UNKNOWN",
+                provider_billing_outcome="UNKNOWN",
+                forensic_closure_contract_version="D2_FORENSIC_CLOSURE_V2",
+                forensic_classification="CHAT_ONLY_UNRESOLVED_ACTIVITY",
+                forensic_closed_at=summary["FORENSIC_COMPLETED_AT"],
+                forensic_reason=summary["FORENSIC_REASON"],
+                forensic_evidence_sha256=evidence_sha256,
+                forensic_implementation_commit=implementation_commit,
+                forensic_closure_evidence=summary,
+                updated_at=_utc_now(),
+            )
+            self._write(payload)
+            return dict(attempt)
+
     def attempts(self) -> tuple[Mapping[str, object], ...]:
         """Return a defensive snapshot of the sanitized attempt records."""
         with self._locked_file():
@@ -1813,6 +1957,7 @@ class D2DailyCreditLedger:
             "baseline_pending_count": None,
             "baseline_confirmation_ids": [],
             "baseline_agent_turn_id": None,
+            "baseline_agent_turn_bubble_hashes": [],
             "confirmation_id": None,
             "accounting_date": None,
             "accounted_credit_cost": "0",

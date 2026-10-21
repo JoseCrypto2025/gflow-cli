@@ -222,6 +222,11 @@ prompt. Keep execution, debugging, code modification, and paid approval in separ
 Before any D2 same-attempt recovery execution, also read
 [`docs/ai-video-automation-v2/operations/D2_SAME_ATTEMPT_RECOVERY_V1.md`](docs/ai-video-automation-v2/operations/D2_SAME_ATTEMPT_RECOVERY_V1.md).
 
+Before any D2 forensic closure, read the applicable versioned contract. V2
+chat-only closure is governed by
+[`docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md`](docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md);
+the V1 contract remains frozen with its original absolute-zero-chat rule.
+
 ### The Iron Law — done means verified by a run
 
 ```

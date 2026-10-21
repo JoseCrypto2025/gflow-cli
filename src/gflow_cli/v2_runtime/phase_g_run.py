@@ -361,6 +361,7 @@ async def recover_late_confirmation_same_attempt(
     baseline_ids = _string_list(attempt.get("baseline_media_ids"))
     execution_ids = _string_list(attempt.get("baseline_execution_ids"))
     confirmation_ids = _string_list(attempt.get("baseline_confirmation_ids"))
+    chat_bubble_hashes = _string_list(attempt.get("baseline_agent_turn_bubble_hashes"))
     agent_turn_id = attempt.get("baseline_agent_turn_id")
     pending_count = attempt.get("baseline_pending_count")
     if (
@@ -368,6 +369,10 @@ async def recover_late_confirmation_same_attempt(
         or baseline_ids is None
         or execution_ids is None
         or confirmation_ids is None
+        or (
+            chat_bubble_hashes is not None
+            and any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in chat_bubble_hashes)
+        )
         or isinstance(pending_count, bool)
         or not isinstance(pending_count, int)
         or pending_count != 0
@@ -381,6 +386,7 @@ async def recover_late_confirmation_same_attempt(
         pending_count,
         frozenset(confirmation_ids),
         str(agent_turn_id),
+        tuple(chat_bubble_hashes or ()),
     )
     journal = AgentSettingsRecoveryJournal(
         request.presubmit_request.runtime_state_root,

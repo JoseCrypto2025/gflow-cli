@@ -155,6 +155,20 @@ sanitized evidence summary. Existing ledger records remain readable.
 
 ### D6 release prerequisite
 
+### Versioned forensic closure for chat-only unknown activity
+
+The separate `D2_FORENSIC_CLOSURE_V2` operator contract is documented in
+[`../operations/D2_FORENSIC_CLOSURE_V2.md`](../operations/D2_FORENSIC_CLOSURE_V2.md).
+It preserves V1 behavior and permits an unknown attempt to be classified as
+`CHAT_ONLY_UNRESOLVED_ACTIVITY` only when current non-chat provider activity is
+absent and the ordered chat snapshot is complete. A nonzero submission-baseline
+chat count requires hashes captured at that baseline; historical hashes cannot
+be reconstructed afterward. V2 closure preserves the existing reservation and
+unknown provider, credit, and billing outcomes, remains non-retryable for the
+same run ID, and never releases D6.
+
+### D6 release prerequisite
+
 Every D6 request must name one exact `prerequisite_d2_run_id`. The centralized
 read-only `evaluate_d6_release()` checks that ID against the authoritative D2
 ledger and accepts only a record whose submission and terminal states are both
