@@ -227,6 +227,13 @@ class OptimisticGoogleSheetsJobStore:
     def row_digest(self, tab: str, row: dict[str, object]) -> str:
         return self._digest(row, self._headers[tab])
 
+    def read_rows(self, tab: str) -> tuple[dict[str, object], ...]:
+        """Read a schema-checked snapshot of one existing V2 job tab."""
+        if tab not in _ALLOWED_KEYS:
+            raise SheetsTransactionError("only existing V2 job tabs may be read")
+        _headers, rows = self._read_table(tab)
+        return tuple(dict(row) for row in rows)
+
     def _read_table(self, tab: str) -> tuple[tuple[str, ...], list[dict[str, object]]]:
         headers = self._headers[tab]
         values = self._transport.read_values(tab, f"A1:AZ{_MAX_ROWS}")

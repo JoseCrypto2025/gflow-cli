@@ -1,7 +1,7 @@
-"""Offline transaction contracts for idempotent Production and Scene Jobs.
+"""Transaction contracts for idempotent Production and Scene Jobs.
 
-The in-memory store is test-only. A live backend must implement atomic claims
-and compare-and-transition before this coordinator can be used in production.
+The in-memory store is test-only. The Google Sheets implementation uses
+bounded optimistic writes because Sheets values updates do not expose CAS.
 """
 
 from __future__ import annotations
@@ -65,6 +65,50 @@ def _utc(value: datetime | None) -> str:
 def _canonical_digest(value: Mapping[str, object]) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def is_valid_scene_job_status(status: str) -> bool:
+    return status in _JOB_STATUSES
+
+
+def is_valid_scene_job_transition(current: str, following: str) -> bool:
+    return current in _TRANSITIONS and following in _TRANSITIONS[current]
+
+
+def validate_remote_evidence(
+    *,
+    provider_execution_id: str,
+    provider_media_id: str,
+    output_sha256: str,
+    output_size_bytes: int,
+    output_duration_sec: float,
+    remote_output_uri: str,
+    remote_file_id: str,
+    remote_sha256: str,
+    local_cleanup_status: str,
+) -> None:
+    if not provider_execution_id or not provider_media_id:
+        raise ValueError("exact provider execution and media IDs are required")
+    parsed_uri = urlparse(remote_output_uri)
+    if (
+        parsed_uri.scheme != "https"
+        or not parsed_uri.netloc
+        or parsed_uri.hostname in {"flow.google.com", "labs.google", "aisandbox-pa.googleapis.com"}
+        or not remote_file_id
+    ):
+        raise ValueError("persistent remote URI and file ID are required")
+    if not _SHA256_RE.fullmatch(output_sha256) or output_sha256.lower() != remote_sha256.lower():
+        raise ValueError("remote checksum must match the validated local checksum")
+    if (
+        isinstance(output_size_bytes, bool)
+        or output_size_bytes <= 0
+        or isinstance(output_duration_sec, bool)
+        or not math.isfinite(output_duration_sec)
+        or output_duration_sec <= 0
+    ):
+        raise ValueError("validated output size and duration must be positive")
+    if local_cleanup_status not in {"NOT_STARTED", "RETAINED"}:
+        raise ValueError("local media must remain until remote verification is recorded")
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,32 +431,17 @@ class InMemoryProductionJobStore:
             job = self._scene_jobs.get(scene_job_id)
             if job is None or job.job_status != "REMOTE_VERIFYING":
                 raise InvalidJobTransitionError("remote evidence requires REMOTE_VERIFYING state")
-            if not provider_execution_id or not provider_media_id:
-                raise ValueError("exact provider execution and media IDs are required")
-            parsed_uri = urlparse(remote_output_uri)
-            if (
-                parsed_uri.scheme != "https"
-                or not parsed_uri.netloc
-                or parsed_uri.hostname
-                in {"flow.google.com", "labs.google", "aisandbox-pa.googleapis.com"}
-                or not remote_file_id
-            ):
-                raise ValueError("persistent remote URI and file ID are required")
-            if (
-                not _SHA256_RE.fullmatch(output_sha256)
-                or output_sha256.lower() != remote_sha256.lower()
-            ):
-                raise ValueError("remote checksum must match the validated local checksum")
-            if (
-                isinstance(output_size_bytes, bool)
-                or output_size_bytes <= 0
-                or isinstance(output_duration_sec, bool)
-                or not math.isfinite(output_duration_sec)
-                or output_duration_sec <= 0
-            ):
-                raise ValueError("validated output size and duration must be positive")
-            if local_cleanup_status not in {"NOT_STARTED", "RETAINED"}:
-                raise ValueError("local media must remain until remote verification is recorded")
+            validate_remote_evidence(
+                provider_execution_id=provider_execution_id,
+                provider_media_id=provider_media_id,
+                output_sha256=output_sha256,
+                output_size_bytes=output_size_bytes,
+                output_duration_sec=output_duration_sec,
+                remote_output_uri=remote_output_uri,
+                remote_file_id=remote_file_id,
+                remote_sha256=remote_sha256,
+                local_cleanup_status=local_cleanup_status,
+            )
             updated = SceneJob(
                 scene_job_id=job.scene_job_id,
                 production_job_id=job.production_job_id,
@@ -482,7 +511,6 @@ class InMemoryProductionJobStore:
                 raise InvalidJobTransitionError("completion requires REMOTE_VERIFYING state")
             if not (
                 job.provider_execution_id
-                and job.provider_media_id
                 and job.remote_output_uri
                 and job.remote_file_id
                 and job.output_sha256

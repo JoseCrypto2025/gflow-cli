@@ -137,14 +137,13 @@ F5 report verified the PROD account/project, Agent-only surface, prepared model,
 control without clicking it, and a `CLEAN` recovery journal. It recorded
 `generate_clicked=false` and `credits_used=0`.
 
-## D7 transaction coordinator — offline implementation
+## D7 transaction coordinator — backend integration (offline-tested)
 
-`gflow_cli.v2_runtime.production_jobs` provides canonical idempotency digests,
-schema-shaped row serializers, append-only Scene Job attempts, compare-and-
-transition guards, and remote-verification-before-cleanup checks. Its
-in-memory store is test-only. No live Google Sheets transaction writer or
-atomic compare-and-set implementation exists, and no Production Job or Scene
-Job rows were written. D7 live remains dependent on D2, D4, D5, and D6 PASS.
+`gflow_cli.v2_runtime.production_jobs` provides the coordinator contract and
+test-only in-memory implementation. Its Sheets-backed implementation and Drive
+artifact boundary are described in the current checkpoint below. No live
+Production Job or Scene Job rows have been written. D7 live remains dependent
+on D2, D4, D5, and D6 PASS.
 
 D6 production execution is not generalized offline. D6-shaped run IDs are now
 rejected by generic Phase G ledger creation; the dedicated release-gated path
@@ -168,13 +167,27 @@ validated at `94c15a5b9fe07fac64cea7bc71d246b47d1d36c0`:
 - Phase G now has explicit environment/provider/account/project identity and a
   single shared provider/day credit guard. This is offline engineering only;
   it does not make D5 pass or resolve the historical D2 attempt.
-- Offline D7 Sheets and Drive adapters are implemented and fake-transport
-  tested. Sheets uses bounded optimistic read/compare/write/readback under a
-  single VPS writer lock; ordinary Sheets calls do not provide server-side CAS.
-- D7 remains **partially prepared**: the Sheets adapter is not yet wired to
-  `ProductionJobCoordinator`; current approved tabs do not persist transition
-  history or provider media ID. Drive uses multipart rather than resumable
-  upload, and its caller must supply a freshly verified output-folder identity.
+- The D7 Sheets transaction adapter is wired to
+  `ProductionJobCoordinator` through `GoogleSheetsProductionJobStore`. Claims
+  use the existing request idempotency key and exact schema rows; transitions
+  compare the caller's expected state and read back uncertain acknowledgements.
+  Conflicts and unresolved writes fail closed, with a best-effort persisted HOLD
+  when the last observed state still matches the expected state. Sheets values
+  updates are not server-side compare-and-swap, so external concurrent editors
+  remain a production risk.
+- `persist_scene_output` connects the Scene Job persistence boundary to Drive:
+  stable-key upload, remote metadata and re-download hash verification, evidence
+  persistence, then local cleanup and COMPLETED. Local media stays present until
+  the verified remote evidence row is written.
+- D7 is still **not live-validated**. The current repo documents the transaction
+  tabs as production schemas and has no isolated TEST transaction sheet or
+  approved synthetic row lifecycle. Do not write test records into unrelated
+  production rows. The current schemas also have no durable transition-event
+  history or `Provider_Media_ID` field; the Sheet store reports only events seen
+  by its current process and cannot rehydrate a provider media ID after restart.
+  These schema and live-test-path limits require review before D7 production
+  execution. Drive uses multipart rather than resumable upload, and its caller
+  must supply a freshly verified output-folder identity.
 - No live Sheets/Drive write, Flow Generate, or media generation was run. The
   non-generating D5 presubmit was run and held at `APPROVED_PROMPT_STALE` before
   opening Flow. At the time of this checkpoint, `/opt/gflow-v2` still held

@@ -138,10 +138,12 @@ create a production/scene job execution attempt.
   `CLEAN` recovery journal. F5 passed without clicking Generate or using
   credits. Re-resolve the unique current approved version from live Master
   data for every new F5 run.
-- D7 has an offline-only idempotent transaction contract and schema-shaped
-  serializers. The in-memory store is test-only; no live transaction backend
-  exists and no Sheets rows were written.
+- D7 now has a Sheets-backed `ProductionJobStore` bridge and a Drive-backed
+  Scene Job persistence boundary, covered by offline fake-transport tests. No
+  live transaction rows were written. The current repository does not define
+  an isolated TEST transaction sheet or approved synthetic row lifecycle, so
+  D7 live validation remains blocked until that path is authorized and D2/D4/
+  D5/D6 production gates are satisfied.
 
-The checkout contains no Sheet transaction writer or Google Drive storage I/O.
 Offline D5/D7 code must not be reported as live PASS. Do not enter D8, modify
 n8n, or start social posting.

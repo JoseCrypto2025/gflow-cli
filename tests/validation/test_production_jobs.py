@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from gflow_cli.v2_runtime.assets import AssetReference
 from gflow_cli.v2_runtime.production_jobs import (
     InMemoryProductionJobStore,
     InvalidJobTransitionError,
@@ -15,6 +16,8 @@ from gflow_cli.v2_runtime.production_jobs import (
     validate_production_job_row,
     validate_scene_job_row,
 )
+from gflow_cli.v2_runtime.scene_job_persistence import persist_scene_output
+from gflow_cli.v2_runtime.storage import AssetMetadata
 
 
 def _request(key: str = "run-1", prompts: tuple[str, ...] = ("SPV_000004",)) -> ProductionRequest:
@@ -173,3 +176,111 @@ def test_job_serializers_match_transaction_schema_headers() -> None:
         field["field_name"] for field in scene_schema["fields"]
     }
     validate_production_job_row(claim.production_job.as_row())
+
+
+def test_scene_output_is_recorded_before_local_cleanup(tmp_path: Path) -> None:
+    class Drive:
+        def upload_asset(self, source: Path, logical_key: str) -> AssetReference:
+            return AssetReference(
+                "GOOGLE_DRIVE",
+                "drive-file-id",
+                logical_key,
+                remote_file_id="drive-file-id",
+                mime_type="video/mp4",
+                size_bytes=source.stat().st_size,
+            )
+
+        def verify_remote_asset(self, _reference: AssetReference) -> AssetMetadata:
+            return AssetMetadata(True, size_bytes=4, mime_type="video/mp4")
+
+        def download_asset(self, _reference: AssetReference, destination: Path) -> Path:
+            destination.write_bytes(b"clip")
+            return destination
+
+    class ObservedStore(InMemoryProductionJobStore):
+        def record_remote_evidence(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            assert source.is_file()
+            result = super().record_remote_evidence(*args, **kwargs)
+            evidence_recorded.append(True)
+            return result
+
+        def mark_local_cleaned(self, scene_job_id: str, occurred_at: str):
+            assert evidence_recorded == [True]
+            assert not source.exists()
+            return super().mark_local_cleaned(scene_job_id, occurred_at)
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"clip")
+    evidence_recorded: list[bool] = []
+    store = ObservedStore()
+    claim = store.claim(_request(), "2026-10-18T00:00:00Z")
+    pending = claim.scene_jobs[0]
+    for expected, next_status in (
+        ("PENDING", "VALIDATING"),
+        ("VALIDATING", "RUNNING"),
+        ("RUNNING", "UPLOADING"),
+    ):
+        pending = store.transition_scene(
+            pending.scene_job_id, expected, next_status, "2026-10-18T00:00:01Z"
+        )
+
+    completed = persist_scene_output(
+        store,
+        Drive(),
+        pending,
+        source,
+        provider_execution_id="execution-1",
+        provider_media_id="media-1",
+        output_duration_sec=8,
+        verification_temp_dir=tmp_path / "verify",
+        occurred_at="2026-10-18T00:00:02Z",
+    )
+
+    assert completed.job_status == "COMPLETED"
+    assert completed.remote_verified
+    assert completed.local_cleanup_status == "CLEANED"
+    assert not source.exists()
+
+
+def test_drive_verification_failure_holds_scene_job_and_keeps_local_file(tmp_path: Path) -> None:
+    class Drive:
+        def upload_asset(self, source: Path, logical_key: str) -> AssetReference:
+            return AssetReference("GOOGLE_DRIVE", "drive-file-id", logical_key, size_bytes=4)
+
+        def verify_remote_asset(self, _reference: AssetReference) -> AssetMetadata:
+            raise RuntimeError("remote metadata unavailable")
+
+        def download_asset(self, _reference: AssetReference, destination: Path) -> Path:
+            raise AssertionError("download must not run before metadata verification")
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"clip")
+    store = InMemoryProductionJobStore()
+    claim = store.claim(_request(), "2026-10-18T00:00:00Z")
+    pending = claim.scene_jobs[0]
+    for expected, next_status in (
+        ("PENDING", "VALIDATING"),
+        ("VALIDATING", "RUNNING"),
+        ("RUNNING", "UPLOADING"),
+    ):
+        pending = store.transition_scene(
+            pending.scene_job_id, expected, next_status, "2026-10-18T00:00:01Z"
+        )
+
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        persist_scene_output(
+            store,
+            Drive(),
+            pending,
+            source,
+            provider_execution_id="execution-1",
+            provider_media_id="media-1",
+            output_duration_sec=8,
+            verification_temp_dir=tmp_path / "verify",
+            occurred_at="2026-10-18T00:00:02Z",
+        )
+
+    held = store.scene_jobs()[0]
+    assert held.job_status == "HOLD"
+    assert held.local_cleanup_status == "NOT_STARTED"
+    assert source.is_file()
