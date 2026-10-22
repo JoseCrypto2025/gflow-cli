@@ -10,15 +10,13 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
 from uuid import uuid4
 
 import pytest
 
 from gflow_cli.v2_runtime.phase_g_run import (
-    build_phase_g_request,
+    build_phase_g_request_from_snapshot,
     execute_and_validate,
     run_fresh_presubmit,
 )
@@ -47,27 +45,8 @@ async def test_phase_g_one_approved_test_clip(e2e_profile_dir: Path) -> None:
     if not expected_email or "@" not in expected_email:
         pytest.skip(f"set {_ACCOUNT_EMAIL} to the verified TEST account identity")
 
-    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    if not isinstance(snapshot, dict):
-        pytest.fail("Phase G snapshot must be a JSON object")
-    captured_at = snapshot.get("captured_at_utc")
-    if not isinstance(captured_at, str):
-        pytest.fail("Phase G snapshot must include captured_at_utc")
-    try:
-        captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
-    except ValueError:
-        pytest.fail("Phase G snapshot captured_at_utc must be ISO 8601")
-    age = datetime.now(UTC) - captured.astimezone(UTC)
-    if age < timedelta(seconds=-60) or age > timedelta(minutes=15):
-        pytest.fail("Phase G Master snapshot is not fresh (maximum age: 15 minutes)")
-    tables = snapshot.get("tables")
-    prompt_versions = snapshot.get("prompt_versions")
-    if not isinstance(tables, dict) or not isinstance(prompt_versions, list):
-        pytest.fail("Phase G snapshot must contain tables and prompt_versions")
-
-    request = build_phase_g_request(
-        cast(dict[str, list[dict[str, object]]], tables),
-        cast(list[dict[str, object]], prompt_versions),
+    request = build_phase_g_request_from_snapshot(
+        snapshot_path,
         d2_run_id=f"D2_{uuid4().hex[:16]}",
         runtime_state_root=state_root,
         temp_root=temp_root,

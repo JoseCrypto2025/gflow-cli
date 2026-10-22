@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 from gflow_cli.errors import WafRejectionError
@@ -18,6 +20,7 @@ from .google_flow import (
     FlowPresubmitRequest,
     PersistedPromptVersion,
 )
+from .google_sheets import APPROVED_SPREADSHEET_ID, SOURCE_LIVE_GOOGLE_SHEETS
 from .live_flow import prepare_live_flow
 from .phase_e import InMemorySceneCatalog, Row, preflight_scene
 from .phase_g import (
@@ -35,6 +38,7 @@ from .phase_g_artifacts import (
 )
 from .phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
 from .production_execution import ProductionCreditGuard, ProductionExecutionContext
+from .timestamps import parse_utc_timestamp
 
 _SCENE_ID = "SCN_000001"
 _PROFILE_ID = "GPR_0001"
@@ -53,6 +57,76 @@ class PhaseGD2Run:
     result: PhaseGExecutionResult
     local_file: Path
     video: ValidatedVideo
+
+
+def load_phase_g_master_snapshot(
+    path: Path, *, now: datetime | None = None
+) -> tuple[dict[str, list[Row]], list[Row]]:
+    """Load the canonical live Master snapshot for the one-shot D2 test."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Phase G snapshot file is unavailable")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Phase G snapshot could not be read") from exc
+    if not isinstance(document, dict):
+        raise ValueError("Phase G snapshot must be a JSON object")
+    snapshot = cast(dict[str, Any], document)
+    if snapshot.get("spreadsheet_id") != APPROVED_SPREADSHEET_ID:
+        raise ValueError("Phase G snapshot spreadsheet ID is not approved")
+    if snapshot.get("source") != SOURCE_LIVE_GOOGLE_SHEETS:
+        raise ValueError("Phase G snapshot source is not LIVE_GOOGLE_SHEETS")
+    try:
+        read_at_value = snapshot.get("read_at")
+        if not isinstance(read_at_value, str):
+            raise ValueError("missing read_at")
+        read_at = parse_utc_timestamp(read_at_value)
+    except ValueError as exc:
+        raise ValueError("Phase G snapshot read_at must be canonical UTC RFC3339") from exc
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    age = current.astimezone(UTC) - read_at
+    if age < timedelta(seconds=-60) or age > timedelta(minutes=15):
+        raise ValueError("Phase G Master snapshot is outside the freshness window")
+    raw_tables = snapshot.get("tables")
+    if not isinstance(raw_tables, dict):
+        raise ValueError("Phase G snapshot tables are missing")
+    typed_raw_tables = cast(dict[str, object], raw_tables)
+    raw_prompt_versions = typed_raw_tables.get("SCENE_PROMPT_VERSION")
+    if not isinstance(raw_prompt_versions, list):
+        raise ValueError("Phase G snapshot SCENE_PROMPT_VERSION table must be a list")
+    tables: dict[str, list[Row]] = {}
+    for name, rows in cast(dict[object, object], typed_raw_tables).items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(rows, list)
+            or any(not isinstance(row, dict) for row in cast(list[object], rows))
+        ):
+            raise ValueError("Phase G snapshot table rows are invalid")
+        tables[name] = cast(list[Row], rows)
+    prompt_versions = tables.get("SCENE_PROMPT_VERSION")
+    if prompt_versions is None:
+        raise ValueError("Phase G snapshot SCENE_PROMPT_VERSION table is missing")
+    return tables, prompt_versions
+
+
+def build_phase_g_request_from_snapshot(
+    path: Path,
+    *,
+    d2_run_id: str,
+    runtime_state_root: Path,
+    temp_root: Path,
+) -> PhaseGExecutionRequest:
+    """Build the normal Phase G request from the canonical snapshot tables."""
+    tables, prompt_versions = load_phase_g_master_snapshot(path)
+    return build_phase_g_request(
+        tables,
+        prompt_versions,
+        d2_run_id=d2_run_id,
+        runtime_state_root=runtime_state_root,
+        temp_root=temp_root,
+    )
 
 
 def build_phase_g_request(

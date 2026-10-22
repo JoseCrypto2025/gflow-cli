@@ -217,3 +217,16 @@ It is opt-in via `GFLOW_CLI_E2E_RUN_PHASE_G=I_CONFIRM_ONE_D2_GENERATION`, requir
 15 minutes, the expected account email, and explicit state/temp paths. It runs
 F5, Phase G, and media validation exactly once; Drive persistence remains a
 separate operator step.
+
+Create the fresh one-shot-test snapshot with
+[`scripts/operations/export_d2_master_snapshot.py`](../../../scripts/operations/export_d2_master_snapshot.py).
+Run it with the existing `GFLOW_GOOGLE_WORKSPACE_CREDENTIALS` and
+`RUNTIME_STATE_ROOT` environment configuration, then set
+`GFLOW_CLI_E2E_PHASE_G_SNAPSHOT` to the returned `output_path`.
+The operator reads the live Master through `GoogleSheetsSnapshotSource` and
+persists it through `write_snapshot_atomic()` below `RUNTIME_STATE_ROOT`. The
+persisted document uses the canonical `GoogleSheetsSnapshot` fields:
+`spreadsheet_id`, `read_at`, `source`, and `tables`. The D2 E2E freshness
+timestamp is `read_at`; prompt versions are derived from
+`tables["SCENE_PROMPT_VERSION"]`. The operator does not write a second
+top-level `prompt_versions` copy.
