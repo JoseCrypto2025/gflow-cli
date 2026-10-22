@@ -70,10 +70,15 @@ prior approvals, exact TEST identity, and an exact live gate fingerprint. It
 cannot fill a prompt or click Generate. Its read-only gate lookup waits up to
 15 seconds for Flow's permission DOM to hydrate, polling once per second; zero
 gates at timeout and multiple gates fail closed under the same error contract.
-WAF refusal, unresolved attempts, already successful D2 output, and every
-recorded Generate action prevent another paid attempt. An already generated
-media ID may be recovered and validated again under the same D2 run ID; this
-recovery path cannot click Generate.
+WAF refusal, unresolved attempts, and already successful D2 output prevent
+another paid attempt. A recorded Generate action blocks normal attempt
+creation, apart from the existing forensic-closure exception for a distinct
+run. The separate one-time authorization in
+[`D2_EXPLICIT_RETRY_AUTHORIZATION_V1.md`](../operations/D2_EXPLICIT_RETRY_AUTHORIZATION_V1.md)
+is the only supported exception, limited to one distinct D2 row after an exact
+terminal `UNEXPECTED_MULTI_OUTPUT` predecessor. An already generated media ID
+may be recovered and validated again under the same D2 run ID; this recovery
+path cannot click Generate.
 
 ## Output attribution and media verification
 
@@ -120,11 +125,12 @@ single-scene test clip in `05_OUTPUT/Final_Video`.
 
 ## Explicit exclusions
 
-This contract does not authorize a second submit, WAF evasion, account/profile
-rotation, CAPTCHA solving, personal Chrome reuse, production n8n changes, VPS
-deployment, or edits to production Sheets. A post-submit timeout is
-`UNKNOWN_SUBMISSION_STATE`; reconcile the same attempt without clicking
-Generate again.
+This contract does not authorize a second submit for the same run ID, WAF
+evasion, account/profile rotation, CAPTCHA solving, personal Chrome reuse,
+production n8n changes, VPS deployment, or edits to production Sheets. A
+post-submit timeout is `UNKNOWN_SUBMISSION_STATE`; reconcile the same attempt
+without clicking Generate again. A distinct paid retry is governed only by the
+versioned explicit retry authorization contract linked above.
 
 ### Forensic closure of irrecoverable unknown attempts
 

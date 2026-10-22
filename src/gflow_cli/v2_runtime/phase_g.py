@@ -98,6 +98,14 @@ class D6PrerequisiteProof:
 
 
 @dataclass(frozen=True, slots=True)
+class D2RetryAuthorization:
+    """One explicit authorization to create a new D2 after an exact terminal failure."""
+
+    predecessor_d2_run_id: str
+    expected_terminal_state: str
+
+
+@dataclass(frozen=True, slots=True)
 class D6ReleaseResult:
     """Structured fail-closed result for one explicit D6 prerequisite check."""
 
@@ -278,9 +286,18 @@ class GoogleFlowAgentOnlyGenerationExecutor:
         self.recovery_journal = recovery_journal
         self.production_credit_guard = production_credit_guard
 
-    async def execute(self, request: PhaseGExecutionRequest) -> PhaseGExecutionResult:
+    async def execute(
+        self,
+        request: PhaseGExecutionRequest,
+        *,
+        retry_authorization: D2RetryAuthorization | None = None,
+    ) -> PhaseGExecutionResult:
         """Apply settings, click once, validate one new gate and restore defaults."""
         validate_phase_g_request(request)
+        if request.d2_run_id.startswith("D6_") and retry_authorization is not None:
+            raise PhaseGError(
+                "D6_RELEASE_PATH_REQUIRED", "D6 attempts cannot use D2 retry authorization"
+            )
         if (request.execution_context is None) != (self.production_credit_guard is None):
             raise PhaseGError(
                 "PHASE_G_EXECUTION_CONTEXT_REQUIRED",
@@ -351,6 +368,8 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             try:
                 if d6_proof is not None:
                     self.ledger.create_d6_attempt(request, proof=d6_proof)
+                elif retry_authorization is not None:
+                    self.ledger.create_authorized_retry_attempt(request, retry_authorization)
                 else:
                     self.ledger.create_attempt(request)
             except BaseException:
@@ -963,6 +982,21 @@ class D2DailyCreditLedger:
                 code, "D6 attempts must use create_d6_attempt with a verified D2 release proof"
             )
         return self._mutate(lambda payload: self._create(payload, request))
+
+    def create_authorized_retry_attempt(
+        self,
+        request: PhaseGExecutionRequest,
+        authorization: D2RetryAuthorization,
+    ) -> dict[str, object]:
+        """Consume one exact retry authorization while atomically creating its new D2 row."""
+        validate_phase_g_request(request)
+        if request.d2_run_id.startswith("D6_"):
+            raise PhaseGError(
+                "D6_RELEASE_PATH_REQUIRED", "D6 attempts cannot use D2 retry authorization"
+            )
+        return self._mutate(
+            lambda payload: self._create(payload, request, retry_authorization=authorization)
+        )
 
     def create_d6_attempt(
         self, request: PhaseGExecutionRequest, *, proof: D6PrerequisiteProof | None
@@ -1864,11 +1898,20 @@ class D2DailyCreditLedger:
         return self._mutate(update)
 
     def _create(
-        self, payload: dict[str, object], request: PhaseGExecutionRequest
+        self,
+        payload: dict[str, object],
+        request: PhaseGExecutionRequest,
+        *,
+        retry_authorization: D2RetryAuthorization | None = None,
     ) -> dict[str, object]:
         attempts = cast(list[dict[str, object]], payload["attempts"])
         if any(row["d2_run_id"] == request.d2_run_id for row in attempts):
             raise PhaseGError("PHASE_G_DUPLICATE_RUN_ID", "D2 run ID already exists in the ledger")
+        retry_predecessor: dict[str, object] | None = None
+        if retry_authorization is not None:
+            retry_predecessor = self._validate_retry_authorization(
+                payload, request, retry_authorization
+            )
         for previous in attempts:
             state = previous.get("submission_state")
             if state == "WAF_REJECTED":
@@ -1908,6 +1951,8 @@ class D2DailyCreditLedger:
                     "PHASE_G_LEDGER_INVALID", "stored Generate action count is invalid"
                 )
             if generate_count > 0:
+                if previous is retry_predecessor:
+                    continue
                 raise PhaseGError(
                     "PHASE_G_PAID_ATTEMPT_ALREADY_STARTED",
                     "the authorized D2 live attempt has already used its Generate action",
@@ -1915,8 +1960,76 @@ class D2DailyCreditLedger:
             if state not in _TERMINAL_STATES:
                 raise PhaseGError("PHASE_G_ATTEMPT_UNRESOLVED", "prior D2 attempt is not terminal")
         attempt = self._new_attempt(request)
+        if retry_authorization is not None:
+            attempt["retry_authorization"] = {
+                "contract_version": 1,
+                "predecessor_d2_run_id": retry_authorization.predecessor_d2_run_id,
+                "expected_terminal_state": retry_authorization.expected_terminal_state,
+                "consumed_at": _utc_now(),
+            }
         attempts.append(attempt)
         return dict(attempt)
+
+    def _validate_retry_authorization(
+        self,
+        payload: dict[str, object],
+        request: PhaseGExecutionRequest,
+        authorization: D2RetryAuthorization,
+    ) -> dict[str, object]:
+        attempts = cast(list[dict[str, object]], payload["attempts"])
+        predecessor_id = authorization.predecessor_d2_run_id
+        if (
+            not _RUN_ID_RE.fullmatch(predecessor_id)
+            or not predecessor_id.startswith("D2_")
+            or predecessor_id == request.d2_run_id
+            or authorization.expected_terminal_state != "UNEXPECTED_MULTI_OUTPUT"
+        ):
+            raise PhaseGError(
+                "PHASE_G_RETRY_AUTHORIZATION_INVALID",
+                "retry authorization must bind a distinct D2 and the supported failure state",
+            )
+        if any(row.get("retry_authorization") is not None for row in attempts):
+            raise PhaseGError(
+                "PHASE_G_RETRY_AUTHORIZATION_CONSUMED",
+                "the ledger already contains a consumed one-time retry authorization",
+            )
+        predecessor = next(
+            (row for row in attempts if row.get("d2_run_id") == predecessor_id), None
+        )
+        if predecessor is None:
+            raise PhaseGError(
+                "PHASE_G_RETRY_PREDECESSOR_NOT_FOUND",
+                "the exact retry predecessor is not present in the ledger",
+            )
+        state = predecessor.get("submission_state")
+        terminal_state = predecessor.get("terminal_state")
+        generate_count = predecessor.get("generate_action_count")
+        if state in {"UNKNOWN_SUBMISSION_STATE", "GENERATION_PENDING", "SUBMISSION_ACKNOWLEDGED"}:
+            raise PhaseGError("PHASE_G_ATTEMPT_UNRESOLVED", "retry predecessor is unresolved")
+        if state == "WAF_REJECTED":
+            raise PhaseGError("WAF_REJECTED", "D2 live testing stopped after provider WAF refusal")
+        if state == "D2_SUCCEEDED" or terminal_state == "D2_SUCCEEDED":
+            raise PhaseGError(
+                "PHASE_G_SUCCESS_ALREADY_PROVEN", "D2 stops after its first verified artifact"
+            )
+        if (
+            state != authorization.expected_terminal_state
+            or terminal_state != authorization.expected_terminal_state
+            or state not in _TERMINAL_STATES
+            or isinstance(generate_count, bool)
+            or generate_count != 1
+        ):
+            raise PhaseGError(
+                "PHASE_G_RETRY_PREDECESSOR_MISMATCH",
+                "retry predecessor does not match the exact terminal authorization",
+            )
+        today = datetime.now(_BANGKOK).date().isoformat()
+        if self._accounted(payload, today) >= Decimal(self.daily_budget):
+            raise PhaseGError(
+                "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
+                "Bangkok-day accounting already reaches the D2 credit ceiling",
+            )
+        return predecessor
 
     @staticmethod
     def _new_attempt(request: PhaseGExecutionRequest) -> dict[str, object]:

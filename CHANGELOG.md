@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One-time explicit D2 retry authorization.** Keeps ordinary second-attempt
+  creation denied while allowing one exact distinct retry after a terminal
+  `UNEXPECTED_MULTI_OUTPUT` result. The authorization is consumed atomically in
+  the new row; prior credit accounting and WAF/success/unresolved stops remain.
+
 - **Versioned D2 forensic closure V2 for chat-only unresolved activity.** Adds
   sanitized baseline-relative chat evidence and a separate fail-closed dry-run /
   apply path while leaving V1 closure behavior unchanged. Closure preserves

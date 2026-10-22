@@ -25,6 +25,7 @@ from .live_flow import prepare_live_flow
 from .phase_e import InMemorySceneCatalog, Row, preflight_scene
 from .phase_g import (
     D2DailyCreditLedger,
+    D2RetryAuthorization,
     FlowSubmissionBaseline,
     GoogleFlowAgentOnlyGenerationExecutor,
     PhaseGError,
@@ -298,7 +299,10 @@ async def run_fresh_presubmit(request: PhaseGExecutionRequest, *, expected_email
 
 
 async def execute_and_validate(
-    request: PhaseGExecutionRequest, *, expected_email: str
+    request: PhaseGExecutionRequest,
+    *,
+    expected_email: str,
+    retry_authorization: D2RetryAuthorization | None = None,
 ) -> PhaseGD2Run:
     """Perform one request, recover only its media ID, and fully validate the MP4."""
     context = request.execution_context
@@ -320,7 +324,7 @@ async def execute_and_validate(
     try:
         result = await GoogleFlowAgentOnlyGenerationExecutor(
             port, ledger, journal, production_credit_guard=credit_guard
-        ).execute(request)
+        ).execute(request, retry_authorization=retry_authorization)
         if result.submission_state != "GENERATION_SUCCEEDED" or not result.provider_media_id:
             raise PhaseGError(
                 "PHASE_G_OUTPUT_NOT_READY", "attempt has not produced one attributable media ID"

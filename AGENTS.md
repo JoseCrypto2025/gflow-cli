@@ -227,6 +227,11 @@ chat-only closure is governed by
 [`docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md`](docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md);
 the V1 contract remains frozen with its original absolute-zero-chat rule.
 
+Before any explicitly authorized distinct D2 retry, read
+[`docs/ai-video-automation-v2/operations/D2_EXPLICIT_RETRY_AUTHORIZATION_V1.md`](docs/ai-video-automation-v2/operations/D2_EXPLICIT_RETRY_AUTHORIZATION_V1.md).
+This narrow one-time policy does not authorize retrying the same run ID and
+does not change either forensic-closure contract.
+
 ### The Iron Law — done means verified by a run
 
 ```

@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import pytest
 
+from gflow_cli.v2_runtime.phase_g import D2RetryAuthorization
 from gflow_cli.v2_runtime.phase_g_run import (
     build_phase_g_request_from_snapshot,
     execute_and_validate,
@@ -28,6 +29,8 @@ _SNAPSHOT = "GFLOW_CLI_E2E_PHASE_G_SNAPSHOT"
 _ACCOUNT_EMAIL = "GFLOW_CLI_E2E_PHASE_G_ACCOUNT_EMAIL"
 _STATE_ROOT = "GFLOW_CLI_E2E_PHASE_G_STATE_ROOT"
 _TEMP_ROOT = "GFLOW_CLI_E2E_PHASE_G_TEMP_ROOT"
+_RETRY_PREDECESSOR = "GFLOW_CLI_E2E_PHASE_G_RETRY_PREDECESSOR"
+_RETRY_EXPECTED_STATE = "GFLOW_CLI_E2E_PHASE_G_RETRY_EXPECTED_STATE"
 
 
 @pytest.mark.asyncio
@@ -44,6 +47,13 @@ async def test_phase_g_one_approved_test_clip(e2e_profile_dir: Path) -> None:
     expected_email = os.environ.get(_ACCOUNT_EMAIL, "").strip()
     if not expected_email or "@" not in expected_email:
         pytest.skip(f"set {_ACCOUNT_EMAIL} to the verified TEST account identity")
+    retry_predecessor = os.environ.get(_RETRY_PREDECESSOR, "").strip()
+    retry_expected_state = os.environ.get(_RETRY_EXPECTED_STATE, "").strip()
+    if bool(retry_predecessor) != bool(retry_expected_state):
+        pytest.fail("retry authorization requires both predecessor and expected-state variables")
+    retry_authorization = (
+        D2RetryAuthorization(retry_predecessor, retry_expected_state) if retry_predecessor else None
+    )
 
     request = build_phase_g_request_from_snapshot(
         snapshot_path,
@@ -52,7 +62,11 @@ async def test_phase_g_one_approved_test_clip(e2e_profile_dir: Path) -> None:
         temp_root=temp_root,
     )
     await run_fresh_presubmit(request, expected_email=expected_email)
-    run = await execute_and_validate(request, expected_email=expected_email)
+    run = await execute_and_validate(
+        request,
+        expected_email=expected_email,
+        retry_authorization=retry_authorization,
+    )
     assert run.result.submission_state == "GENERATION_SUCCEEDED"
     assert run.result.provider_media_id
     assert run.result.provider_project_id == request.provider_project_id

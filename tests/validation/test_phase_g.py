@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,7 @@ from gflow_cli.v2_runtime.google_flow import (
 from gflow_cli.v2_runtime.phase_e import PreflightResult
 from gflow_cli.v2_runtime.phase_g import (
     D2DailyCreditLedger,
+    D2RetryAuthorization,
     FlowConfirmationGate,
     FlowSubmissionBaseline,
     GoogleFlowAgentOnlyGenerationExecutor,
@@ -649,6 +651,184 @@ def test_phase_g_allows_only_one_generate_action_across_run_ids(tmp_path: Path) 
     with pytest.raises(PhaseGError) as stopped:
         ledger.create_attempt(second_request)
     assert stopped.value.code == "PHASE_G_PAID_ATTEMPT_ALREADY_STARTED"
+
+
+def _retry_fixture(
+    tmp_path: Path,
+    *,
+    state: str = "UNEXPECTED_MULTI_OUTPUT",
+    terminal_state: str | None = None,
+    accounted_credit_cost: int = 10,
+) -> tuple[D2DailyCreditLedger, PhaseGExecutionRequest, D2RetryAuthorization]:
+    predecessor_id = "D2_2aebc5af59bd423b"
+    predecessor_request = PhaseGExecutionRequest.from_presubmit(
+        request_for(tmp_path), predecessor_id
+    )
+    ledger = D2DailyCreditLedger(tmp_path / "retry-runtime")
+    ledger.create_attempt(predecessor_request)
+    ledger.capture_baseline(
+        predecessor_id,
+        FlowSubmissionBaseline(
+            "34e60953-e534-46e9-ac65-993893e61065",
+            frozenset(),
+            frozenset(),
+            0,
+            frozenset(),
+            "turn-before",
+        ),
+    )
+    ledger.mark_generate_action(predecessor_id)
+    if state == "D2_SUCCEEDED":
+        ledger.observe_confirmation(
+            predecessor_id,
+            confirmation_id="retry-fixture-confirmation",
+            video_count=1,
+            credit_cost=10,
+            visible_balance=None,
+        )
+        ledger.approve_gate(
+            predecessor_id,
+            video_count=1,
+            credit_cost=10,
+            confirmation_id="retry-fixture-confirmation",
+        )
+        ledger.record_state(
+            predecessor_id,
+            submission_state="GENERATION_SUCCEEDED",
+            terminal_state="GENERATION_SUCCEEDED",
+            provider_media_id="media-success",
+        )
+        ledger.record_state(
+            predecessor_id,
+            submission_state="D2_SUCCEEDED",
+            terminal_state="D2_SUCCEEDED",
+        )
+    else:
+        if state in {"UNEXPECTED_MULTI_OUTPUT", "GENERATION_FAILED"}:
+            ledger.observe_confirmation(
+                predecessor_id,
+                confirmation_id="retry-fixture-confirmation",
+                video_count=1,
+                credit_cost=accounted_credit_cost,
+                visible_balance=None,
+            )
+            ledger.approve_gate(
+                predecessor_id,
+                video_count=1,
+                credit_cost=accounted_credit_cost,
+                confirmation_id="retry-fixture-confirmation",
+            )
+        ledger.record_state(
+            predecessor_id,
+            submission_state=state,
+            terminal_state=terminal_state if terminal_state is not None else state,
+            accounted_credit_cost=(
+                accounted_credit_cost if state == "UNEXPECTED_MULTI_OUTPUT" else None
+            ),
+        )
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-retry-0002")
+    authorization = D2RetryAuthorization(predecessor_id, "UNEXPECTED_MULTI_OUTPUT")
+    return ledger, request, authorization
+
+
+def test_phase_g_explicit_retry_is_default_deny_and_exactly_bound(tmp_path: Path) -> None:
+    ledger, request, authorization = _retry_fixture(tmp_path)
+    with pytest.raises(PhaseGError) as denied:
+        ledger.create_attempt(request)
+    assert denied.value.code == "PHASE_G_PAID_ATTEMPT_ALREADY_STARTED"
+
+    created = ledger.create_authorized_retry_attempt(request, authorization)
+    assert created["submission_state"] == "PREPARED"
+    assert created["generate_action_count"] == 0
+    retry_record = created["retry_authorization"]
+    assert isinstance(retry_record, dict)
+    assert retry_record["contract_version"] == 1
+    assert retry_record["predecessor_d2_run_id"] == "D2_2aebc5af59bd423b"
+    assert retry_record["expected_terminal_state"] == "UNEXPECTED_MULTI_OUTPUT"
+    assert isinstance(retry_record["consumed_at"], str)
+    assert ledger.attempts()[0]["submission_state"] == "UNEXPECTED_MULTI_OUTPUT"
+    assert ledger.attempts()[0]["accounted_credit_cost"] == "10"
+    assert ledger.accounted_today() == Decimal("10")
+
+
+def test_phase_g_retry_rejects_wrong_or_missing_predecessor(tmp_path: Path) -> None:
+    ledger, request, authorization = _retry_fixture(tmp_path)
+    wrong = D2RetryAuthorization("D2_wrong-predecessor", "UNEXPECTED_MULTI_OUTPUT")
+    with pytest.raises(PhaseGError) as missing:
+        ledger.create_authorized_retry_attempt(request, wrong)
+    assert missing.value.code == "PHASE_G_RETRY_PREDECESSOR_NOT_FOUND"
+
+    wrong_state = D2RetryAuthorization(authorization.predecessor_d2_run_id, "GENERATION_FAILED")
+    with pytest.raises(PhaseGError) as state:
+        ledger.create_authorized_retry_attempt(request, wrong_state)
+    assert state.value.code == "PHASE_G_RETRY_AUTHORIZATION_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("state", "terminal_state", "expected_code"),
+    [
+        ("UNKNOWN_SUBMISSION_STATE", None, "PHASE_G_ATTEMPT_UNRESOLVED"),
+        ("D2_SUCCEEDED", "D2_SUCCEEDED", "PHASE_G_SUCCESS_ALREADY_PROVEN"),
+        ("WAF_REJECTED", "WAF_REJECTED", "WAF_REJECTED"),
+        ("GENERATION_FAILED", "UNEXPECTED_MULTI_OUTPUT", "PHASE_G_RETRY_PREDECESSOR_MISMATCH"),
+    ],
+)
+def test_phase_g_retry_rejects_unsafe_predecessor_states(
+    tmp_path: Path,
+    state: str,
+    terminal_state: str | None,
+    expected_code: str,
+) -> None:
+    ledger, request, authorization = _retry_fixture(
+        tmp_path, state=state, terminal_state=terminal_state
+    )
+    with pytest.raises(PhaseGError) as rejected:
+        ledger.create_authorized_retry_attempt(request, authorization)
+    assert rejected.value.code == expected_code
+
+
+def test_phase_g_retry_authorization_is_one_time_and_run_id_is_unique(tmp_path: Path) -> None:
+    ledger, request, authorization = _retry_fixture(tmp_path)
+    created = ledger.create_authorized_retry_attempt(request, authorization)
+    with pytest.raises(PhaseGError) as duplicate:
+        ledger.create_authorized_retry_attempt(request, authorization)
+    assert duplicate.value.code == "PHASE_G_DUPLICATE_RUN_ID"
+
+    second_request = PhaseGExecutionRequest.from_presubmit(
+        request_for(tmp_path), "D2_test-retry-0003"
+    )
+    with pytest.raises(PhaseGError) as replay:
+        ledger.create_authorized_retry_attempt(second_request, authorization)
+    assert replay.value.code == "PHASE_G_RETRY_AUTHORIZATION_CONSUMED"
+    assert created["generate_action_count"] == 0
+
+
+def test_phase_g_retry_authorization_is_consumed_atomically(tmp_path: Path) -> None:
+    ledger, request, authorization = _retry_fixture(tmp_path)
+    second_request = PhaseGExecutionRequest.from_presubmit(
+        request_for(tmp_path), "D2_test-retry-0003"
+    )
+
+    def create(candidate: PhaseGExecutionRequest) -> str:
+        try:
+            ledger.create_authorized_retry_attempt(candidate, authorization)
+        except PhaseGError as exc:
+            return exc.code
+        return "CREATED"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, (request, second_request)))
+
+    assert sorted(results) == ["CREATED", "PHASE_G_RETRY_AUTHORIZATION_CONSUMED"]
+    assert len(ledger.attempts()) == 2
+
+
+def test_phase_g_retry_requires_daily_budget_headroom(tmp_path: Path) -> None:
+    ledger, request, authorization = _retry_fixture(tmp_path, accounted_credit_cost=50)
+    with pytest.raises(PhaseGError) as budget:
+        ledger.create_authorized_retry_attempt(request, authorization)
+    assert budget.value.code == "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED"
+    assert ledger.accounted_today() == Decimal("50")
 
 
 @pytest.mark.asyncio
