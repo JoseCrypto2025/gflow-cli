@@ -69,12 +69,6 @@ async () => {
     media_ids: [...new Set([...tiles, ...document.querySelectorAll('flow-a2ui-video-option')]
       .flatMap(read))],
     finished_media_ids: [...new Set(finished.flatMap(read))],
-    finished_keys: finished.map(tile => {
-      const video = tile.querySelector('video');
-      const image = tile.querySelector('img');
-      return video ? (video.currentSrc || video.src || '')
-        : image ? (image.currentSrc || image.src || '') : '';
-    }),
     chat_count: chat.length,
     chat_bubble_hashes: await Promise.all(chat.map(async bubble => {
       const text = (bubble.innerText || bubble.textContent || '').trim();
@@ -174,7 +168,6 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._request: PhaseGExecutionRequest | None = None
         self._baseline: FlowSubmissionBaseline | None = None
         self._records: dict[tuple[str, str, str], _ObservedRecord] = {}
-        self._baseline_head_key = ""
         self._response_tasks: set[asyncio.Task[None]] = set()
         self._waf_rejected = False
         self._generate_clicked = False
@@ -184,7 +177,6 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._observed_finished_media_ids: set[str] = set()
         self._observed_peak_pending = 0
         self._observed_new_turn = False
-        self._observed_head_changed = False
 
     @classmethod
     async def open(
@@ -362,7 +354,6 @@ class GoogleFlowAgentOnlyGenerationPort:
             tuple(cast(list[str], bubble_hash_items)),
         )
         self._baseline = baseline
-        self._baseline_head_key = self._head_key(state.get("finished_keys"))
         return baseline
 
     async def click_generate_once(self) -> None:
@@ -532,7 +523,7 @@ class GoogleFlowAgentOnlyGenerationPort:
                 record
                 for record in self._records.values()
                 if record.media_id.lower() not in baseline.media_ids
-                or record.workflow_id.lower() not in baseline.execution_ids
+                and record.workflow_id.lower() not in baseline.execution_ids
             ]
             for record in wire_new:
                 if record.project_id != request.provider_project_id:
@@ -551,23 +542,21 @@ class GoogleFlowAgentOnlyGenerationPort:
                     attributed_confirmation_id=confirmation_id,
                 )
             wire_done = [record for record in wire_new if record.is_done]
-            if len({record.media_id.lower() for record in wire_done}) > 1:
-                ids = tuple(sorted({record.media_id.lower() for record in wire_done}))
+            wire_media_ids = {record.media_id.lower() for record in wire_new}
+            if len(wire_media_ids) > 1:
+                ids = tuple(sorted(wire_media_ids))
                 return PhaseGAttemptEvidence(
                     request.d2_run_id,
                     "UNEXPECTED_MULTI_OUTPUT",
-                    provider_execution_id=wire_done[0].workflow_id,
+                    provider_execution_id=wire_new[0].workflow_id,
                     provider_project_id=request.provider_project_id,
                     terminal_state="UNEXPECTED_MULTI_OUTPUT",
                     attributed_confirmation_id=confirmation_id,
                     new_provider_media_ids=ids,
                 )
-            media_ids = set(self._observed_media_ids)
-            media_ids.update(self._valid_ids(state.get("media_ids")))
-            media_ids.update(self._valid_ids(state.get("chat_media_ids")))
-            media_ids.difference_update(baseline.media_ids)
-            if wire_done:
-                media_ids.add(wire_done[0].media_id.lower())
+            # Only the structured provider media_id field identifies an output.
+            # DOM UUIDs may include workflow IDs, project IDs, or other references.
+            media_ids = set(wire_media_ids)
             baseline_chat_count, _, baseline_chat_hash = (baseline.agent_turn_id or "0:").partition(
                 ":"
             )
@@ -575,29 +564,7 @@ class GoogleFlowAgentOnlyGenerationPort:
                 self._integer(state.get("chat_count")) > int(baseline_chat_count or "0")
                 and str(state.get("chat_tail_hash") or "") != baseline_chat_hash
             )
-            finished_ids = set(self._observed_finished_media_ids)
-            finished_ids.update(self._valid_ids(state.get("finished_media_ids")))
-            head_changed = self._observed_head_changed or (
-                self._head_key(state.get("finished_keys")) != self._baseline_head_key
-            )
-            if len(media_ids) > 1:
-                ids = tuple(sorted(media_ids))
-                return PhaseGAttemptEvidence(
-                    request.d2_run_id,
-                    "UNEXPECTED_MULTI_OUTPUT",
-                    provider_execution_id=wire_done[0].workflow_id if wire_done else None,
-                    provider_project_id=request.provider_project_id,
-                    terminal_state="UNEXPECTED_MULTI_OUTPUT",
-                    attributed_confirmation_id=confirmation_id,
-                    new_provider_media_ids=ids,
-                )
-            if (
-                len(media_ids) == 1
-                and not pending
-                and new_turn
-                and (wire_done or peak_pending > 0)
-                and (next(iter(media_ids)) in finished_ids or head_changed)
-            ):
+            if len(media_ids) == 1 and not pending and new_turn and wire_done:
                 media_id = next(iter(media_ids))
                 workflow_id = next(
                     (
@@ -633,10 +600,8 @@ class GoogleFlowAgentOnlyGenerationPort:
         wire_pending = [
             record
             for record in self._records.values()
-            if (
-                record.media_id.lower() not in baseline.media_ids
-                or record.workflow_id.lower() not in baseline.execution_ids
-            )
+            if record.media_id.lower() not in baseline.media_ids
+            and record.workflow_id.lower() not in baseline.execution_ids
         ]
         if wire_pending:
             record = wire_pending[0]
@@ -725,9 +690,12 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._observed_peak_pending = max(
             self._observed_peak_pending, self._integer(state.get("pending"))
         )
-        media_ids = set(self._valid_ids(state.get("media_ids")))
-        media_ids.update(self._valid_ids(state.get("chat_media_ids")))
-        self._observed_media_ids.update(media_ids - baseline.media_ids)
+        self._observed_media_ids.update(
+            record.media_id.lower()
+            for record in self._records.values()
+            if record.media_id.lower() not in baseline.media_ids
+            and record.workflow_id.lower() not in baseline.execution_ids
+        )
         self._observed_finished_media_ids.update(
             set(self._valid_ids(state.get("finished_media_ids"))) - baseline.media_ids
         )
@@ -735,9 +703,6 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._observed_new_turn = self._observed_new_turn or (
             self._integer(state.get("chat_count")) > int(baseline_count or "0")
             and str(state.get("chat_tail_hash") or "") != baseline_hash
-        )
-        self._observed_head_changed = self._observed_head_changed or (
-            self._head_key(state.get("finished_keys")) != self._baseline_head_key
         )
 
     def _provider_progress_present(self, baseline: FlowSubmissionBaseline) -> bool:
@@ -773,13 +738,6 @@ class GoogleFlowAgentOnlyGenerationPort:
     @staticmethod
     def _integer(value: Any) -> int:
         return value if isinstance(value, int) and not isinstance(value, bool) else 0
-
-    @staticmethod
-    def _head_key(values: object) -> str:
-        if not isinstance(values, list) or not values:
-            return ""
-        head = cast(list[object], values)[0]
-        return hashlib.sha256(head.encode("utf-8")).hexdigest() if isinstance(head, str) else ""
 
     @staticmethod
     def _valid_ids(values: object) -> set[str]:

@@ -79,6 +79,54 @@ def _baseline() -> FlowSubmissionBaseline:
     return FlowSubmissionBaseline("project", frozenset(), frozenset(), 0, frozenset(), "0:")
 
 
+UUID_A = "aaaaaaaa-0000-0000-0000-000000000001"
+UUID_B = "bbbbbbbb-0000-0000-0000-000000000002"
+UUID_C = "cccccccc-0000-0000-0000-000000000003"
+
+
+def _wire_record(workflow_id: str, media_id: str, status: int) -> live_flow._ObservedRecord:
+    return live_flow._ObservedRecord(workflow_id, "project", media_id, status)
+
+
+def _observation_port(
+    states: list[dict[str, object]], records: list[live_flow._ObservedRecord]
+) -> GoogleFlowAgentOnlyGenerationPort:
+    port = _port(gate_after_polls=None)
+    port._request = SimpleNamespace(d2_run_id="D2_test", provider_project_id="project")  # type: ignore[assignment]
+    port._records = {
+        (record.workflow_id, record.project_id, record.media_id): record for record in records
+    }
+    page = port._page
+    page.states = states  # type: ignore[attr-defined]
+    page.evaluate_calls = 0  # type: ignore[attr-defined]
+
+    async def evaluate(_script: str) -> dict[str, object]:
+        page.evaluate_calls += 1  # type: ignore[attr-defined]
+        return page.states[min(page.evaluate_calls - 1, len(page.states) - 1)]  # type: ignore[attr-defined]
+
+    page.evaluate = evaluate  # type: ignore[method-assign]
+    return port
+
+
+def _project_state(
+    *,
+    pending: int,
+    media_ids: list[str],
+    finished_media_ids: list[str] | None = None,
+    chat_count: int = 1,
+    chat_tail_hash: str = "new-turn",
+) -> dict[str, object]:
+    return {
+        "pending": pending,
+        "media_ids": media_ids,
+        "finished_media_ids": finished_media_ids or [],
+        "finished_keys": [],
+        "chat_count": chat_count,
+        "chat_tail_hash": chat_tail_hash,
+        "chat_media_ids": [],
+    }
+
+
 @pytest.mark.asyncio
 async def test_live_adapter_observes_gate_after_initial_30_second_window(
     monkeypatch: pytest.MonkeyPatch,
@@ -293,3 +341,114 @@ async def test_read_current_confirmation_readiness_never_approves_generates_or_m
     assert gate.video_count == 1
     assert ledger.read_bytes() == ledger_before
     assert port._generate_clicked is False
+
+
+@pytest.mark.asyncio
+async def test_workflow_and_media_dom_uuids_are_not_two_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _observation_port(
+        [_project_state(pending=1, media_ids=[UUID_A, UUID_B])],
+        [_wire_record(UUID_A, UUID_B, 2)],
+    )
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "GENERATION_PENDING"
+    assert evidence.provider_execution_id == UUID_A
+    assert evidence.provider_media_id == UUID_B
+    assert evidence.new_provider_media_ids == (UUID_B,)
+
+
+@pytest.mark.asyncio
+async def test_one_wire_media_and_workflow_stays_observable_while_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _observation_port(
+        [
+            _project_state(pending=1, media_ids=[UUID_A, UUID_B]),
+            _project_state(pending=0, media_ids=[UUID_A, UUID_B], finished_media_ids=[UUID_B]),
+        ],
+        [_wire_record(UUID_A, UUID_B, 2)],
+    )
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    async def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+        if now >= 1.0:
+            port._records[(UUID_A, "project", UUID_B)] = _wire_record(UUID_A, UUID_B, 3)
+
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", advance)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=4.0)
+
+    assert evidence.submission_state == "GENERATION_SUCCEEDED"
+    assert evidence.provider_execution_id == UUID_A
+    assert evidence.provider_media_id == UUID_B
+    assert evidence.new_provider_media_ids == (UUID_B,)
+    assert port._page.evaluate_calls == 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_one_completed_authoritative_media_is_generation_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _observation_port(
+        [_project_state(pending=0, media_ids=[UUID_A, UUID_B], finished_media_ids=[UUID_B])],
+        [_wire_record(UUID_A, UUID_B, 3)],
+    )
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=10.0)
+
+    assert evidence.submission_state == "GENERATION_SUCCEEDED"
+    assert evidence.provider_media_id == UUID_B
+    assert evidence.new_provider_media_ids == (UUID_B,)
+
+
+@pytest.mark.asyncio
+async def test_two_distinct_authoritative_media_ids_are_multi_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _observation_port(
+        [_project_state(pending=0, media_ids=[])],
+        [_wire_record(UUID_A, UUID_B, 3), _wire_record(UUID_A, UUID_C, 3)],
+    )
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=10.0)
+
+    assert evidence.submission_state == "UNEXPECTED_MULTI_OUTPUT"
+    assert evidence.new_provider_media_ids == tuple(sorted((UUID_B, UUID_C)))
+
+
+@pytest.mark.asyncio
+async def test_unfinished_workflow_and_media_keep_observation_open_to_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _observation_port(
+        [_project_state(pending=1, media_ids=[UUID_A, UUID_B])],
+        [_wire_record(UUID_A, UUID_B, 2)],
+    )
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    async def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", advance)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=3.0)
+
+    assert evidence.submission_state == "GENERATION_PENDING"
+    assert port._page.evaluate_calls == 3  # type: ignore[attr-defined]
