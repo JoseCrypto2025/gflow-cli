@@ -42,6 +42,8 @@ logger = structlog.get_logger(__name__)
 # AUTHENTICATED_BODY fixture in tests/auth/test_verification.py — if Google
 # changes the shape, that test fails rather than the change going silent.
 SESSION_API_URL = "https://labs.google/fx/api/auth/session"
+# HTTP 410 Gone: this Labs session URL no longer issues a session response.
+LABS_GONE_STATUS = 410
 
 # Per-request timeout for the session probe (milliseconds).
 _REQUEST_TIMEOUT_MS = 15_000
@@ -136,6 +138,12 @@ def evaluate_session_response(
 
     def _result(outcome: FlowSessionOutcome, email: str | None = None) -> FlowSessionStatus:
         return FlowSessionStatus(outcome=outcome, user_email=email, source=source)
+
+    if status_code == LABS_GONE_STATUS:
+        # Treat a retired Labs session oracle as an empty session. The normal
+        # Google-cookie split remains fail-closed and can invoke the existing
+        # server-attested migrated-host check only for GOOGLE_SESSION_ONLY.
+        status_code, body = 200, "{}"
 
     if status_code != 200:
         return _result(FlowSessionOutcome.VERIFICATION_ERROR)
@@ -554,6 +562,8 @@ async def verify_flow_profile(
             source=source,
         )
 
+    if status_code == LABS_GONE_STATUS:
+        logger.info("auth_labs_session_gone", source=source)
     result = evaluate_session_response(
         status_code,
         body,

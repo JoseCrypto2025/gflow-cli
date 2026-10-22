@@ -991,3 +991,104 @@ class TestFindEmails:
 
         local = "x" * (_MAX_LOCAL_PART + 10)
         assert find_emails(f"{local}@example.com") == ["x" * _MAX_LOCAL_PART + "@example.com"]
+
+
+class TestLabsSessionGone:
+    """HTTP 410 from Labs is absence of its session oracle, not a network failure."""
+
+    @pytest.fixture
+    def gflow_home(self, tmp_path: Path) -> Path:
+        home = tmp_path / "gflow_home"
+        home.mkdir()
+        return home
+
+    @staticmethod
+    def _profile(monkeypatch: pytest.MonkeyPatch, home: Path, *, google: bool = True) -> Path:
+        profile = home / "profile_default"
+        profile.mkdir()
+        settings = MagicMock()
+        settings.home = home
+        monkeypatch.setattr("gflow_cli.auth.verification.get_settings", lambda: settings)
+        monkeypatch.setattr(
+            "gflow_cli.auth.verification.fetch_flow_session_httpx",
+            AsyncMock(return_value=(410, '{"error":"gone"}', google)),
+        )
+        return profile
+
+    @pytest.mark.parametrize(
+        ("google_session", "expected"),
+        [
+            (False, FlowSessionOutcome.NO_SESSION),
+            (True, FlowSessionOutcome.GOOGLE_SESSION_ONLY),
+        ],
+    )
+    def test_410_classifies_from_google_session(
+        self, google_session: bool, expected: FlowSessionOutcome
+    ) -> None:
+        status = evaluate_session_response(
+            410, '{"error":"gone"}', google_session=google_session, source="test"
+        )
+        assert status.outcome is expected
+
+    @pytest.mark.asyncio
+    async def test_410_google_session_invokes_migrated_fallback(
+        self, gflow_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = self._profile(monkeypatch, gflow_home)
+        authenticated = FlowSessionStatus(
+            outcome=FlowSessionOutcome.AUTHENTICATED,
+            user_email="test.user@example.com",
+            source="test",
+        )
+        fallback = AsyncMock(return_value=authenticated)
+        monkeypatch.setattr("gflow_cli.auth.verification._verify_migrated_host_fallback", fallback)
+
+        status = await verify_flow_profile(profile, source="test")
+
+        assert status is authenticated
+        fallback.assert_awaited_once_with(profile, "test")
+
+    @pytest.mark.asyncio
+    async def test_410_fallback_decline_remains_google_session_only(
+        self, gflow_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = self._profile(monkeypatch, gflow_home)
+        fallback = AsyncMock(return_value=None)
+        monkeypatch.setattr("gflow_cli.auth.verification._verify_migrated_host_fallback", fallback)
+
+        status = await verify_flow_profile(profile, source="test")
+
+        assert status.outcome is FlowSessionOutcome.GOOGLE_SESSION_ONLY
+        assert not status.authenticated
+        fallback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_410_without_google_session_does_not_invoke_fallback(
+        self, gflow_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = self._profile(monkeypatch, gflow_home, google=False)
+        fallback = AsyncMock(return_value=None)
+        monkeypatch.setattr("gflow_cli.auth.verification._verify_migrated_host_fallback", fallback)
+
+        status = await verify_flow_profile(profile, source="test")
+
+        assert status.outcome is FlowSessionOutcome.NO_SESSION
+        fallback.assert_not_awaited()
+
+    @pytest.mark.parametrize("status_code", [429, 503, 504])
+    @pytest.mark.asyncio
+    async def test_transient_status_remains_error_without_fallback(
+        self, status_code: int, gflow_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = self._profile(monkeypatch, gflow_home)
+        monkeypatch.setattr(
+            "gflow_cli.auth.verification.fetch_flow_session_httpx",
+            AsyncMock(return_value=(status_code, '{"error":"transient"}', True)),
+        )
+        fallback = AsyncMock(return_value=None)
+        monkeypatch.setattr("gflow_cli.auth.verification._verify_migrated_host_fallback", fallback)
+
+        status = await verify_flow_profile(profile, source="test")
+
+        assert status.outcome is FlowSessionOutcome.VERIFICATION_ERROR
+        fallback.assert_not_awaited()
