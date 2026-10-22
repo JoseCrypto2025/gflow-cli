@@ -312,6 +312,24 @@ async def test_a_labs_state_never_observed_is_not_reported_renewed(
 
 
 @pytest.mark.asyncio
+async def test_a_gone_labs_session_leaves_the_verdict_to_the_verifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Labs 410 means no Labs session remains to refresh, not an unverified renewal."""
+    mock_ap, page, events = _playwright_mock(
+        session_bodies=['{"error":"gone"}'], session_status=410
+    )
+    monkeypatch.setattr("gflow_cli.auth.strategies.async_playwright", mock_ap)
+    _patch_verdict(monkeypatch, events, FlowSessionOutcome.AUTHENTICATED)
+
+    result = await renew.renew_profile(tmp_path)
+
+    assert result.labs_stale is False
+    assert result.renewed is True
+    page.request.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_a_public_landing_wins_over_the_verifier_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

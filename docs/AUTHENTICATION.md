@@ -282,10 +282,11 @@ gflow auth renew --all --json       # every profile with a saved session
 
 It exits `0` when every renewed profile verifies and `1` otherwise. An account that Flow sends to
 its public `/about` page (see [KNOWN_ISSUES](../KNOWN_ISSUES.md)) never finishes the labs sign-in,
-so it needs `gflow auth login`. A profile counts as renewed only when labs.google was seen to
-refresh it: if labs is unreachable or answers unreadably (a network that blocks `labs.google`,
-say), the row is `labs_unverified` and the command exits `1` even though the Flow session
-verifies. A profile another gflow process is using is skipped, not failed. It cannot bring back a session Google has **revoked**
+so it needs `gflow auth login`. If labs is unreachable or answers unreadably (a network that
+blocks `labs.google`, say), the row is `labs_unverified` and the command exits `1` even though
+the Flow session verifies. HTTP 410 means the Labs session endpoint is retired; in that case,
+the final Flow verifier determines whether the profile is authenticated. A profile another
+gflow process is using is skipped, not failed. It cannot bring back a session Google has **revoked**
 (a password change, "sign out of all devices", an identity re-check). That still needs
 `gflow auth login`. `gflow credits user|list --refresh` runs the same renewal automatically for
 a profile whose credits read fails with an expired session. Over MCP, that case is reached

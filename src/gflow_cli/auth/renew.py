@@ -26,7 +26,12 @@ import structlog
 
 from gflow_cli.profile_lease import ProfileLease
 
-from .verification import FlowSessionOutcome, FlowSessionStatus, verify_flow_profile
+from .verification import (
+    LABS_GONE_STATUS,
+    FlowSessionOutcome,
+    FlowSessionStatus,
+    verify_flow_profile,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -120,6 +125,11 @@ async def _await_labs_refresh(page: Any, source: str) -> bool | None:
     while True:
         remaining_ms = max(deadline - loop.time(), 1.0) * 1000
         resp = await page.request.get(_LABS_SESSION_URL, timeout=remaining_ms)
+        if resp.status == LABS_GONE_STATUS:
+            # No Labs session exists any more, so nothing there can be stale.
+            # The verdict that follows asks the host that serves the app.
+            logger.info("auth_renew_labs_session", source=source, status=resp.status, stale=False)
+            return False
         stale = _session_stale(await resp.text()) if resp.status == 200 else None
         if not stale or loop.time() >= deadline:
             # Status and the verdict only — the body carries the access token.
