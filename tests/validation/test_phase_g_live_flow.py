@@ -82,6 +82,9 @@ def _baseline() -> FlowSubmissionBaseline:
 UUID_A = "aaaaaaaa-0000-0000-0000-000000000001"
 UUID_B = "bbbbbbbb-0000-0000-0000-000000000002"
 UUID_C = "cccccccc-0000-0000-0000-000000000003"
+UUID_D = "dddddddd-0000-0000-0000-000000000004"
+UUID_E = "eeeeeeee-0000-0000-0000-000000000005"
+UUID_F = "ffffffff-0000-0000-0000-000000000006"
 
 
 def _wire_record(workflow_id: str, media_id: str, status: int) -> live_flow._ObservedRecord:
@@ -426,6 +429,86 @@ async def test_two_distinct_authoritative_media_ids_are_multi_output(
 
     assert evidence.submission_state == "UNEXPECTED_MULTI_OUTPUT"
     assert evidence.new_provider_media_ids == tuple(sorted((UUID_B, UUID_C)))
+
+
+@pytest.mark.parametrize("status", [2, 3])
+@pytest.mark.asyncio
+async def test_historical_record_omitted_from_live_dom_is_not_new_output(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    port = _observation_port(
+        [_project_state(pending=0, media_ids=[])],
+        [_wire_record(UUID_A, UUID_B, status)],
+    )
+    baseline = FlowSubmissionBaseline(
+        "project", frozenset({UUID_B}), frozenset({UUID_A}), 0, frozenset(), "0:"
+    )
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(baseline, None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "UNKNOWN_SUBMISSION_STATE"
+    assert evidence.new_provider_media_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_new_media_with_historical_ids_in_baseline_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _observation_port(
+        [_project_state(pending=0, media_ids=[UUID_C, UUID_D], finished_media_ids=[UUID_D])],
+        [_wire_record(UUID_C, UUID_D, 3)],
+    )
+    baseline = FlowSubmissionBaseline(
+        "project", frozenset({UUID_B}), frozenset({UUID_A}), 0, frozenset(), "0:"
+    )
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(baseline, None, observation_deadline=10.0)
+
+    assert evidence.submission_state == "GENERATION_SUCCEEDED"
+    assert evidence.provider_execution_id == UUID_C
+    assert evidence.provider_media_id == UUID_D
+    assert evidence.new_provider_media_ids == (UUID_D,)
+
+
+@pytest.mark.asyncio
+async def test_historical_plus_new_record_counts_only_new_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _observation_port(
+        [_project_state(pending=0, media_ids=[UUID_A, UUID_B, UUID_C, UUID_D])],
+        [_wire_record(UUID_A, UUID_B, 3), _wire_record(UUID_C, UUID_D, 3)],
+    )
+    baseline = FlowSubmissionBaseline(
+        "project", frozenset({UUID_B}), frozenset({UUID_A}), 0, frozenset(), "0:"
+    )
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(baseline, None, observation_deadline=10.0)
+
+    assert evidence.submission_state == "GENERATION_SUCCEEDED"
+    assert evidence.provider_media_id == UUID_D
+    assert evidence.new_provider_media_ids == (UUID_D,)
+
+
+@pytest.mark.asyncio
+async def test_two_new_authoritative_records_are_multi_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _observation_port(
+        [_project_state(pending=0, media_ids=[])],
+        [_wire_record(UUID_C, UUID_D, 3), _wire_record(UUID_E, UUID_F, 3)],
+    )
+    baseline = FlowSubmissionBaseline(
+        "project", frozenset({UUID_B}), frozenset({UUID_A}), 0, frozenset(), "0:"
+    )
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(baseline, None, observation_deadline=10.0)
+
+    assert evidence.submission_state == "UNEXPECTED_MULTI_OUTPUT"
+    assert evidence.new_provider_media_ids == tuple(sorted((UUID_D, UUID_F)))
 
 
 @pytest.mark.asyncio

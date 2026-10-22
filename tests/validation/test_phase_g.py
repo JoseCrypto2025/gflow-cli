@@ -299,6 +299,91 @@ async def test_provider_progress_before_late_gate_is_observed_without_approval(
     assert ledger.attempts()[0]["approval_action_count"] == 0
 
 
+@pytest.mark.asyncio
+async def test_retry_baseline_unions_live_and_historical_provider_identities(
+    tmp_path: Path,
+) -> None:
+    project_id = "34e60953-e534-46e9-ac65-993893e61065"
+    historical_workflow = "aaaaaaaa-0000-0000-0000-000000000001"
+    historical_media = "bbbbbbbb-0000-0000-0000-000000000002"
+    historical_media_list = "cccccccc-0000-0000-0000-000000000003"
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    predecessor_id = "D2_history-run-0001"
+    predecessor = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), predecessor_id)
+    ledger.create_attempt(predecessor)
+    ledger.capture_baseline(
+        predecessor_id,
+        FlowSubmissionBaseline(project_id, frozenset(), frozenset(), 0, frozenset(), "0:"),
+    )
+    ledger.mark_generate_action(predecessor_id)
+    ledger.observe_confirmation(
+        predecessor_id,
+        confirmation_id="history-confirmation",
+        video_count=1,
+        credit_cost=10,
+        visible_balance=None,
+    )
+    ledger.approve_gate(
+        predecessor_id,
+        video_count=1,
+        credit_cost=10,
+        confirmation_id="history-confirmation",
+    )
+    ledger.record_state(
+        predecessor_id,
+        submission_state="UNEXPECTED_MULTI_OUTPUT",
+        terminal_state="UNEXPECTED_MULTI_OUTPUT",
+        provider_execution_id=historical_workflow,
+        provider_media_id=historical_media,
+        provider_media_ids=(historical_media_list,),
+    )
+
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-retry-0002")
+    authorization = D2RetryAuthorization(predecessor_id, "UNEXPECTED_MULTI_OUTPUT")
+    port = FakeGenerationPort()
+    port.baseline = FlowSubmissionBaseline(
+        project_id,
+        frozenset({"live-media"}),
+        frozenset({"live-execution"}),
+        0,
+        frozenset(),
+        "0:",
+    )
+    port.evidence = replace(
+        port.evidence,
+        d2_run_id=request.d2_run_id,
+        attributed_confirmation_id=port.gate.confirmation_id,
+    )
+    observed_baselines: list[FlowSubmissionBaseline] = []
+    observe_attempt = port.observe_attempt
+
+    async def capture_observed_baseline(
+        baseline: FlowSubmissionBaseline,
+        confirmation_id: str | None,
+        *,
+        observation_deadline: float,
+    ) -> PhaseGAttemptEvidence:
+        observed_baselines.append(baseline)
+        return await observe_attempt(
+            baseline, confirmation_id, observation_deadline=observation_deadline
+        )
+
+    port.observe_attempt = capture_observed_baseline  # type: ignore[method-assign]
+    journal = AgentSettingsRecoveryJournal(tmp_path / "runtime", "PVA_0001", project_id)
+    executor = GoogleFlowAgentOnlyGenerationExecutor(port, ledger, journal)
+
+    await executor.execute(request, retry_authorization=authorization)
+
+    assert len(observed_baselines) == 1
+    assert observed_baselines[0].media_ids == frozenset(
+        {"live-media", historical_media, historical_media_list}
+    )
+    assert observed_baselines[0].execution_ids == frozenset({"live-execution", historical_workflow})
+    retry = next(row for row in ledger.attempts() if row["d2_run_id"] == request.d2_run_id)
+    assert retry["baseline_media_ids"] == [historical_media, historical_media_list, "live-media"]
+    assert retry["baseline_execution_ids"] == [historical_workflow, "live-execution"]
+
+
 def test_ledger_rejects_over_budget_and_unexpected_state_transitions(tmp_path: Path) -> None:
     ledger = D2DailyCreditLedger(tmp_path / "runtime")
     ledger.create_attempt(phase_g_request(tmp_path))

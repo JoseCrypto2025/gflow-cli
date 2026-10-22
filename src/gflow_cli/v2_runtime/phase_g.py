@@ -14,7 +14,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -404,6 +404,9 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 raise PhaseGError(
                     "PHASE_G_UNRELATED_GENERATION_ACTIVE", "project already has pending work"
                 )
+            baseline = self.ledger.include_historical_provider_identities(
+                request.d2_run_id, baseline
+            )
             self.ledger.capture_baseline(request.d2_run_id, baseline)
             self.ledger.mark_generate_action(request.d2_run_id)
             generate_recorded = True
@@ -1127,6 +1130,59 @@ class D2DailyCreditLedger:
             return dict(attempt)
 
         return self._mutate(update)
+
+    def include_historical_provider_identities(
+        self, d2_run_id: str, baseline: FlowSubmissionBaseline
+    ) -> FlowSubmissionBaseline:
+        """Exclude durable prior-attempt identities from this submit baseline."""
+        with self._locked_file():
+            payload = self._read()
+            current = self._attempt(payload, d2_run_id)
+            project_id = current.get("provider_project_id")
+            if not isinstance(project_id, str) or baseline.project_id != project_id:
+                raise PhaseGError(
+                    "PHASE_G_BASELINE_INVALID", "baseline project does not match its D2 attempt"
+                )
+            historical_media_ids: set[str] = set()
+            historical_execution_ids: set[str] = set()
+            for attempt in cast(list[dict[str, object]], payload["attempts"]):
+                if (
+                    attempt.get("d2_run_id") == d2_run_id
+                    or attempt.get("provider_project_id") != project_id
+                ):
+                    continue
+                execution_id = attempt.get("provider_execution_id")
+                if execution_id is not None:
+                    if not isinstance(execution_id, str) or not execution_id:
+                        raise PhaseGError(
+                            "PHASE_G_LEDGER_INVALID",
+                            "stored provider execution identity is invalid",
+                        )
+                    historical_execution_ids.add(execution_id.lower())
+                media_id = attempt.get("provider_media_id")
+                if media_id is not None:
+                    if not isinstance(media_id, str) or not media_id:
+                        raise PhaseGError(
+                            "PHASE_G_LEDGER_INVALID", "stored provider media identity is invalid"
+                        )
+                    historical_media_ids.add(media_id.lower())
+                media_ids = attempt.get("provider_media_ids")
+                if not isinstance(media_ids, list):
+                    raise PhaseGError(
+                        "PHASE_G_LEDGER_INVALID", "stored provider media identities are invalid"
+                    )
+                for value in cast(list[object], media_ids):
+                    if not isinstance(value, str) or not value:
+                        raise PhaseGError(
+                            "PHASE_G_LEDGER_INVALID",
+                            "stored provider media identities are invalid",
+                        )
+                    historical_media_ids.add(value.lower())
+            return replace(
+                baseline,
+                media_ids=baseline.media_ids | frozenset(historical_media_ids),
+                execution_ids=baseline.execution_ids | frozenset(historical_execution_ids),
+            )
 
     def approve_gate(
         self,
