@@ -14,6 +14,7 @@ from scripts.operations.collect_provider_silent_d2_evidence_v3 import (
     _PROJECT_ID,
     _is_project_listing_response,
     _merge_project_records,
+    _minimum_observation_delay,
     _ProjectListingObserver,
     _reload_project_listing,
     _require_historical_records,
@@ -90,6 +91,16 @@ def test_project_listing_url_filter_requires_exact_host_endpoint_and_rpc() -> No
     )
     assert not _is_project_listing_response("https://example.com/data/batchexecute?rpcids=Zzl0ze")
     assert not _is_project_listing_response("https://flow.google.com/project/123")
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "expected_delay"),
+    [(59.99, 0.11), (60.0, 0.1), (60.1, 0.0), (61.0, 0.0)],
+)
+def test_minimum_observation_delay_prevents_integer_duration_truncation(
+    elapsed: float, expected_delay: float
+) -> None:
+    assert _minimum_observation_delay(10.0, 10.0 + elapsed) == pytest.approx(expected_delay)
 
 
 def test_three_project_reloads_require_three_independent_listing_responses() -> None:

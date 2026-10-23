@@ -34,6 +34,7 @@ _ACCOUNT_ID = "PVA_0001"
 _HISTORICAL_WORKFLOW_ID = "9dc0380b-0a38-44f7-9c6c-8fe5262fdc2a"
 _HISTORICAL_MEDIA_ID = "d6e85926-120f-40ab-bfc0-6a788c521339"
 _PROJECT_LISTING_RPC = "Zzl0ze"
+_MIN_OBSERVATION_SECONDS = 60.1
 _CHAT_SCAN_JS = r"""
 () => {
   const bubbles = [...document.querySelectorAll('flow-chat-bubble')];
@@ -355,6 +356,11 @@ def _require_historical_records(
         )
 
 
+def _minimum_observation_delay(started_at: float, now: float) -> float:
+    """Leave a small serialization margin so integer elapsed seconds cannot truncate to 59."""
+    return max(0.0, _MIN_OBSERVATION_SECONDS - (now - started_at))
+
+
 async def _collect(args: argparse.Namespace) -> dict[str, object]:
     ledger = D2DailyCreditLedger(args.runtime_state_root)
     if ledger.path.is_symlink() or not ledger.path.is_file():
@@ -497,6 +503,14 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
                 }
             )
 
+        minimum_wait = _minimum_observation_delay(start, time.monotonic())
+        if time.monotonic() + minimum_wait >= deadline:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                "minimum project listing observation span exceeded the bounded deadline",
+            )
+        if minimum_wait:
+            await asyncio.sleep(minimum_wait)
         await port._raise_wire_refusal()
         final_state_value = await page.evaluate(_VIDEO_STATE_JS)
         final_chat_value = await page.evaluate(_CHAT_SCAN_JS)
