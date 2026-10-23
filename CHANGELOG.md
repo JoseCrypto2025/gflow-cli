@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase G outbound Flow submit attestation.** The pinned generation port
+  arms a passive request observer before the one-time Generate click and
+  records sanitized `YhhmEf` dispatch/response evidence. Missing or duplicate
+  submits remain unresolved with conservative credit accounting; no retry or
+  no-charge inference is introduced.
+
 - **One-time explicit D2 retry authorization.** Keeps ordinary second-attempt
   creation denied while allowing one exact distinct retry after a terminal
   `UNEXPECTED_MULTI_OUTPUT` result. The authorization is consumed atomically in

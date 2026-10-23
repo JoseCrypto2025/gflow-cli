@@ -26,6 +26,7 @@ from gflow_cli.v2_runtime.phase_g import (
     PhaseGAttemptEvidence,
     PhaseGError,
     PhaseGExecutionRequest,
+    PhaseGSubmitTransportEvidence,
     validate_phase_g_request,
 )
 from gflow_cli.v2_runtime.phase_g_artifacts import sha256_file
@@ -191,6 +192,38 @@ def test_unknown_post_submit_state_reserves_remaining_daily_budget(tmp_path: Pat
     with pytest.raises(PhaseGError) as duplicate:
         ledger.mark_generate_action("D2_test-run-0001")
     assert duplicate.value.code == "PHASE_G_DUPLICATE_SUBMIT_FORBIDDEN"
+
+
+def test_submit_transport_evidence_is_sanitized_and_explicit(tmp_path: Path) -> None:
+    request = phase_g_request(tmp_path)
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(request)
+    baseline = FlowSubmissionBaseline(
+        request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+    )
+    ledger.capture_baseline(request.d2_run_id, baseline)
+    ledger.mark_generate_action(request.d2_run_id)
+
+    attempt = ledger.record_submit_transport_evidence(
+        request.d2_run_id,
+        PhaseGSubmitTransportEvidence(
+            generate_click_dispatched=True,
+            provider_submit_rpc_observed=True,
+            provider_submit_rpc_id="YhhmEf",
+            provider_submit_observed_at="2026-10-23T00:00:00.000Z",
+            provider_submit_http_method="POST",
+            provider_submit_project_id=request.provider_project_id,
+            provider_submit_request_count=1,
+            provider_submit_dispatch_window_completed=True,
+            provider_submit_response_observed=False,
+        ),
+    )
+
+    assert attempt["provider_submit_rpc_observed"] is True
+    assert attempt["provider_submit_request_count"] == 1
+    assert attempt["provider_submit_transport_classification"] == ("SUBMIT_SENT_RESPONSE_UNKNOWN")
+    assert "request_body" not in attempt
+    assert "headers" not in attempt
 
 
 def test_late_gate_reconciles_unknown_reservation_without_claiming_provider_charge(
@@ -457,6 +490,21 @@ class FakeGenerationPort:
         self.fail_restore = False
         self.prompt = ""
         self.raise_waf_on_observe = False
+        self.submit_evidence = PhaseGSubmitTransportEvidence(
+            generate_click_dispatched=True,
+            provider_submit_rpc_observed=True,
+            provider_submit_rpc_id="YhhmEf",
+            provider_submit_observed_at="2026-10-23T00:00:00.000Z",
+            provider_submit_http_method="POST",
+            provider_submit_project_id="34e60953-e534-46e9-ac65-993893e61065",
+            provider_submit_request_count=1,
+            provider_submit_dispatch_window_completed=True,
+            provider_submit_request_failed=False,
+            provider_submit_response_observed=True,
+            provider_submit_response_status=200,
+            provider_submit_generation_record_observed=True,
+            provider_submit_refusal_detected=False,
+        )
 
     async def bind_request(self, request: PhaseGExecutionRequest) -> None:
         self.calls.append("bind")
@@ -494,10 +542,24 @@ class FakeGenerationPort:
         self.calls.append("baseline")
         return replace(self.baseline, pending_count=self.pending_count)
 
+    async def arm_submit_request_observer(self) -> None:
+        self.calls.append("arm_submit_observer")
+
     async def click_generate_once(self) -> None:
+        assert self.calls[-1] == "arm_submit_observer"
         self.calls.append("generate")
         if self.raise_after_click:
             raise TimeoutError("ambiguous post-click timeout")
+
+    async def await_submit_dispatch(self) -> PhaseGSubmitTransportEvidence:
+        self.calls.append("await_submit_dispatch")
+        return self.submit_evidence
+
+    def read_submit_transport_evidence(self) -> PhaseGSubmitTransportEvidence:
+        return self.submit_evidence
+
+    def disarm_submit_request_observer(self) -> None:
+        self.calls.append("disarm_submit_observer")
 
     async def await_confirmation(
         self, baseline: FlowSubmissionBaseline, *, observation_deadline: float
@@ -643,6 +705,78 @@ async def test_phase_g_ambiguous_post_click_timeout_is_non_retryable_and_reserve
     assert ledger.attempts()[0]["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
     assert port.settings == port.original
     assert journal.read().state == "CLEAN"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_no_submit_rpc_observed_stops_early_without_retry_or_credit_release(
+    tmp_path: Path,
+) -> None:
+    port = FakeGenerationPort()
+    port.submit_evidence = PhaseGSubmitTransportEvidence(
+        generate_click_dispatched=True,
+        provider_submit_rpc_observed=False,
+        provider_submit_request_count=0,
+        provider_submit_dispatch_window_completed=True,
+        provider_submit_response_observed=False,
+    )
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    with pytest.raises(PhaseGError) as error:
+        await executor.execute(request)
+
+    attempt = ledger.attempts()[0]
+    assert error.value.code == "PHASE_G_SUBMIT_RPC_NOT_OBSERVED"
+    assert port.calls.count("generate") == 1
+    assert port.calls.count("approve") == 0
+    assert attempt["generate_action_count"] == 1
+    assert attempt["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
+    assert attempt["accounted_credit_cost"] == "50"
+    assert attempt.get("provider_outcome", "UNKNOWN") == "UNKNOWN"
+    assert attempt["provider_billing_outcome"] == "UNKNOWN"
+    assert attempt["provider_submit_transport_classification"] == "SUBMIT_RPC_NOT_OBSERVED"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_submit_rpcs_after_one_click_fail_closed(tmp_path: Path) -> None:
+    port = FakeGenerationPort()
+    port.submit_evidence = replace(port.submit_evidence, provider_submit_request_count=2)
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    with pytest.raises(PhaseGError) as error:
+        await executor.execute(request)
+
+    attempt = ledger.attempts()[0]
+    assert error.value.code == "PHASE_G_DUPLICATE_SUBMIT_RPC"
+    assert port.calls.count("generate") == 1
+    assert port.calls.count("approve") == 0
+    assert attempt["provider_submit_transport_classification"] == "DUPLICATE_SUBMIT_RPC"
+    assert attempt["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
+    assert attempt["accounted_credit_cost"] == "50"
+
+
+@pytest.mark.asyncio
+async def test_submit_response_without_generation_record_cannot_be_success(
+    tmp_path: Path,
+) -> None:
+    port = FakeGenerationPort()
+    port.submit_evidence = replace(
+        port.submit_evidence,
+        provider_submit_generation_record_observed=False,
+    )
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    with pytest.raises(PhaseGError) as error:
+        await executor.execute(request)
+
+    attempt = ledger.attempts()[0]
+    assert error.value.code == "PHASE_G_SUBMIT_RESPONSE_NO_GENERATION_RECORD"
+    assert attempt["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
+    assert attempt["provider_submit_transport_classification"] == (
+        "SUBMIT_RESPONSE_WITHOUT_GENERATION_RECORD"
+    )
+    assert attempt["accounted_credit_cost"] == "10"
+    assert port.calls.count("generate") == 1
+    assert port.calls.count("approve") == 1
 
 
 @pytest.mark.asyncio

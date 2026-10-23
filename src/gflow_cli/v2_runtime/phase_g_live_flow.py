@@ -12,12 +12,14 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from gflow_cli.api.transports.batchexecute import (
+    TEXT_TO_VIDEO_SUBMIT_RPC,
     generation_record,
     parse_frames,
     rpc_errors,
@@ -34,6 +36,7 @@ from .phase_g import (
     PhaseGAttemptEvidence,
     PhaseGError,
     PhaseGExecutionRequest,
+    PhaseGSubmitTransportEvidence,
 )
 
 if TYPE_CHECKING:
@@ -88,13 +91,14 @@ _LIVE_GATE = "flow-permission-message:has(div[role='radio'].option-row:not(.read
 _APPROVE_ROW = "div[role='radio'].option-row:not(.read-only):has(mat-icon:text-is('check'))"
 _RECOVERY_GATE_HYDRATION_TIMEOUT_SECONDS = 15.0
 _RECOVERY_GATE_POLL_INTERVAL_SECONDS = 1.0
+_SUBMIT_DISPATCH_TIMEOUT_SECONDS = 15.0
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", re.I)
 _VIDEO_QUOTE_RE = re.compile(r"\b(\d+)\s+videos?\b", re.I)
 _CREDIT_QUOTE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s+credits?\b", re.I)
 _AMBIGUOUS_CREDIT_RANGE_RE = re.compile(
     r"\b\d+(?:[.,]\d+)?\s*(?:or|/|to)\s*\d+(?:[.,]\d+)?\s+credits?\b", re.I
 )
-_VIDEO_RPCS = frozenset({"YhhmEf", "eb1hJf", "MZZa6b", "jwpduf", "as29s"})
+_VIDEO_RPCS = frozenset({TEXT_TO_VIDEO_SUBMIT_RPC, "eb1hJf", "MZZa6b", "jwpduf", "as29s"})
 
 
 def _monotonic() -> float:
@@ -177,6 +181,19 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._observed_finished_media_ids: set[str] = set()
         self._observed_peak_pending = 0
         self._observed_new_turn = False
+        self._submit_observer_armed = False
+        self._submit_dispatch_started_at: float | None = None
+        self._submit_dispatch_deadline: float | None = None
+        self._submit_dispatch_window_completed = False
+        self._generate_click_dispatched: bool | None = None
+        self._submit_requests: list[Any] = []
+        self._submit_observed_at: str | None = None
+        self._submit_project_id: str | None = None
+        self._submit_request_failed: bool | None = None
+        self._submit_response_observed = False
+        self._submit_response_status: int | None = None
+        self._submit_generation_record_observed: bool | None = None
+        self._submit_refusal_detected: bool | None = None
 
     @classmethod
     async def open(
@@ -222,8 +239,9 @@ class GoogleFlowAgentOnlyGenerationPort:
         )
 
     async def close(self) -> None:
-        """Detach response observation and close the isolated repository browser."""
+        """Detach transport observation and close the isolated repository browser."""
         if self._page is not None:
+            self.disarm_submit_request_observer()
             self._page.remove_listener("response", self._on_response)
         if self._response_tasks:
             await asyncio.gather(*tuple(self._response_tasks), return_exceptions=True)
@@ -356,13 +374,19 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._baseline = baseline
         return baseline
 
-    async def click_generate_once(self) -> None:
-        """Click the single enabled Agent start control at most once."""
-        if self._generate_clicked:
+    async def arm_submit_request_observer(self) -> None:
+        """Validate the pinned submit surface, then arm passive request listeners."""
+        if self._submit_observer_armed:
             raise PhaseGError(
-                "PHASE_G_DUPLICATE_SUBMIT_FORBIDDEN", "this Flow port already clicked Generate"
+                "PHASE_G_SUBMIT_OBSERVER_ALREADY_ARMED", "submit request observer is already armed"
             )
         page = self._require_page()
+        await self._validate_generate_control(page)
+        page.on("request", self._on_request)
+        page.on("requestfailed", self._on_request_failed)
+        self._submit_observer_armed = True
+
+    async def _validate_generate_control(self, page: Page) -> Any:
         request = self._require_request()
         parsed = urlparse(page.url)
         if (
@@ -389,8 +413,71 @@ class GoogleFlowAgentOnlyGenerationPort:
             raise PhaseGError(
                 "PHASE_G_BASELINE_REQUIRED", "submission baseline must precede Generate"
             )
+        return submit
+
+    async def click_generate_once(self) -> None:
+        """Click the single enabled Agent start control at most once."""
+        if self._generate_clicked:
+            raise PhaseGError(
+                "PHASE_G_DUPLICATE_SUBMIT_FORBIDDEN", "this Flow port already clicked Generate"
+            )
+        if not self._submit_observer_armed:
+            raise PhaseGError(
+                "PHASE_G_SUBMIT_OBSERVER_REQUIRED", "submit request observer must precede Generate"
+            )
+        page = self._require_page()
+        submit = await self._validate_generate_control(page)
         self._generate_clicked = True
-        await submit.click(timeout=5_000)
+        self._submit_dispatch_started_at = _monotonic()
+        self._submit_dispatch_deadline = (
+            self._submit_dispatch_started_at + _SUBMIT_DISPATCH_TIMEOUT_SECONDS
+        )
+        try:
+            await submit.click(timeout=5_000)
+        except Exception:
+            # A click timeout is ambiguous; keep observing for the already-started request.
+            self._generate_click_dispatched = None
+        else:
+            self._generate_click_dispatched = True
+
+    async def await_submit_dispatch(self) -> PhaseGSubmitTransportEvidence:
+        """Wait out the short dispatch window, then close request counting."""
+        if self._submit_dispatch_deadline is None:
+            raise PhaseGError("PHASE_G_SUBMIT_OBSERVER_REQUIRED", "Generate was not dispatched")
+        remaining = max(0.0, self._submit_dispatch_deadline - _monotonic())
+        if remaining:
+            await _async_sleep(remaining)
+        self._submit_dispatch_window_completed = True
+        self.disarm_submit_request_observer()
+        if self._response_tasks:
+            await asyncio.gather(*tuple(self._response_tasks), return_exceptions=True)
+        if self._submit_requests and self._submit_request_failed is None:
+            self._submit_request_failed = False
+        return self.read_submit_transport_evidence()
+
+    def read_submit_transport_evidence(self) -> PhaseGSubmitTransportEvidence:
+        count = len(self._submit_requests)
+        return PhaseGSubmitTransportEvidence(
+            generate_click_dispatched=self._generate_click_dispatched,
+            provider_submit_rpc_observed=count > 0,
+            provider_submit_rpc_id=TEXT_TO_VIDEO_SUBMIT_RPC if count else None,
+            provider_submit_observed_at=self._submit_observed_at,
+            provider_submit_http_method="POST" if count else None,
+            provider_submit_project_id=self._submit_project_id,
+            provider_submit_request_count=count,
+            provider_submit_dispatch_window_completed=(self._submit_dispatch_window_completed),
+            provider_submit_request_failed=self._submit_request_failed,
+            provider_submit_response_observed=(self._submit_response_observed if count else False),
+            provider_submit_response_status=self._submit_response_status,
+            provider_submit_generation_record_observed=(self._submit_generation_record_observed),
+            provider_submit_refusal_detected=self._submit_refusal_detected,
+        )
+
+    def disarm_submit_request_observer(self) -> None:
+        if self._page is not None and self._submit_observer_armed:
+            self._page.remove_listener("request", self._on_request)
+            self._page.remove_listener("requestfailed", self._on_request_failed)
+        self._submit_observer_armed = False
 
     async def await_confirmation(
         self, baseline: FlowSubmissionBaseline, *, observation_deadline: float
@@ -633,6 +720,59 @@ class GoogleFlowAgentOnlyGenerationPort:
             out_dir=destination,
         )
 
+    def _on_request(self, request: Any) -> None:
+        """Observe only the exact T2V submit RPC during the one-click window."""
+        if (
+            not self._submit_observer_armed
+            or self._submit_dispatch_started_at is None
+            or self._submit_dispatch_deadline is None
+            or not self._submit_dispatch_started_at
+            <= _monotonic()
+            <= self._submit_dispatch_deadline
+        ):
+            return
+        parsed = urlparse(str(request.url))
+        if (
+            parsed.netloc != "flow.google.com"
+            or not parsed.path.endswith("/data/batchexecute")
+            or str(request.method).upper() != "POST"
+        ):
+            return
+        rpcids = parse_qs(parsed.query).get("rpcids", [])
+        if TEXT_TO_VIDEO_SUBMIT_RPC not in rpcids:
+            return
+        attempt = self._request
+        page = self._page
+        if attempt is None or page is None:
+            return
+        page_url = urlparse(page.url)
+        if (
+            page_url.netloc != "flow.google.com"
+            or page_url.path != f"/project/{attempt.provider_project_id}"
+        ):
+            return
+        self._submit_requests.append(request)
+        self._submit_project_id = attempt.provider_project_id
+        if self._submit_observed_at is None:
+            self._submit_observed_at = (
+                datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            )
+
+    def _on_request_failed(self, request: Any) -> None:
+        if self._is_submit_request(request):
+            self._submit_request_failed = True
+
+    def _is_submit_request(self, request: Any) -> bool:
+        candidate_impl = getattr(request, "_impl_obj", None)
+        return any(
+            request is tracked
+            or request == tracked
+            or (
+                candidate_impl is not None and candidate_impl is getattr(tracked, "_impl_obj", None)
+            )
+            for tracked in self._submit_requests
+        )
+
     def _on_response(self, response: Response) -> None:
         """Parse only sanitized record fields; do not retain response bodies or signed URLs."""
         parsed = urlparse(response.url)
@@ -644,12 +784,23 @@ class GoogleFlowAgentOnlyGenerationPort:
 
     async def _capture_response(self, response: Response) -> None:
         try:
+            is_submit_response = self._is_submit_request(response.request)
+        except Exception:
+            is_submit_response = False
+        if is_submit_response:
+            self._submit_response_observed = True
+            self._submit_response_status = int(response.status)
+            self._submit_generation_record_observed = False
+            self._submit_refusal_detected = False
+        try:
             body = await response.text()
         except Exception:
             return
         for error in rpc_errors(body):
             if "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in error.reasons:
                 self._waf_rejected = True
+                if is_submit_response:
+                    self._submit_refusal_detected = True
         request = self._request
         if request is None:
             return
@@ -661,6 +812,8 @@ class GoogleFlowAgentOnlyGenerationPort:
                 record = generation_record(rpcid, payload)
             except Exception:
                 continue
+            if is_submit_response and rpcid == TEXT_TO_VIDEO_SUBMIT_RPC:
+                self._submit_generation_record_observed = True
             key = (record.workflow_id.lower(), record.project_id.lower(), record.media_id.lower())
             self._records[key] = _ObservedRecord(
                 record.workflow_id, record.project_id, record.media_id, record.status

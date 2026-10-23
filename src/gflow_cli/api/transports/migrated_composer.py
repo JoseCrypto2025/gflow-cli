@@ -58,6 +58,7 @@ from gflow_cli.api.transports._common import (
     safe_page_url,
 )
 from gflow_cli.api.transports.batchexecute import (
+    TEXT_TO_VIDEO_SUBMIT_RPC,
     GenerationRecord,
     generation_record,
     image_records,
@@ -187,7 +188,7 @@ COOKIE_BAR_ACCEPT = "button.glue-cookie-notification-bar__accept"
 #: t2v submits on ``YhhmEf``, i2v on ``eb1hJf``, and an Ingredients (r2v) run on
 #: ``MZZa6b`` — measured 2026-09-05. Watching only the first is why r2v looked
 #: for several rounds like it never submitted at all.
-SUBMIT_RPCS = ("YhhmEf", "eb1hJf", "MZZa6b", "nprQif")
+SUBMIT_RPCS = (TEXT_TO_VIDEO_SUBMIT_RPC, "eb1hJf", "MZZa6b", "nprQif")
 #: The start+end (interpolation) submit. Same composer, different contract: the model
 #: key is ``veo_3_1_interpolation_lite``, the body carries BOTH frame ids, and the rpc
 #: name travels in the ``f.req`` body — the URL carries no ``rpcids`` query param

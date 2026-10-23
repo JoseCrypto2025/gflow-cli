@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 import gflow_cli.v2_runtime.phase_g_live_flow as live_flow
+from gflow_cli.api.transports.batchexecute import TEXT_TO_VIDEO_SUBMIT_RPC
 from gflow_cli.v2_runtime.phase_g import FlowSubmissionBaseline, PhaseGError
 from gflow_cli.v2_runtime.phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
 
@@ -57,6 +59,46 @@ class _Base:
     async def select_project(self, project_id: str) -> SimpleNamespace:
         return SimpleNamespace(project_id=project_id)
 
+    async def inspect_surface(self) -> str:
+        return "AGENT_ONLY"
+
+
+class _EventPage(_Page):
+    def __init__(self) -> None:
+        super().__init__(_Locator(None))
+        self.url = "https://flow.google.com/project/project"
+        self.events: dict[str, object] = {}
+        self.submit_request = SimpleNamespace(
+            url="https://flow.google.com/data/batchexecute?rpcids=YhhmEf", method="POST"
+        )
+
+    def on(self, event: str, callback: object) -> None:
+        self.events[event] = callback
+
+    def remove_listener(self, event: str, _callback: object) -> None:
+        self.events.pop(event, None)
+
+    def locator(self, _selector: str) -> Any:
+        page = self
+
+        class Button:
+            async def count(self) -> int:
+                return 1
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def click(self, *, timeout: int) -> None:
+                assert timeout == 5_000
+                callback = page.events["request"]
+                assert callable(callback)
+                callback(page.submit_request)
+
+        return Button()
+
 
 def _port(gate_after_polls: int | None) -> GoogleFlowAgentOnlyGenerationPort:
     port = GoogleFlowAgentOnlyGenerationPort.__new__(GoogleFlowAgentOnlyGenerationPort)
@@ -72,6 +114,19 @@ def _port(gate_after_polls: int | None) -> GoogleFlowAgentOnlyGenerationPort:
     port._observed_peak_pending = 0
     port._observed_new_turn = False
     port._observed_head_changed = False
+    port._submit_observer_armed = False
+    port._submit_dispatch_started_at = None
+    port._submit_dispatch_deadline = None
+    port._submit_dispatch_window_completed = False
+    port._generate_click_dispatched = None
+    port._submit_requests = []
+    port._submit_observed_at = None
+    port._submit_project_id = None
+    port._submit_request_failed = None
+    port._submit_response_observed = False
+    port._submit_response_status = None
+    port._submit_generation_record_observed = None
+    port._submit_refusal_detected = None
     return port
 
 
@@ -85,6 +140,185 @@ UUID_C = "cccccccc-0000-0000-0000-000000000003"
 UUID_D = "dddddddd-0000-0000-0000-000000000004"
 UUID_E = "eeeeeeee-0000-0000-0000-000000000005"
 UUID_F = "ffffffff-0000-0000-0000-000000000006"
+
+
+@pytest.mark.asyncio
+async def test_submit_request_observer_is_armed_before_generate_click() -> None:
+    port = _port(None)
+    page = _EventPage()
+    port._page = page  # type: ignore[assignment]
+    port._base = _Base()  # type: ignore[assignment]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+    port._baseline = _baseline()
+
+    await port.arm_submit_request_observer()
+    assert "request" in page.events
+    await port.click_generate_once()
+
+    evidence = port.read_submit_transport_evidence()
+    assert evidence.generate_click_dispatched is True
+    assert evidence.provider_submit_rpc_observed is True
+    assert evidence.provider_submit_rpc_id == TEXT_TO_VIDEO_SUBMIT_RPC
+    assert evidence.provider_submit_request_count == 1
+    assert evidence.provider_submit_project_id == "project"
+    assert evidence.provider_submit_http_method == "POST"
+
+
+def test_unrelated_batchexecute_request_does_not_count_as_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _port(None)
+    port._page = SimpleNamespace(url="https://flow.google.com/project/project")  # type: ignore[assignment]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+    port._submit_observer_armed = True
+    port._submit_dispatch_started_at = 1.0
+    port._submit_dispatch_deadline = 20.0
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 2.0)
+
+    request = SimpleNamespace(
+        url="https://flow.google.com/data/batchexecute?rpcids=jwpduf", method="POST"
+    )
+    port._on_request(request)
+
+    assert port.read_submit_transport_evidence().provider_submit_request_count == 0
+
+
+def test_duplicate_submit_requests_count_without_reading_sensitive_request_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _port(None)
+    port._page = SimpleNamespace(url="https://flow.google.com/project/project")  # type: ignore[assignment]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+    port._submit_observer_armed = True
+    port._submit_dispatch_started_at = 1.0
+    port._submit_dispatch_deadline = 20.0
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 2.0)
+
+    class SensitiveRequest:
+        url = "https://flow.google.com/data/batchexecute?rpcids=YhhmEf"
+        method = "POST"
+
+        @property
+        def post_data(self) -> str:
+            raise AssertionError("request body must never be read")
+
+        @property
+        def headers(self) -> dict[str, str]:
+            raise AssertionError("request headers must never be read")
+
+    port._on_request(SensitiveRequest())
+    port._on_request(SensitiveRequest())
+    evidence = port.read_submit_transport_evidence()
+
+    assert evidence.provider_submit_request_count == 2
+    assert evidence.provider_submit_rpc_observed is True
+    assert evidence.provider_submit_rpc_id == TEXT_TO_VIDEO_SUBMIT_RPC
+    assert evidence.provider_submit_http_method == "POST"
+    assert not hasattr(evidence, "post_data")
+    assert not hasattr(evidence, "headers")
+
+
+@pytest.mark.asyncio
+async def test_submit_response_generation_record_is_correlated_to_exact_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _port(None)
+    request = SimpleNamespace(
+        url="https://flow.google.com/data/batchexecute?rpcids=YhhmEf", method="POST"
+    )
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+    port._submit_requests = [request]
+
+    class Response:
+        url = "https://flow.google.com/data/batchexecute?rpcids=YhhmEf"
+        status = 200
+
+        def __init__(self) -> None:
+            self.request = request
+
+        async def text(self) -> str:
+            return "SENSITIVE_RESPONSE_BODY"
+
+    monkeypatch.setattr(live_flow, "rpc_errors", lambda _body: [])
+    monkeypatch.setattr(live_flow, "parse_frames", lambda _body: [("YhhmEf", {})])
+    monkeypatch.setattr(
+        live_flow,
+        "generation_record",
+        lambda _rpcid, _payload: SimpleNamespace(
+            workflow_id="workflow", project_id="project", media_id="media", status=6
+        ),
+    )
+
+    await port._capture_response(Response())  # type: ignore[arg-type]
+
+    evidence = port.read_submit_transport_evidence()
+    assert evidence.provider_submit_response_observed is True
+    assert evidence.provider_submit_response_status == 200
+    assert evidence.provider_submit_generation_record_observed is True
+    assert evidence.provider_submit_refusal_detected is False
+    assert "SENSITIVE_RESPONSE_BODY" not in repr(evidence)
+
+
+@pytest.mark.asyncio
+async def test_submit_response_without_record_stays_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _port(None)
+    request = SimpleNamespace(url="request", method="POST")
+    port._submit_requests = [request]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+
+    class Response:
+        url = "https://flow.google.com/data/batchexecute?rpcids=YhhmEf"
+        status = 200
+
+        def __init__(self) -> None:
+            self.request = request
+
+        async def text(self) -> str:
+            return "response without a generation record"
+
+    monkeypatch.setattr(live_flow, "rpc_errors", lambda _body: [])
+    monkeypatch.setattr(live_flow, "parse_frames", lambda _body: [])
+
+    await port._capture_response(Response())  # type: ignore[arg-type]
+
+    evidence = port.read_submit_transport_evidence()
+    assert evidence.provider_submit_response_observed is True
+    assert evidence.provider_submit_generation_record_observed is False
+    assert evidence.provider_submit_refusal_detected is False
+
+
+@pytest.mark.asyncio
+async def test_submit_waf_response_keeps_existing_refusal_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _port(None)
+    request = SimpleNamespace(url="request", method="POST")
+    port._submit_requests = [request]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+
+    class Response:
+        url = "https://flow.google.com/data/batchexecute?rpcids=YhhmEf"
+        status = 200
+
+        def __init__(self) -> None:
+            self.request = request
+
+        async def text(self) -> str:
+            return "sanitized fixture"
+
+    monkeypatch.setattr(
+        live_flow,
+        "rpc_errors",
+        lambda _body: [SimpleNamespace(reasons=("PUBLIC_ERROR_UNUSUAL_ACTIVITY",))],
+    )
+    monkeypatch.setattr(live_flow, "parse_frames", lambda _body: [])
+
+    await port._capture_response(Response())  # type: ignore[arg-type]
+
+    assert port._waf_rejected is True
+    assert port.read_submit_transport_evidence().provider_submit_refusal_detected is True
 
 
 def _wire_record(workflow_id: str, media_id: str, status: int) -> live_flow._ObservedRecord:

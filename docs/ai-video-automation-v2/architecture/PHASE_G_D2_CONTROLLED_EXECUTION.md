@@ -20,7 +20,25 @@ applies the pinned model, mode, aspect ratio, output count, and confirmation
 policy `Always`, then verifies readback. The baseline of existing media,
 executions, pending tiles, confirmation IDs, and Agent turn is captured
 immediately before the one allowed Generate action and durably recorded in the
-attempt ledger. Confirmation may be late or optional: the executor observes the
+attempt ledger. The live port validates the pinned project, Agent-only surface,
+and enabled Generate control, then arms a passive request listener before the
+durable Generate mark and click. It counts only POST requests to the exact
+`flow.google.com/data/batchexecute` endpoint whose `rpcids` includes `YhhmEf`,
+and binds the observed project from the still-pinned project page. The 15-second
+dispatch window is bounded by the existing 240-second attempt deadline; it is
+based on the checked-in video-wire observation where the `YhhmEf` response
+completed in 4.301 seconds, with the window serving as a fail-closed ceiling,
+not a latency guarantee. Request bodies, prompts, headers, tokens, full URLs,
+and response bodies are never persisted. Duplicate submit requests fail closed.
+
+The attempt ledger distinguishes the click invocation, outbound submit request,
+response, decoded `GenerationRecord`, and refusal signal. An interrupted
+dispatch window is classified `SUBMIT_DISPATCH_OBSERVATION_INCOMPLETE`; missing
+outbound evidence after the full window is `SUBMIT_RPC_NOT_OBSERVED`; a request
+without a response is `SUBMIT_SENT_RESPONSE_UNKNOWN`; a response without a
+record remains unresolved. These diagnostics do not prove provider acceptance or billing,
+release conservative accounting, or authorize a retry. Confirmation may be late
+or optional: the executor observes the
 same attempt for one bounded 240-second window, polls for a newly attributable
 gate, retains sanitized pending/media/Agent-turn progress, and does not fail
 merely because a gate did not appear in the first 30 seconds. A newly observed

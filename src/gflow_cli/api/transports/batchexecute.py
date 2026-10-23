@@ -32,6 +32,8 @@ from typing import Any, cast
 from gflow_cli.data.redaction import redact_error_detail
 from gflow_cli.errors import WireFormatError
 
+TEXT_TO_VIDEO_SUBMIT_RPC = "YhhmEf"
+
 _XSSI_PREFIX = ")]}'"
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{120,}")

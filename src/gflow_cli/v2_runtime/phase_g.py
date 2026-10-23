@@ -206,6 +206,25 @@ class PhaseGAttemptEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class PhaseGSubmitTransportEvidence:
+    """Allowlisted request/response facts for the one Phase G submit window."""
+
+    generate_click_dispatched: bool | None = None
+    provider_submit_rpc_observed: bool = False
+    provider_submit_rpc_id: str | None = None
+    provider_submit_observed_at: str | None = None
+    provider_submit_http_method: str | None = None
+    provider_submit_project_id: str | None = None
+    provider_submit_request_count: int = 0
+    provider_submit_dispatch_window_completed: bool = False
+    provider_submit_request_failed: bool | None = None
+    provider_submit_response_observed: bool | None = None
+    provider_submit_response_status: int | None = None
+    provider_submit_generation_record_observed: bool | None = None
+    provider_submit_refusal_detected: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FlowSubmissionBaseline:
     """Attempt-specific provider state captured immediately before Generate."""
 
@@ -253,7 +272,11 @@ class FlowGenerationPort(Protocol):
     async def fill_prompt(self, prompt: str, negative_prompt: str) -> None: ...
     async def read_prompt(self) -> str | None: ...
     async def capture_submission_baseline(self) -> FlowSubmissionBaseline: ...
+    async def arm_submit_request_observer(self) -> None: ...
     async def click_generate_once(self) -> None: ...
+    async def await_submit_dispatch(self) -> PhaseGSubmitTransportEvidence: ...
+    def read_submit_transport_evidence(self) -> PhaseGSubmitTransportEvidence: ...
+    def disarm_submit_request_observer(self) -> None: ...
     async def await_confirmation(
         self, baseline: FlowSubmissionBaseline, *, observation_deadline: float
     ) -> FlowConfirmationGate | None: ...
@@ -408,6 +431,7 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 request.d2_run_id, baseline
             )
             self.ledger.capture_baseline(request.d2_run_id, baseline)
+            await self.port.arm_submit_request_observer()
             self.ledger.mark_generate_action(request.d2_run_id)
             generate_recorded = True
             started = True
@@ -415,8 +439,20 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 self.production_credit_guard.record_generate_click(
                     request.execution_context.attempt_id
                 )
-            await self.port.click_generate_once()
             observation_deadline = time.monotonic() + 240
+            await self.port.click_generate_once()
+            dispatch = await self.port.await_submit_dispatch()
+            self.ledger.record_submit_transport_evidence(request.d2_run_id, dispatch)
+            if dispatch.provider_submit_request_count == 0:
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_RPC_NOT_OBSERVED",
+                    "no YhhmEf submit request was observed in the bounded dispatch window",
+                )
+            if dispatch.provider_submit_request_count > 1:
+                raise PhaseGError(
+                    "PHASE_G_DUPLICATE_SUBMIT_RPC",
+                    "multiple YhhmEf submit requests were observed after one Generate click",
+                )
             gate = await self.port.await_confirmation(
                 baseline, observation_deadline=observation_deadline
             )
@@ -496,6 +532,16 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 confirmation_id,
                 observation_deadline=observation_deadline,
             )
+            submit_transport = self.port.read_submit_transport_evidence()
+            self.ledger.record_submit_transport_evidence(request.d2_run_id, submit_transport)
+            if (
+                submit_transport.provider_submit_response_observed is True
+                and submit_transport.provider_submit_generation_record_observed is False
+            ):
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_RESPONSE_NO_GENERATION_RECORD",
+                    "YhhmEf response did not contain an attributable GenerationRecord",
+                )
             if evidence.d2_run_id != request.d2_run_id:
                 raise PhaseGError(
                     "PHASE_G_ATTEMPT_ATTRIBUTION_FAILED", "provider evidence belongs to another run"
@@ -601,6 +647,8 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             )
         except WafRejectionError:
             if generate_recorded:
+                self._record_submit_transport_evidence(request)
+            if generate_recorded:
                 self.ledger.record_state(
                     request.d2_run_id,
                     submission_state="WAF_REJECTED",
@@ -613,6 +661,7 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             raise
         except BaseException:
             if started and generate_recorded:
+                self._record_submit_transport_evidence(request)
                 self._record_unknown(request)
             elif request.execution_context is not None and self.production_credit_guard is not None:
                 try:
@@ -623,6 +672,7 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                     pass
             raise
         finally:
+            self.port.disarm_submit_request_observer()
             # Failed restoration leaves the journal DIRTY and blocks new work.
             restoring_error: Exception | None = None
             try:
@@ -655,6 +705,15 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             provider_project_id=request.provider_project_id,
         )
         self._resolve_production_guard(request, "FAILED_CONFIRMED", 0)
+
+    def _record_submit_transport_evidence(self, request: PhaseGExecutionRequest) -> None:
+        try:
+            self.ledger.record_submit_transport_evidence(
+                request.d2_run_id, self.port.read_submit_transport_evidence()
+            )
+        except PhaseGError:
+            # Preserve the original Phase G failure; the attempt remains UNKNOWN.
+            pass
 
     def _resolve_production_guard(
         self,
@@ -1107,6 +1166,153 @@ class D2DailyCreditLedger:
             return dict(attempt)
 
         return self._mutate(update)
+
+    def record_submit_transport_evidence(
+        self, d2_run_id: str, evidence: PhaseGSubmitTransportEvidence
+    ) -> dict[str, object]:
+        """Persist only allowlisted submit transport metadata, never wire payloads."""
+        count = evidence.provider_submit_request_count
+        if type(count) is not int or count < 0:
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "request count is invalid")
+        if type(evidence.provider_submit_rpc_observed) is not bool:
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "RPC observation flag is invalid")
+        if evidence.provider_submit_rpc_observed != (count > 0):
+            raise PhaseGError(
+                "PHASE_G_SUBMIT_EVIDENCE_INVALID", "request count conflicts with RPC evidence"
+            )
+        if count and (
+            evidence.provider_submit_rpc_id != "YhhmEf"
+            or evidence.provider_submit_http_method != "POST"
+            or not evidence.provider_submit_observed_at
+            or not evidence.provider_submit_project_id
+        ):
+            raise PhaseGError(
+                "PHASE_G_SUBMIT_EVIDENCE_INVALID", "submit request facts are incomplete"
+            )
+        if not count and any(
+            value is not None
+            for value in (
+                evidence.provider_submit_rpc_id,
+                evidence.provider_submit_observed_at,
+                evidence.provider_submit_http_method,
+                evidence.provider_submit_project_id,
+            )
+        ):
+            raise PhaseGError(
+                "PHASE_G_SUBMIT_EVIDENCE_INVALID", "unobserved request contains request metadata"
+            )
+        for flag in (
+            evidence.generate_click_dispatched,
+            evidence.provider_submit_dispatch_window_completed,
+            evidence.provider_submit_request_failed,
+            evidence.provider_submit_response_observed,
+            evidence.provider_submit_generation_record_observed,
+            evidence.provider_submit_refusal_detected,
+        ):
+            if flag is not None and type(flag) is not bool:
+                raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "transport flag is invalid")
+        if (
+            evidence.provider_submit_observed_at is not None
+            and type(evidence.provider_submit_observed_at) is not str
+        ):
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "request timestamp is invalid")
+        if evidence.provider_submit_response_status is not None and (
+            type(evidence.provider_submit_response_status) is not int
+            or not 100 <= evidence.provider_submit_response_status <= 599
+        ):
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "response status is invalid")
+        if evidence.provider_submit_response_observed is not True and (
+            evidence.provider_submit_response_status is not None
+            or evidence.provider_submit_generation_record_observed is True
+            or evidence.provider_submit_refusal_detected is True
+        ):
+            raise PhaseGError(
+                "PHASE_G_SUBMIT_EVIDENCE_INVALID", "response facts require an observed response"
+            )
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            attempt = self._attempt(payload, d2_run_id)
+            if _counter(attempt.get("generate_action_count")) != 1:
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_EVIDENCE_INVALID",
+                    "submit evidence requires the recorded one-time Generate action",
+                )
+            if count and evidence.provider_submit_project_id != attempt.get("provider_project_id"):
+                raise PhaseGError(
+                    "PHASE_G_PROJECT_MISMATCH", "submit request project is not pinned"
+                )
+            previous_count = _counter(attempt.get("provider_submit_request_count"))
+            if count < previous_count:
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_EVIDENCE_INVALID", "submit request count cannot decrease"
+                )
+            if attempt.get("generate_click_dispatched") is True and (
+                evidence.generate_click_dispatched is not True
+            ):
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_EVIDENCE_INVALID", "click dispatch evidence cannot be cleared"
+                )
+            if attempt.get("provider_submit_dispatch_window_completed") is True and (
+                evidence.provider_submit_dispatch_window_completed is not True
+            ):
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_EVIDENCE_INVALID",
+                    "dispatch window completion cannot be cleared",
+                )
+            if attempt.get("provider_submit_response_observed") is True and (
+                evidence.provider_submit_response_observed is not True
+            ):
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_EVIDENCE_INVALID", "response evidence cannot be cleared"
+                )
+            if attempt.get("provider_submit_generation_record_observed") is True and (
+                evidence.provider_submit_generation_record_observed is not True
+            ):
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_EVIDENCE_INVALID", "record evidence cannot be cleared"
+                )
+            attempt.update(
+                generate_click_dispatched=evidence.generate_click_dispatched,
+                provider_submit_rpc_observed=evidence.provider_submit_rpc_observed,
+                provider_submit_rpc_id=evidence.provider_submit_rpc_id,
+                provider_submit_observed_at=evidence.provider_submit_observed_at,
+                provider_submit_http_method=evidence.provider_submit_http_method,
+                provider_submit_project_id=evidence.provider_submit_project_id,
+                provider_submit_request_count=count,
+                provider_submit_dispatch_window_completed=(
+                    evidence.provider_submit_dispatch_window_completed
+                ),
+                provider_submit_request_failed=evidence.provider_submit_request_failed,
+                provider_submit_response_observed=evidence.provider_submit_response_observed,
+                provider_submit_response_status=evidence.provider_submit_response_status,
+                provider_submit_generation_record_observed=(
+                    evidence.provider_submit_generation_record_observed
+                ),
+                provider_submit_refusal_detected=evidence.provider_submit_refusal_detected,
+                provider_submit_transport_classification=(
+                    self._submit_transport_classification(evidence)
+                ),
+                updated_at=_utc_now(),
+            )
+            return dict(attempt)
+
+        return self._mutate(update)
+
+    @staticmethod
+    def _submit_transport_classification(evidence: PhaseGSubmitTransportEvidence) -> str:
+        if evidence.provider_submit_dispatch_window_completed is not True:
+            return "SUBMIT_DISPATCH_OBSERVATION_INCOMPLETE"
+        if evidence.provider_submit_request_count == 0:
+            return "SUBMIT_RPC_NOT_OBSERVED"
+        if evidence.provider_submit_request_count > 1:
+            return "DUPLICATE_SUBMIT_RPC"
+        if evidence.provider_submit_response_observed is not True:
+            return "SUBMIT_SENT_RESPONSE_UNKNOWN"
+        if evidence.provider_submit_refusal_detected is True:
+            return "SUBMIT_RESPONSE_PROVIDER_REFUSAL"
+        if evidence.provider_submit_generation_record_observed is True:
+            return "SUBMIT_RESPONSE_WITH_GENERATION_RECORD"
+        return "SUBMIT_RESPONSE_WITHOUT_GENERATION_RECORD"
 
     def capture_baseline(
         self, d2_run_id: str, baseline: FlowSubmissionBaseline
@@ -2532,6 +2738,20 @@ class D2DailyCreditLedger:
             "started_at": now,
             "started_bangkok_date": datetime.now(_BANGKOK).date().isoformat(),
             "generate_action_count": 0,
+            "generate_click_dispatched": None,
+            "provider_submit_rpc_observed": None,
+            "provider_submit_rpc_id": None,
+            "provider_submit_observed_at": None,
+            "provider_submit_http_method": None,
+            "provider_submit_project_id": None,
+            "provider_submit_request_count": 0,
+            "provider_submit_dispatch_window_completed": False,
+            "provider_submit_request_failed": None,
+            "provider_submit_response_observed": None,
+            "provider_submit_response_status": None,
+            "provider_submit_generation_record_observed": None,
+            "provider_submit_refusal_detected": None,
+            "provider_submit_transport_classification": None,
             "quoted_video_count": None,
             "quoted_credit_cost": None,
             "approval_action_count": 0,
