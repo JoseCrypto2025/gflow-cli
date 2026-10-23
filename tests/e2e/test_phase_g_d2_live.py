@@ -78,13 +78,17 @@ async def test_phase_g_one_approved_test_clip(e2e_profile_dir: Path) -> None:
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     attempt = next(row for row in ledger["attempts"] if row["d2_run_id"] == request.d2_run_id)
     assert attempt["generate_click_dispatched"] is True
-    assert attempt["provider_submit_rpc_observed"] is True
-    assert attempt["provider_submit_rpc_id"] == "YhhmEf"
-    assert attempt["provider_submit_http_method"] == "POST"
-    assert attempt["provider_submit_project_id"] == request.provider_project_id
-    assert attempt["provider_submit_request_count"] == 1
-    assert attempt["provider_submit_response_observed"] is True
-    assert attempt["provider_submit_generation_record_observed"] is True
+    assert attempt["submission_surface"] == "AGENT_ONLY"
+    assert attempt["agent_turn_dispatched"] is True
+    assert attempt["provider_directive_sha256"]
+    if attempt["provider_submit_request_count"]:
+        assert attempt["provider_submit_rpc_observed"] is True
+        assert attempt["provider_submit_rpc_id"] == "YhhmEf"
+        assert attempt["provider_submit_http_method"] == "POST"
+        assert attempt["provider_submit_project_id"] == request.provider_project_id
+    else:
+        assert attempt["provider_submit_rpc_id"] is None
+    assert attempt["provider_submit_request_count"] <= 1
 
     evidence_path = state_root / "phase-g-live-result.json"
     evidence_path.parent.mkdir(parents=True, exist_ok=True)

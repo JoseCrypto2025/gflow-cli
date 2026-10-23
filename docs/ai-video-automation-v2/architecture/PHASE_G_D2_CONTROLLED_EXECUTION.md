@@ -21,23 +21,27 @@ policy `Always`, then verifies readback. The baseline of existing media,
 executions, pending tiles, confirmation IDs, and Agent turn is captured
 immediately before the one allowed Generate action and durably recorded in the
 attempt ledger. The live port validates the pinned project, Agent-only surface,
-and enabled Generate control, then arms a passive request listener before the
-durable Generate mark and click. It counts only POST requests to the exact
-`flow.google.com/data/batchexecute` endpoint whose `rpcids` includes `YhhmEf`,
-and binds the observed project from the still-pinned project page. The 15-second
-dispatch window is bounded by the existing 240-second attempt deadline; it is
-based on the checked-in video-wire observation where the `YhhmEf` response
-completed in 4.301 seconds, with the window serving as a fail-closed ceiling,
-not a latency guarantee. Request bodies, prompts, headers, tokens, full URLs,
-and response bodies are never persisted. Duplicate submit requests fail closed.
+and one enabled structural Generate control, then arms a passive request listener
+before the durable Generate mark and click. On `AGENT_ONLY`, dispatch is proven
+by a new chat bubble whose text hash matches the exact provider directive and
+whose ordered chat baseline changed. `YhhmEf` is optional on this surface and is
+never required as submission or success proof. On `CLASSIC_MIGRATED`, the
+existing submit contract remains: one POST to the exact
+`flow.google.com/data/batchexecute` endpoint with `rpcids=YhhmEf`, bound to the
+still-pinned project. Both use the same bounded 15-second dispatch window;
+request bodies, prompts, headers, tokens, full URLs, and response bodies are
+never persisted. Duplicate submit requests fail closed.
 
-The attempt ledger distinguishes the click invocation, outbound submit request,
-response, decoded `GenerationRecord`, and refusal signal. An interrupted
-dispatch window is classified `SUBMIT_DISPATCH_OBSERVATION_INCOMPLETE`; missing
-outbound evidence after the full window is `SUBMIT_RPC_NOT_OBSERVED`; a request
-without a response is `SUBMIT_SENT_RESPONSE_UNKNOWN`; a response without a
-record remains unresolved. These diagnostics do not prove provider acceptance or billing,
-release conservative accounting, or authorize a retry. Confirmation may be late
+The attempt ledger distinguishes the click invocation, surface-specific
+dispatch evidence, outbound submit request, response, decoded
+`GenerationRecord`, and refusal signal. For Agent-only, an exact new prompt turn
+is recorded as `AGENT_TURN_DISPATCHED`; an incomplete or absent turn remains
+unresolved. For Classic Migrated, an interrupted dispatch window is classified
+`SUBMIT_DISPATCH_OBSERVATION_INCOMPLETE`; missing outbound evidence after the
+full window is `SUBMIT_RPC_NOT_OBSERVED`; a request without a response is
+`SUBMIT_SENT_RESPONSE_UNKNOWN`; a response without a record remains unresolved.
+These diagnostics do not prove provider billing, release conservative accounting,
+or authorize a retry. Confirmation may be late
 or optional: the executor observes the
 same attempt for one bounded 240-second window, polls for a newly attributable
 gate, retains sanitized pending/media/Agent-turn progress, and does not fail
@@ -52,9 +56,22 @@ approving a later gate; ambiguous billing remains conservatively reserved.
 
 The live Flow port requires an expected account email. It compares that value
 to the repository auth verifier's observed Google identity before the browser
-can reach the D2 generation boundary. The surface check also fails closed when
-the document/browser locale is not English, because the existing V2 controls
-have not been verified for translated labels.
+can reach the D2 generation boundary. The Agent-only submit control uses the
+structural `div.ProseMirror` editor and `flow-generate-icon-button button`
+submit anchors. The surface check also fails closed when the document/browser
+locale is not English, because the remaining V2 controls have not been verified
+for translated labels.
+
+The zero-credit dispatch diagnostic is
+[`scripts/operations/agent_only_zero_credit_canary.py`](../../../scripts/operations/agent_only_zero_credit_canary.py).
+It runs outside the D2 executor and ledger, blocks Service Workers for its
+browser context, arms context-wide request interception before its single
+diagnostic click, and aborts every outbound request after activation. It keeps
+only `rpcids`, HTTP methods, and timestamps. Its `INTERCEPTION_PASS` result is
+not by itself a zero-credit result: an operator must also read the provider
+balance before and after and verify that project media, pending tiles, and live
+gates are unchanged. If the balance reader is unavailable, stop before either
+the canary or a paid D2.
 
 Settings restoration runs on every path. The journal is marked `CLEAN` only
 after exact readback of the original settings. Any restore or readback failure
@@ -102,9 +119,23 @@ path cannot click Generate.
 
 The generation port must link observed provider execution/media evidence to
 the exact new confirmation and expected TEST project. IDs present in the
-pre-submit baseline are rejected. A successful single-output attempt must
-identify exactly one new media ID; multiple new IDs produce
-`UNEXPECTED_MULTI_OUTPUT` and are retained as evidence.
+pre-submit baseline are rejected. Agent-only media IDs are extracted only from
+the canonical `flow-content.google/video/<uuid>` media URL on a video option
+inside the new Agent chat turn; arbitrary UUIDs in tile text or attributes are
+not media evidence. Success requires exactly one new finished tile key relative
+to the ordered baseline, no pending tile, one new prompt-associated chat media
+ID, and a changed first (newest) finished tile. If the finished tile exposes a canonical
+media ID, it must match the chat media ID; an opaque `/asb/` tile is accepted
+only with the unique new finished tile and matching Agent chat poster evidence.
+Two outputs are terminal only when multiple distinct prompt-associated media
+IDs are matched by the same number of new finished tiles. Workflow and project
+UUIDs do not count as media. Agent-only `YhhmEf`, `WuwhI`, `jwpduf`, and `as29s`
+records are sanitized telemetry and do not independently attribute media.
+Classic Migrated continues to use the structured provider
+`GenerationRecord.media_id`. Exactly one new media identity is required for
+success; two or more attributable media IDs produce `UNEXPECTED_MULTI_OUTPUT`
+and are retained as evidence. An unreadable response body after submit remains
+same-attempt observation; it never authorizes a second click or a retry.
 
 Only the exact attributed media may be retrieved, into a job-scoped directory
 under `TEMP_ROOT/<D2_RUN_ID>/`. The existing migrated-host media recovery path

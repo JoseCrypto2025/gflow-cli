@@ -224,7 +224,10 @@ def test_phase_e_duration_is_structured_and_drives_distinct_agent_directives(dur
     directive = build_agent_only_directive(
         result.compiled_prompt or "scene prompt", result.technical_configuration
     )
-    assert f"target a duration of {duration} seconds" in directive
+    assert directive == (
+        f"Make me a {duration} second video of {result.compiled_prompt} "
+        f"in a {result.technical_configuration['aspect_ratio']} aspect ratio."
+    )
 
 
 def test_different_structured_durations_produce_different_agent_directives() -> None:
@@ -252,7 +255,7 @@ def test_absent_scene_and_profile_duration_holds_without_inventing_a_default() -
     assert "REQUIRED_PARAMETER_MAPPING_MISSING" in {issue.code for issue in result.errors}
     with pytest.raises(FlowPresubmitError) as exc:
         build_agent_only_directive("scene prompt", result.technical_configuration)
-    assert exc.value.code == "FLOW_DURATION_UNRESOLVED"
+    assert exc.value.code == "FLOW_AGENT_DIRECTIVE_UNRESOLVED"
 
 
 def test_profile_duration_is_only_a_fallback_after_scene_duration() -> None:

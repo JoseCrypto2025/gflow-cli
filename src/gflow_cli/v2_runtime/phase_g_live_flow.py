@@ -50,28 +50,51 @@ _MODEL_DISPLAY_NAMES = {"MDL_0001": "Veo 3.1 - Lite"}
 _FLOW_ORIGIN = "https://flow.google.com"
 _VIDEO_STATE_JS = r"""
 async () => {
-  const read = (root) => {
-    const values = [];
-    const uuid = /[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/ig;
-    for (const el of [root, ...root.querySelectorAll('*')]) {
-      for (const attr of ['src', 'href', 'data-media-id', 'data-id']) {
-        const value = el.getAttribute?.(attr) || '';
-        for (const match of value.matchAll(uuid)) values.push(match[0].toLowerCase());
-      }
-      for (const match of (el.textContent || '').matchAll(uuid)) {
-        values.push(match[0].toLowerCase());
-      }
-    }
-    return values;
+  const source = (element) => element ? (element.currentSrc || element.src || '') : '';
+  const mediaId = (value) => {
+    let url;
+    try { url = new URL(value); } catch { return null; }
+    const match = /^\/video\/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i.exec(url.pathname);
+    return url.origin === 'https://flow-content.google' && match
+      ? match[1].toLowerCase()
+      : null;
+  };
+  const digest = async (value) => {
+    if (!value) return null;
+    const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+    return [...new Uint8Array(bytes)].map(part => part.toString(16).padStart(2, '0')).join('');
   };
   const tiles = [...document.querySelectorAll('flow-video-tile')];
   const finished = tiles.filter(tile => !tile.querySelector('flow-pending-tile'));
   const chat = [...document.querySelectorAll('flow-chat-bubble')];
+  const videoOptions = [...document.querySelectorAll('flow-a2ui-video-option')].map(option => ({
+    media_id: mediaId(source(option.querySelector('img'))),
+    chat_bubble_index: chat.indexOf(option.closest('flow-chat-bubble')),
+  })).filter(option => option.media_id);
+  const tileRows = tiles.map(tile => {
+    const video = source(tile.querySelector('video'));
+    const image = source(tile.querySelector('img'));
+    return { key: video || image, media_id: mediaId(video) || mediaId(image) };
+  });
+  const finishedRows = finished.map(tile => {
+    const video = source(tile.querySelector('video'));
+    const image = source(tile.querySelector('img'));
+    return { key: video || image, media_id: mediaId(video) || mediaId(image) };
+  });
+  const tileKeys = await Promise.all(finishedRows.map(row => digest(row.key)));
+  const options = [...document.querySelectorAll('flow-a2ui-video-option')];
+  const optionIds = options
+    .map(option => mediaId(source(option.querySelector('img'))))
+    .filter(Boolean);
   return {
     pending: document.querySelectorAll('flow-video-tile flow-pending-tile').length,
-    media_ids: [...new Set([...tiles, ...document.querySelectorAll('flow-a2ui-video-option')]
-      .flatMap(read))],
-    finished_media_ids: [...new Set(finished.flatMap(read))],
+    media_ids: [...new Set(
+      [...tileRows, ...finishedRows].map(row => row.media_id).filter(Boolean).concat(optionIds)
+    )],
+    finished_media_ids: [...new Set(finishedRows.map(row => row.media_id).filter(Boolean))],
+    finished_tile_key_hashes: tileKeys.filter(Boolean),
+    chat_video_media_ids: [...new Set(videoOptions.map(option => option.media_id))],
+    chat_video_options: videoOptions,
     chat_count: chat.length,
     chat_bubble_hashes: await Promise.all(chat.map(async bubble => {
       const text = (bubble.innerText || bubble.textContent || '').trim();
@@ -83,7 +106,9 @@ async () => {
           'SHA-256', new TextEncoder().encode(chat[chat.length - 1].outerHTML)))].map(
           value => value.toString(16).padStart(2, '0')).join('')
       : '',
-    chat_media_ids: chat.length ? [...new Set(read(chat[chat.length - 1]))] : [],
+    chat_media_ids: chat.length ? [...new Set(videoOptions
+      .filter(option => option.chat_bubble_index === chat.length - 1)
+      .map(option => option.media_id))] : [],
   };
 }
 """
@@ -117,6 +142,8 @@ class _ObservedRecord:
     project_id: str
     media_id: str
     status: int | None
+    rpcid: str | None = None
+    submit_request: bool = False
 
     @property
     def is_done(self) -> bool:
@@ -179,8 +206,10 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._page: Page | None = None
         self._observed_media_ids: set[str] = set()
         self._observed_finished_media_ids: set[str] = set()
+        self._observed_finished_tile_key_hashes: set[str] = set()
         self._observed_peak_pending = 0
         self._observed_new_turn = False
+        self._observed_new_turn_bubble_index: int | None = None
         self._submit_observer_armed = False
         self._submit_dispatch_started_at: float | None = None
         self._submit_dispatch_deadline: float | None = None
@@ -194,6 +223,8 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._submit_response_status: int | None = None
         self._submit_generation_record_observed: bool | None = None
         self._submit_refusal_detected: bool | None = None
+        self._submission_surface = "AGENT_ONLY"
+        self._provider_directive_sha256: str | None = None
 
     @classmethod
     async def open(
@@ -205,6 +236,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         provider_project_id: str = _TEST_PROJECT_ID,
         project_name: str = _TEST_PROJECT_NAME,
         model_display_names: Mapping[str, str] = _MODEL_DISPLAY_NAMES,
+        block_service_workers: bool = False,
     ) -> GoogleFlowAgentOnlyGenerationPort:
         """Open a repository-owned TEST or PROD profile, never personal Chrome."""
         if not expected_email.strip() or "@" not in expected_email:
@@ -220,6 +252,7 @@ class GoogleFlowAgentOnlyGenerationPort:
             model_display_names=model_display_names,
             expected_email=expected_email,
             headless=False,
+            block_service_workers=block_service_workers,
         )
         lease = ProfileLease(base.profile_dir)
         try:
@@ -325,6 +358,7 @@ class GoogleFlowAgentOnlyGenerationPort:
                 "PHASE_G_NEGATIVE_PROMPT_UNSUPPORTED", "D2 requires an empty negative prompt"
             )
         await self._base.fill_prompt(prompt)
+        self._provider_directive_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
     async def read_prompt(self) -> str | None:
         return (await self._base.readback()).prompt
@@ -340,7 +374,7 @@ class GoogleFlowAgentOnlyGenerationPort:
             raise PhaseGError("PHASE_G_BASELINE_UNREADABLE", "Flow project baseline is unreadable")
         state = cast(dict[str, object], state)
         gate_ids = await self._confirmation_ids()
-        chat_ids = state.get("chat_media_ids", [])
+        chat_ids = state.get("chat_video_media_ids", [])
         chat_count = self._integer(state.get("chat_count"))
         chat_bubble_hashes = state.get("chat_bubble_hashes")
         bubble_hash_items = (
@@ -362,6 +396,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         media_ids.update(record.media_id.lower() for record in self._records.values())
         execution_ids = {record.workflow_id.lower() for record in self._records.values()}
         pending = self._integer(state.get("pending"))
+        finished_tile_key_hashes = tuple(self._valid_hashes(state.get("finished_tile_key_hashes")))
         baseline = FlowSubmissionBaseline(
             request.provider_project_id,
             frozenset(media_ids),
@@ -370,6 +405,8 @@ class GoogleFlowAgentOnlyGenerationPort:
             frozenset(gate_ids),
             f"{chat_count}:{state.get('chat_tail_hash') or ''}",
             tuple(cast(list[str], bubble_hash_items)),
+            finished_tile_key_hashes,
+            frozenset(self._valid_ids(chat_ids)),
         )
         self._baseline = baseline
         return baseline
@@ -400,7 +437,7 @@ class GoogleFlowAgentOnlyGenerationPort:
             raise PhaseGError(
                 "PHASE_G_SURFACE_MISMATCH", "Agent-only surface changed before Generate"
             )
-        submit = page.locator('button[aria-label="Start generation"]')
+        submit = page.locator("flow-generate-icon-button button")
         if (
             await submit.count() != 1
             or not await submit.is_visible()
@@ -441,12 +478,24 @@ class GoogleFlowAgentOnlyGenerationPort:
             self._generate_click_dispatched = True
 
     async def await_submit_dispatch(self) -> PhaseGSubmitTransportEvidence:
-        """Wait out the short dispatch window, then close request counting."""
+        """Observe the exact Agent turn or wait for the Classic Migrated request window."""
         if self._submit_dispatch_deadline is None:
             raise PhaseGError("PHASE_G_SUBMIT_OBSERVER_REQUIRED", "Generate was not dispatched")
-        remaining = max(0.0, self._submit_dispatch_deadline - _monotonic())
-        if remaining:
-            await _async_sleep(remaining)
+        if self._submission_surface == "AGENT_ONLY":
+            baseline = self._baseline
+            if baseline is None or self._provider_directive_sha256 is None:
+                raise PhaseGError(
+                    "PHASE_G_BASELINE_REQUIRED", "Agent dispatch needs the prompt and chat baseline"
+                )
+            while _monotonic() < self._submit_dispatch_deadline:
+                await self._capture_progress(baseline)
+                if self._observed_new_turn:
+                    break
+                await _async_sleep(min(1.0, self._submit_dispatch_deadline - _monotonic()))
+        else:
+            remaining = max(0.0, self._submit_dispatch_deadline - _monotonic())
+            if remaining:
+                await _async_sleep(remaining)
         self._submit_dispatch_window_completed = True
         self.disarm_submit_request_observer()
         if self._response_tasks:
@@ -458,6 +507,10 @@ class GoogleFlowAgentOnlyGenerationPort:
     def read_submit_transport_evidence(self) -> PhaseGSubmitTransportEvidence:
         count = len(self._submit_requests)
         return PhaseGSubmitTransportEvidence(
+            submission_surface=self._submission_surface,
+            agent_turn_dispatched=(
+                self._observed_new_turn if self._submission_surface == "AGENT_ONLY" else None
+            ),
             generate_click_dispatched=self._generate_click_dispatched,
             provider_submit_rpc_observed=count > 0,
             provider_submit_rpc_id=TEXT_TO_VIDEO_SUBMIT_RPC if count else None,
@@ -604,11 +657,17 @@ class GoogleFlowAgentOnlyGenerationPort:
                 await _async_sleep(1)
                 continue
             state = cast(dict[str, object], state)
+            if self._observed_new_turn_bubble_index is None:
+                self._observed_new_turn_bubble_index = self._new_agent_turn_bubble_index(
+                    state, baseline
+                )
+            self._observed_new_turn = self._observed_new_turn_bubble_index is not None
             pending = self._integer(state.get("pending"))
             peak_pending = max(peak_pending, pending)
             wire_new = [
                 record
                 for record in self._records.values()
+                if record.rpcid != "as29s" and self._submission_surface == "CLASSIC_MIGRATED"
                 if record.media_id.lower() not in baseline.media_ids
                 and record.workflow_id.lower() not in baseline.execution_ids
             ]
@@ -629,29 +688,79 @@ class GoogleFlowAgentOnlyGenerationPort:
                     attributed_confirmation_id=confirmation_id,
                 )
             wire_done = [record for record in wire_new if record.is_done]
-            wire_media_ids = {record.media_id.lower() for record in wire_new}
-            if len(wire_media_ids) > 1:
-                ids = tuple(sorted(wire_media_ids))
+            finished_dom_ids = set(self._valid_ids(state.get("finished_media_ids")))
+            current_tile_hashes = self._valid_hashes(state.get("finished_tile_key_hashes"))
+            new_tile_hashes = set(current_tile_hashes) - set(baseline.finished_tile_key_hashes)
+            newest_tile_changed = bool(
+                current_tile_hashes
+                and (
+                    not baseline.finished_tile_key_hashes
+                    or current_tile_hashes[0] != baseline.finished_tile_key_hashes[0]
+                )
+            )
+            dom_correlated_media_ids: set[str]
+            media_ids: set[str]
+            if self._submission_surface == "AGENT_ONLY":
+                new_turn_index = self._observed_new_turn_bubble_index
+                agent_chat_ids = self._chat_video_ids_for_turn(state, new_turn_index)
+                agent_chat_ids -= baseline.chat_video_media_ids | baseline.media_ids
+                agent_finished_ids = finished_dom_ids - baseline.media_ids
+                dom_correlated_media_ids = set()
+                if (
+                    len(agent_chat_ids) == 1
+                    and len(new_tile_hashes) == 1
+                    and newest_tile_changed
+                    and (not agent_finished_ids or agent_finished_ids == agent_chat_ids)
+                ):
+                    dom_correlated_media_ids = set(agent_chat_ids)
+                elif (
+                    len(agent_chat_ids) > 1
+                    and len(new_tile_hashes) == len(agent_chat_ids)
+                    and newest_tile_changed
+                    and (not agent_finished_ids or agent_finished_ids == agent_chat_ids)
+                ):
+                    dom_correlated_media_ids = set(agent_chat_ids)
+                media_ids = dom_correlated_media_ids
+            else:
+                chat_video_ids = set(self._valid_ids(state.get("chat_video_media_ids")))
+                dom_correlated_media_ids = (finished_dom_ids & chat_video_ids) - baseline.media_ids
+                media_ids = {
+                    record.media_id.lower() for record in wire_new
+                } | dom_correlated_media_ids
+            if len(media_ids) > 1 and (
+                self._submission_surface != "AGENT_ONLY" or len(new_tile_hashes) == len(media_ids)
+            ):
+                ids = tuple(sorted(media_ids))
                 return PhaseGAttemptEvidence(
                     request.d2_run_id,
                     "UNEXPECTED_MULTI_OUTPUT",
-                    provider_execution_id=wire_new[0].workflow_id,
+                    provider_execution_id=wire_new[0].workflow_id if wire_new else None,
                     provider_project_id=request.provider_project_id,
                     terminal_state="UNEXPECTED_MULTI_OUTPUT",
                     attributed_confirmation_id=confirmation_id,
                     new_provider_media_ids=ids,
                 )
-            # Only the structured provider media_id field identifies an output.
-            # DOM UUIDs may include workflow IDs, project IDs, or other references.
-            media_ids = set(wire_media_ids)
             baseline_chat_count, _, baseline_chat_hash = (baseline.agent_turn_id or "0:").partition(
                 ":"
             )
-            new_turn = self._observed_new_turn or (
+            classic_new_turn = (
                 self._integer(state.get("chat_count")) > int(baseline_chat_count or "0")
                 and str(state.get("chat_tail_hash") or "") != baseline_chat_hash
             )
-            if len(media_ids) == 1 and not pending and new_turn and wire_done:
+            new_turn = (
+                self._observed_new_turn_bubble_index is not None
+                if self._submission_surface == "AGENT_ONLY"
+                else classic_new_turn
+            )
+            completed_media_ids = {record.media_id.lower() for record in wire_done}
+            completed_media_ids.update(dom_correlated_media_ids)
+            if (
+                len(media_ids) == 1
+                and not pending
+                and new_turn
+                and len(completed_media_ids) == 1
+                and (self._submission_surface != "AGENT_ONLY" or newest_tile_changed)
+            ):
                 media_id = next(iter(media_ids))
                 workflow_id = next(
                     (
@@ -687,6 +796,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         wire_pending = [
             record
             for record in self._records.values()
+            if record.rpcid != "as29s" and self._submission_surface == "CLASSIC_MIGRATED"
             if record.media_id.lower() not in baseline.media_ids
             and record.workflow_id.lower() not in baseline.execution_ids
         ]
@@ -816,7 +926,12 @@ class GoogleFlowAgentOnlyGenerationPort:
                 self._submit_generation_record_observed = True
             key = (record.workflow_id.lower(), record.project_id.lower(), record.media_id.lower())
             self._records[key] = _ObservedRecord(
-                record.workflow_id, record.project_id, record.media_id, record.status
+                record.workflow_id,
+                record.project_id,
+                record.media_id,
+                record.status,
+                rpcid,
+                is_submit_response,
             )
 
     async def _raise_wire_refusal(self) -> None:
@@ -846,29 +961,95 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._observed_media_ids.update(
             record.media_id.lower()
             for record in self._records.values()
+            if record.rpcid != "as29s"
+            and (self._submission_surface != "AGENT_ONLY" or record.submit_request)
             if record.media_id.lower() not in baseline.media_ids
             and record.workflow_id.lower() not in baseline.execution_ids
         )
         self._observed_finished_media_ids.update(
             set(self._valid_ids(state.get("finished_media_ids"))) - baseline.media_ids
         )
-        baseline_count, _, baseline_hash = (baseline.agent_turn_id or "0:").partition(":")
-        self._observed_new_turn = self._observed_new_turn or (
-            self._integer(state.get("chat_count")) > int(baseline_count or "0")
-            and str(state.get("chat_tail_hash") or "") != baseline_hash
+        self._observed_finished_tile_key_hashes.update(
+            set(self._valid_hashes(state.get("finished_tile_key_hashes")))
+            - set(baseline.finished_tile_key_hashes)
         )
+        if self._observed_new_turn_bubble_index is None:
+            self._observed_new_turn_bubble_index = self._new_agent_turn_bubble_index(
+                state, baseline
+            )
+        self._observed_new_turn = self._observed_new_turn_bubble_index is not None
+
+    def _new_agent_turn_bubble_index(
+        self, state: dict[str, object], baseline: FlowSubmissionBaseline
+    ) -> int | None:
+        if self._provider_directive_sha256 is None:
+            return None
+        baseline_count, _, baseline_hash = (baseline.agent_turn_id or "0:").partition(":")
+        hashes = self._valid_hashes(state.get("chat_bubble_hashes"))
+        first_new_index = len(baseline.agent_turn_bubble_hashes)
+        if (
+            self._integer(state.get("chat_count")) <= int(baseline_count or "0")
+            or str(state.get("chat_tail_hash") or "") == baseline_hash
+        ):
+            return None
+        matching = [
+            index
+            for index in range(first_new_index, len(hashes))
+            if hashes[index] == self._provider_directive_sha256
+        ]
+        return matching[0] if len(matching) == 1 else None
+
+    def _chat_video_ids_for_turn(
+        self, state: dict[str, object], turn_index: int | None
+    ) -> set[str]:
+        if turn_index is None:
+            return set()
+        value = state.get("chat_video_options")
+        if not isinstance(value, list):
+            return set()
+        ids: set[str] = set()
+        for option in cast(list[object], value):
+            if not isinstance(option, dict):
+                continue
+            row = cast(dict[str, object], option)
+            media_id = row.get("media_id")
+            bubble_index = row.get("chat_bubble_index")
+            if (
+                isinstance(media_id, str)
+                and _UUID_RE.fullmatch(media_id)
+                and isinstance(bubble_index, int)
+                and not isinstance(bubble_index, bool)
+                and bubble_index >= turn_index
+            ):
+                ids.add(media_id.lower())
+        return ids
 
     def _provider_progress_present(self, baseline: FlowSubmissionBaseline) -> bool:
         return bool(
             self._observed_peak_pending
             or self._observed_media_ids
             or self._observed_finished_media_ids
+            or self._observed_finished_tile_key_hashes
             or any(
-                record.media_id.lower() not in baseline.media_ids
-                or record.workflow_id.lower() not in baseline.execution_ids
+                record.rpcid != "as29s"
+                and (self._submission_surface != "AGENT_ONLY" or record.submit_request)
+                and (
+                    record.media_id.lower() not in baseline.media_ids
+                    or record.workflow_id.lower() not in baseline.execution_ids
+                )
                 for record in self._records.values()
             )
         )
+
+    @staticmethod
+    def _valid_hashes(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [
+            item
+            for item in cast(list[object], value)
+            if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item)
+        ]
 
     async def _confirmation_ids(self) -> set[str]:
         gates = self._require_page().locator(_LIVE_GATE)

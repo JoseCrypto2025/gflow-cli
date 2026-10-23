@@ -49,7 +49,9 @@ class _Page:
             "media_ids": [],
             "finished_media_ids": [],
             "finished_keys": [],
+            "chat_video_media_ids": [],
             "chat_count": 0,
+            "chat_bubble_hashes": [],
             "chat_tail_hash": "",
             "chat_media_ids": [],
         }
@@ -68,6 +70,7 @@ class _EventPage(_Page):
         super().__init__(_Locator(None))
         self.url = "https://flow.google.com/project/project"
         self.events: dict[str, object] = {}
+        self.selectors: list[str] = []
         self.submit_request = SimpleNamespace(
             url="https://flow.google.com/data/batchexecute?rpcids=YhhmEf", method="POST"
         )
@@ -78,8 +81,9 @@ class _EventPage(_Page):
     def remove_listener(self, event: str, _callback: object) -> None:
         self.events.pop(event, None)
 
-    def locator(self, _selector: str) -> Any:
+    def locator(self, selector: str) -> Any:
         page = self
+        page.selectors.append(selector)
 
         class Button:
             async def count(self) -> int:
@@ -111,8 +115,10 @@ def _port(gate_after_polls: int | None) -> GoogleFlowAgentOnlyGenerationPort:
     port._generate_clicked = False
     port._observed_media_ids = set()
     port._observed_finished_media_ids = set()
+    port._observed_finished_tile_key_hashes = set()
     port._observed_peak_pending = 0
     port._observed_new_turn = False
+    port._observed_new_turn_bubble_index = None
     port._observed_head_changed = False
     port._submit_observer_armed = False
     port._submit_dispatch_started_at = None
@@ -127,6 +133,8 @@ def _port(gate_after_polls: int | None) -> GoogleFlowAgentOnlyGenerationPort:
     port._submit_response_status = None
     port._submit_generation_record_observed = None
     port._submit_refusal_detected = None
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = None
     return port
 
 
@@ -159,9 +167,40 @@ async def test_submit_request_observer_is_armed_before_generate_click() -> None:
     assert evidence.generate_click_dispatched is True
     assert evidence.provider_submit_rpc_observed is True
     assert evidence.provider_submit_rpc_id == TEXT_TO_VIDEO_SUBMIT_RPC
-    assert evidence.provider_submit_request_count == 1
-    assert evidence.provider_submit_project_id == "project"
-    assert evidence.provider_submit_http_method == "POST"
+    assert "flow-generate-icon-button button" in page.selectors
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_dispatch_does_not_wait_for_or_require_yhhmef(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    baseline = FlowSubmissionBaseline("project", frozenset(), frozenset(), 0, frozenset(), "0:old")
+    port = _observation_port(
+        [
+            _project_state(
+                pending=0,
+                media_ids=[],
+                chat_count=1,
+                chat_tail_hash="new",
+                chat_bubble_hashes=[prompt_hash],
+            )
+        ],
+        [],
+    )
+    port._baseline = baseline
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    port._submit_dispatch_deadline = 15.0
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.await_submit_dispatch()
+
+    assert evidence.submission_surface == "AGENT_ONLY"
+    assert evidence.agent_turn_dispatched is True
+    assert evidence.provider_submit_request_count == 0
+    assert evidence.provider_submit_rpc_id is None
 
 
 def test_unrelated_batchexecute_request_does_not_count_as_submit(
@@ -290,6 +329,32 @@ async def test_submit_response_without_record_stays_unresolved(
 
 
 @pytest.mark.asyncio
+async def test_unreadable_submit_reply_remains_observation_only_and_nonretryable() -> None:
+    port = _port(None)
+    request = SimpleNamespace(url="request", method="POST")
+    port._submit_requests = [request]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+
+    class Response:
+        url = "https://flow.google.com/data/batchexecute?rpcids=YhhmEf"
+        status = 200
+
+        def __init__(self) -> None:
+            self.request = request
+
+        async def text(self) -> str:
+            raise RuntimeError("response body unavailable")
+
+    await port._capture_response(Response())  # type: ignore[arg-type]
+
+    evidence = port.read_submit_transport_evidence()
+    assert evidence.provider_submit_response_observed is True
+    assert evidence.provider_submit_generation_record_observed is False
+    assert len(port._records) == 0
+    assert port._submit_requests == [request]
+
+
+@pytest.mark.asyncio
 async def test_submit_waf_response_keeps_existing_refusal_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -321,8 +386,16 @@ async def test_submit_waf_response_keeps_existing_refusal_signal(
     assert port.read_submit_transport_evidence().provider_submit_refusal_detected is True
 
 
-def _wire_record(workflow_id: str, media_id: str, status: int) -> live_flow._ObservedRecord:
-    return live_flow._ObservedRecord(workflow_id, "project", media_id, status)
+def _wire_record(
+    workflow_id: str,
+    media_id: str,
+    status: int,
+    rpcid: str | None = None,
+    submit_request: bool = False,
+) -> live_flow._ObservedRecord:
+    return live_flow._ObservedRecord(
+        workflow_id, "project", media_id, status, rpcid, submit_request
+    )
 
 
 def _observation_port(
@@ -333,6 +406,7 @@ def _observation_port(
     port._records = {
         (record.workflow_id, record.project_id, record.media_id): record for record in records
     }
+    port._submission_surface = "CLASSIC_MIGRATED"
     page = port._page
     page.states = states  # type: ignore[attr-defined]
     page.evaluate_calls = 0  # type: ignore[attr-defined]
@@ -352,15 +426,23 @@ def _project_state(
     finished_media_ids: list[str] | None = None,
     chat_count: int = 1,
     chat_tail_hash: str = "new-turn",
+    chat_bubble_hashes: list[str] | None = None,
+    chat_video_media_ids: list[str] | None = None,
+    finished_tile_key_hashes: list[str] | None = None,
+    chat_video_options: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "pending": pending,
         "media_ids": media_ids,
         "finished_media_ids": finished_media_ids or [],
+        "finished_tile_key_hashes": finished_tile_key_hashes or [],
         "finished_keys": [],
         "chat_count": chat_count,
+        "chat_bubble_hashes": chat_bubble_hashes or [],
         "chat_tail_hash": chat_tail_hash,
         "chat_media_ids": [],
+        "chat_video_media_ids": chat_video_media_ids or [],
+        "chat_video_options": chat_video_options or [],
     }
 
 
@@ -647,6 +729,292 @@ async def test_one_completed_authoritative_media_is_generation_success(
     assert evidence.submission_state == "GENERATION_SUCCEEDED"
     assert evidence.provider_media_id == UUID_B
     assert evidence.new_provider_media_ids == (UUID_B,)
+
+
+@pytest.mark.asyncio
+async def test_agent_only_correlates_new_chat_video_with_one_finished_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    port = _observation_port(
+        [
+            _project_state(
+                pending=0,
+                media_ids=[UUID_A, UUID_B],
+                finished_media_ids=[UUID_B],
+                chat_count=1,
+                chat_tail_hash="new",
+                chat_bubble_hashes=[prompt_hash],
+                chat_video_options=[{"media_id": UUID_B, "chat_bubble_index": 0}],
+                finished_tile_key_hashes=[hashlib.sha256(b"finished-b").hexdigest()],
+            )
+        ],
+        [],
+    )
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "GENERATION_SUCCEEDED"
+    assert evidence.provider_media_id == UUID_B
+    assert evidence.provider_execution_id is None
+    assert evidence.new_provider_media_ids == (UUID_B,)
+
+
+@pytest.mark.asyncio
+async def test_agent_only_opaque_finished_tile_correlates_exact_new_chat_poster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    baseline = FlowSubmissionBaseline(
+        "project",
+        frozenset(),
+        frozenset(),
+        0,
+        frozenset(),
+        "1:baseline-tail",
+        ("a" * 64,),
+        ("b" * 64,),
+        frozenset(),
+    )
+    port = _observation_port(
+        [
+            _project_state(
+                pending=0,
+                media_ids=[],
+                finished_media_ids=[],
+                chat_count=3,
+                chat_tail_hash="new-tail",
+                chat_bubble_hashes=["a" * 64, prompt_hash, "c" * 64],
+                finished_tile_key_hashes=["d" * 64, "b" * 64],
+                chat_video_options=[{"media_id": UUID_B, "chat_bubble_index": 2}],
+            )
+        ],
+        [],
+    )
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(baseline, None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "GENERATION_SUCCEEDED"
+    assert evidence.provider_media_id == UUID_B
+    assert evidence.new_provider_media_ids == (UUID_B,)
+
+
+@pytest.mark.asyncio
+async def test_agent_only_requires_new_tile_to_be_the_newest_finished_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    old_key = hashlib.sha256(b"old-newest").hexdigest()
+    port = _observation_port(
+        [
+            _project_state(
+                pending=0,
+                media_ids=[],
+                chat_count=2,
+                chat_tail_hash="new-reply",
+                chat_bubble_hashes=[prompt_hash, "c" * 64],
+                finished_tile_key_hashes=[old_key, "d" * 64],
+                chat_video_options=[{"media_id": UUID_B, "chat_bubble_index": 1}],
+            )
+        ],
+        [],
+    )
+    baseline = FlowSubmissionBaseline(
+        "project",
+        frozenset(),
+        frozenset(),
+        0,
+        frozenset(),
+        "1:old-tail",
+        ("a" * 64,),
+        (old_key,),
+        frozenset(),
+    )
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(baseline, None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "UNKNOWN_SUBMISSION_STATE"
+    assert evidence.new_provider_media_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_agent_only_pending_tile_transitions_to_correlated_finished_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    port = _observation_port(
+        [
+            _project_state(
+                pending=1,
+                media_ids=[],
+                chat_count=1,
+                chat_tail_hash="new-prompt",
+                chat_bubble_hashes=[prompt_hash],
+            ),
+            _project_state(
+                pending=0,
+                media_ids=[],
+                chat_count=2,
+                chat_tail_hash="new-reply",
+                chat_bubble_hashes=[prompt_hash, "c" * 64],
+                finished_tile_key_hashes=["d" * 64],
+                chat_video_options=[{"media_id": UUID_B, "chat_bubble_index": 1}],
+            ),
+        ],
+        [],
+    )
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    async def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", advance)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=2.0)
+
+    assert evidence.submission_state == "GENERATION_SUCCEEDED"
+    assert evidence.provider_media_id == UUID_B
+    assert port._page.evaluate_calls == 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_agent_only_generation_record_is_not_media_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    port = _observation_port(
+        [
+            _project_state(
+                pending=0,
+                media_ids=[UUID_A, UUID_B],
+                chat_count=1,
+                chat_tail_hash="new-tail",
+                chat_bubble_hashes=[prompt_hash],
+                finished_media_ids=[UUID_B],
+                chat_video_options=[],
+            )
+        ],
+        [_wire_record(UUID_A, UUID_B, 3, "YhhmEf", submit_request=True)],
+    )
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "UNKNOWN_SUBMISSION_STATE"
+    assert evidence.new_provider_media_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_agent_only_two_finished_chat_media_ids_are_multi_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    port = _observation_port(
+        [
+            _project_state(
+                pending=0,
+                media_ids=[],
+                chat_count=2,
+                chat_tail_hash="new-reply",
+                chat_bubble_hashes=[prompt_hash, "c" * 64],
+                finished_tile_key_hashes=["d" * 64, "e" * 64],
+                chat_video_options=[
+                    {"media_id": UUID_B, "chat_bubble_index": 1},
+                    {"media_id": UUID_C, "chat_bubble_index": 1},
+                ],
+            )
+        ],
+        [],
+    )
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "UNEXPECTED_MULTI_OUTPUT"
+    assert evidence.new_provider_media_ids == tuple(sorted((UUID_B, UUID_C)))
+
+
+@pytest.mark.asyncio
+async def test_as29s_record_alone_is_not_agent_only_output_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    port = _observation_port(
+        [
+            _project_state(
+                pending=0,
+                media_ids=[UUID_A, UUID_B],
+                chat_count=1,
+                chat_tail_hash="new",
+                chat_bubble_hashes=[prompt_hash],
+                chat_video_options=[],
+            )
+        ],
+        [_wire_record(UUID_A, UUID_B, 3, "as29s")],
+    )
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "UNKNOWN_SUBMISSION_STATE"
+    assert evidence.new_provider_media_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_wire_record_is_not_agent_only_attempt_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directive = "Make me a 8 second video of approved prompt in a 9:16 aspect ratio."
+    prompt_hash = hashlib.sha256(directive.encode()).hexdigest()
+    port = _observation_port(
+        [
+            _project_state(
+                pending=0,
+                media_ids=[UUID_A, UUID_B],
+                chat_count=1,
+                chat_tail_hash="new",
+                chat_bubble_hashes=[prompt_hash],
+            )
+        ],
+        [_wire_record(UUID_A, UUID_B, 3, "jwpduf")],
+    )
+    port._submission_surface = "AGENT_ONLY"
+    port._provider_directive_sha256 = prompt_hash
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
+
+    evidence = await port.observe_attempt(_baseline(), None, observation_deadline=0.0)
+
+    assert evidence.submission_state == "UNKNOWN_SUBMISSION_STATE"
+    assert evidence.new_provider_media_ids == ()
 
 
 @pytest.mark.asyncio

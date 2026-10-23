@@ -140,10 +140,11 @@ _AGENT_DURATION_PARAMETER_KEY = "google_flow.agent.video.duration_instruction"
 def build_agent_only_directive(
     prompt_text: str, technical_configuration: Mapping[str, object]
 ) -> str:
-    """Translate Phase E's structured duration into the Agent's text-only control."""
+    """Translate Phase E's duration and aspect ratio into Flow's Agent directive."""
     canonical = technical_configuration.get("canonical_parameters")
     adapter = technical_configuration.get("adapter_parameters")
     duration = technical_configuration.get("duration_sec")
+    aspect_ratio = technical_configuration.get("aspect_ratio")
     canonical_values = cast(Mapping[str, object], canonical)
     adapter_values = cast(Mapping[str, object], adapter)
     if (
@@ -155,17 +156,15 @@ def build_agent_only_directive(
         or duration <= 0
         or canonical_values.get("DURATION_SEC") != duration
         or adapter_values.get(_AGENT_DURATION_PARAMETER_KEY) != duration
+        or not isinstance(aspect_ratio, str)
+        or not re.fullmatch(r"\d+:\d+", aspect_ratio)
     ):
         raise FlowPresubmitError(
-            "FLOW_DURATION_UNRESOLVED",
-            "Phase E must provide a mapped, positive structured duration for Agent-only T2V",
+            "FLOW_AGENT_DIRECTIVE_UNRESOLVED",
+            "Phase E must provide mapped duration and aspect ratio for Agent-only T2V",
         )
     seconds = format(float(duration), "g")
-    return (
-        f"{prompt_text}\n\n"
-        f"Follow the selected video settings and target a duration of {seconds} seconds. "
-        "Create video only; do not generate images first or ask follow-up questions."
-    )
+    return f"Make me a {seconds} second video of {prompt_text} in a {aspect_ratio} aspect ratio."
 
 
 def classify_flow_surface(url: object) -> str | None:

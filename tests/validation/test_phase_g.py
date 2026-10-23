@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -532,7 +533,11 @@ class FakeGenerationPort:
     async def fill_prompt(self, prompt: str, negative_prompt: str) -> None:
         self.calls.append("prompt")
         self.prompt = prompt
-        assert "duration of 8 seconds" in prompt and negative_prompt == ""
+        assert (
+            prompt
+            == "Make me a 8 second video of A red kite over the ocean. in a 9:16 aspect ratio."
+        )
+        assert negative_prompt == ""
 
     async def read_prompt(self) -> str | None:
         self.calls.append("read_prompt")
@@ -609,6 +614,9 @@ async def test_phase_g_executes_single_approved_gate_and_restores_original_setti
     assert port.settings == port.original
     assert journal.read().state == "CLEAN"  # type: ignore[union-attr]
     assert ledger.accounted_today() == Decimal(10)
+    attempt = ledger.attempts()[0]
+    assert attempt["approved_prompt_sha256"] == request.prompt_sha256
+    assert attempt["provider_directive_sha256"] == hashlib.sha256(port.prompt.encode()).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -734,6 +742,53 @@ async def test_no_submit_rpc_observed_stops_early_without_retry_or_credit_releas
     assert attempt.get("provider_outcome", "UNKNOWN") == "UNKNOWN"
     assert attempt["provider_billing_outcome"] == "UNKNOWN"
     assert attempt["provider_submit_transport_classification"] == "SUBMIT_RPC_NOT_OBSERVED"
+
+
+@pytest.mark.asyncio
+async def test_agent_only_turn_dispatch_does_not_require_yhhmef(tmp_path: Path) -> None:
+    port = FakeGenerationPort()
+    port.submit_evidence = PhaseGSubmitTransportEvidence(
+        generate_click_dispatched=True,
+        provider_submit_rpc_observed=False,
+        provider_submit_request_count=0,
+        provider_submit_dispatch_window_completed=True,
+        provider_submit_response_observed=False,
+        submission_surface="AGENT_ONLY",
+        agent_turn_dispatched=True,
+    )
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    result = await executor.execute(request)
+
+    assert result.submission_state == "GENERATION_SUCCEEDED"
+    attempt = ledger.attempts()[0]
+    assert attempt["submission_surface"] == "AGENT_ONLY"
+    assert attempt["agent_turn_dispatched"] is True
+    assert attempt["provider_submit_rpc_id"] is None
+    assert attempt["provider_submit_transport_classification"] == "AGENT_TURN_DISPATCHED"
+
+
+@pytest.mark.asyncio
+async def test_agent_only_missing_turn_fails_closed_without_retry(tmp_path: Path) -> None:
+    port = FakeGenerationPort()
+    port.submit_evidence = PhaseGSubmitTransportEvidence(
+        generate_click_dispatched=True,
+        provider_submit_rpc_observed=False,
+        provider_submit_request_count=0,
+        provider_submit_dispatch_window_completed=True,
+        provider_submit_response_observed=False,
+        submission_surface="AGENT_ONLY",
+        agent_turn_dispatched=False,
+    )
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    with pytest.raises(PhaseGError) as error:
+        await executor.execute(request)
+
+    assert error.value.code == "PHASE_G_AGENT_TURN_NOT_DISPATCHED"
+    assert port.calls.count("generate") == 1
+    assert port.calls.count("approve") == 0
+    assert ledger.attempts()[0]["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
 
 
 @pytest.mark.asyncio

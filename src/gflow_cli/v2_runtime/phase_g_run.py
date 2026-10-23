@@ -48,6 +48,7 @@ _PROJECT_ID = "34e60953-e534-46e9-ac65-993893e61065"
 _PROJECT_NAME = "AI Video Automation V2 - TEST"
 _AUTH_PROFILE = "GFLOW_V2_TEST_AUTH"
 _MODEL_DISPLAY_NAMES = {"MDL_0001": "Veo 3.1 - Lite"}
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", re.I)
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +441,8 @@ async def recover_late_confirmation_same_attempt(
     execution_ids = _string_list(attempt.get("baseline_execution_ids"))
     confirmation_ids = _string_list(attempt.get("baseline_confirmation_ids"))
     chat_bubble_hashes = _string_list(attempt.get("baseline_agent_turn_bubble_hashes"))
+    finished_tile_key_hashes = _string_list(attempt.get("baseline_finished_tile_key_hashes", []))
+    chat_video_media_ids = _string_list(attempt.get("baseline_chat_video_media_ids", []))
     agent_turn_id = attempt.get("baseline_agent_turn_id")
     pending_count = attempt.get("baseline_pending_count")
     if (
@@ -451,6 +454,10 @@ async def recover_late_confirmation_same_attempt(
             chat_bubble_hashes is not None
             and any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in chat_bubble_hashes)
         )
+        or finished_tile_key_hashes is None
+        or any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in finished_tile_key_hashes)
+        or chat_video_media_ids is None
+        or any(not _UUID_RE.fullmatch(value) for value in chat_video_media_ids)
         or isinstance(pending_count, bool)
         or not isinstance(pending_count, int)
         or pending_count != 0
@@ -465,6 +472,8 @@ async def recover_late_confirmation_same_attempt(
         frozenset(confirmation_ids),
         str(agent_turn_id),
         tuple(chat_bubble_hashes or ()),
+        tuple(finished_tile_key_hashes),
+        frozenset(chat_video_media_ids),
     )
     journal = AgentSettingsRecoveryJournal(
         request.presubmit_request.runtime_state_root,

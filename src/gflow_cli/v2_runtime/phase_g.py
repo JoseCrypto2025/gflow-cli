@@ -222,6 +222,8 @@ class PhaseGSubmitTransportEvidence:
     provider_submit_response_status: int | None = None
     provider_submit_generation_record_observed: bool | None = None
     provider_submit_refusal_detected: bool | None = None
+    submission_surface: str = "CLASSIC_MIGRATED"
+    agent_turn_dispatched: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +237,8 @@ class FlowSubmissionBaseline:
     confirmation_ids: frozenset[str]
     agent_turn_id: str | None
     agent_turn_bubble_hashes: tuple[str, ...] = ()
+    finished_tile_key_hashes: tuple[str, ...] = ()
+    chat_video_media_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,10 +447,22 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             await self.port.click_generate_once()
             dispatch = await self.port.await_submit_dispatch()
             self.ledger.record_submit_transport_evidence(request.d2_run_id, dispatch)
-            if dispatch.provider_submit_request_count == 0:
+            if dispatch.submission_surface == "AGENT_ONLY":
+                if dispatch.agent_turn_dispatched is not True:
+                    raise PhaseGError(
+                        "PHASE_G_AGENT_TURN_NOT_DISPATCHED",
+                        "the exact Agent prompt was not observed as a new project chat turn",
+                    )
+            elif dispatch.submission_surface == "CLASSIC_MIGRATED":
+                if dispatch.provider_submit_request_count == 0:
+                    raise PhaseGError(
+                        "PHASE_G_SUBMIT_RPC_NOT_OBSERVED",
+                        "no YhhmEf submit request was observed in the bounded dispatch window",
+                    )
+            else:
                 raise PhaseGError(
-                    "PHASE_G_SUBMIT_RPC_NOT_OBSERVED",
-                    "no YhhmEf submit request was observed in the bounded dispatch window",
+                    "PHASE_G_SUBMISSION_SURFACE_UNKNOWN",
+                    "submit evidence does not identify a supported Flow surface",
                 )
             if dispatch.provider_submit_request_count > 1:
                 raise PhaseGError(
@@ -535,7 +551,8 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             submit_transport = self.port.read_submit_transport_evidence()
             self.ledger.record_submit_transport_evidence(request.d2_run_id, submit_transport)
             if (
-                submit_transport.provider_submit_response_observed is True
+                submit_transport.submission_surface == "CLASSIC_MIGRATED"
+                and submit_transport.provider_submit_response_observed is True
                 and submit_transport.provider_submit_generation_record_observed is False
             ):
                 raise PhaseGError(
@@ -1172,6 +1189,20 @@ class D2DailyCreditLedger:
     ) -> dict[str, object]:
         """Persist only allowlisted submit transport metadata, never wire payloads."""
         count = evidence.provider_submit_request_count
+        if evidence.submission_surface not in {"AGENT_ONLY", "CLASSIC_MIGRATED"}:
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "submission surface is invalid")
+        if (
+            evidence.agent_turn_dispatched is not None
+            and type(evidence.agent_turn_dispatched) is not bool
+        ):
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "Agent turn flag is invalid")
+        if evidence.submission_surface == "AGENT_ONLY" and evidence.agent_turn_dispatched is None:
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "Agent turn evidence is missing")
+        if (
+            evidence.submission_surface == "CLASSIC_MIGRATED"
+            and evidence.agent_turn_dispatched is not None
+        ):
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "unexpected Agent turn evidence")
         if type(count) is not int or count < 0:
             raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "request count is invalid")
         if type(evidence.provider_submit_rpc_observed) is not bool:
@@ -1271,7 +1302,15 @@ class D2DailyCreditLedger:
                 raise PhaseGError(
                     "PHASE_G_SUBMIT_EVIDENCE_INVALID", "record evidence cannot be cleared"
                 )
+            if attempt.get("agent_turn_dispatched") is True and (
+                evidence.agent_turn_dispatched is not True
+            ):
+                raise PhaseGError(
+                    "PHASE_G_SUBMIT_EVIDENCE_INVALID", "Agent turn evidence cannot be cleared"
+                )
             attempt.update(
+                submission_surface=evidence.submission_surface,
+                agent_turn_dispatched=evidence.agent_turn_dispatched,
                 generate_click_dispatched=evidence.generate_click_dispatched,
                 provider_submit_rpc_observed=evidence.provider_submit_rpc_observed,
                 provider_submit_rpc_id=evidence.provider_submit_rpc_id,
@@ -1300,6 +1339,14 @@ class D2DailyCreditLedger:
 
     @staticmethod
     def _submit_transport_classification(evidence: PhaseGSubmitTransportEvidence) -> str:
+        if evidence.submission_surface == "AGENT_ONLY":
+            if evidence.provider_submit_request_count > 1:
+                return "DUPLICATE_SUBMIT_RPC"
+            if evidence.agent_turn_dispatched is True:
+                return "AGENT_TURN_DISPATCHED"
+            if evidence.provider_submit_dispatch_window_completed is True:
+                return "AGENT_TURN_NOT_OBSERVED"
+            return "AGENT_TURN_DISPATCH_OBSERVATION_INCOMPLETE"
         if evidence.provider_submit_dispatch_window_completed is not True:
             return "SUBMIT_DISPATCH_OBSERVATION_INCOMPLETE"
         if evidence.provider_submit_request_count == 0:
@@ -1337,6 +1384,8 @@ class D2DailyCreditLedger:
                 baseline_confirmation_ids=sorted(baseline.confirmation_ids),
                 baseline_agent_turn_id=baseline.agent_turn_id,
                 baseline_agent_turn_bubble_hashes=list(baseline.agent_turn_bubble_hashes),
+                baseline_finished_tile_key_hashes=list(baseline.finished_tile_key_hashes),
+                baseline_chat_video_media_ids=sorted(baseline.chat_video_media_ids),
                 updated_at=_utc_now(),
             )
             return dict(attempt)
@@ -2715,6 +2764,10 @@ class D2DailyCreditLedger:
     @staticmethod
     def _new_attempt(request: PhaseGExecutionRequest) -> dict[str, object]:
         now = _utc_now()
+        directive = build_agent_only_directive(
+            request.compiled_prompt_text,
+            request.presubmit_request.preflight.technical_configuration,
+        )
         attempt: dict[str, object] = {
             "d2_run_id": request.d2_run_id,
             "prerequisite_d2_run_id": None,
@@ -2731,6 +2784,8 @@ class D2DailyCreditLedger:
             "generation_mode": request.generation_mode,
             "source_context_sha256": request.source_context_sha256,
             "prompt_sha256": request.prompt_sha256,
+            "approved_prompt_sha256": request.prompt_sha256,
+            "provider_directive_sha256": hashlib.sha256(directive.encode("utf-8")).hexdigest(),
             "requested_duration_sec": request.duration_sec,
             "requested_aspect_ratio": request.aspect_ratio,
             "requested_output_count": request.output_count,
@@ -2740,6 +2795,8 @@ class D2DailyCreditLedger:
             "generate_action_count": 0,
             "generate_click_dispatched": None,
             "provider_submit_rpc_observed": None,
+            "submission_surface": None,
+            "agent_turn_dispatched": None,
             "provider_submit_rpc_id": None,
             "provider_submit_observed_at": None,
             "provider_submit_http_method": None,
@@ -2766,6 +2823,8 @@ class D2DailyCreditLedger:
             "baseline_confirmation_ids": [],
             "baseline_agent_turn_id": None,
             "baseline_agent_turn_bubble_hashes": [],
+            "baseline_finished_tile_key_hashes": [],
+            "baseline_chat_video_media_ids": [],
             "confirmation_id": None,
             "accounting_date": None,
             "accounted_credit_cost": "0",

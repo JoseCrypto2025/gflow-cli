@@ -32,13 +32,13 @@ from .google_flow import (
 )
 
 _FLOW_ORIGIN = "https://flow.google.com"
-_PROMPT_SELECTOR = '[role="textbox"][aria-label="What do you want to create?"]'
+_PROMPT_SELECTOR = "div.ProseMirror"
 _SETTINGS_BUTTON = "flow-agent-panel button:has(mat-icon:text-is('tune'))"
 _SETTINGS_VIEW = "flow-settings-view"
 _VIDEO_MODEL_BUTTON = 'button[aria-label="Video generation default model"]'
 _SAVE_BUTTON = "button.settings-save-button"
 _BACK_BUTTON = "flow-agent-panel button:has(mat-icon:text-is('arrow_back'))"
-_GENERATE_BUTTON = 'button[aria-label="Start generation"]'
+_GENERATE_BUTTON = "flow-generate-icon-button button"
 _AUTH_PROFILE_NAMES = {
     "GFLOW_V2_TEST_AUTH": "gflow-v2-test",
     "GFLOW_PROD_AUTH": "gflow-prod",
@@ -167,6 +167,7 @@ class GoogleFlowAgentOnlyPort:
         model_display_names: Mapping[str, str],
         expected_email: str | None = None,
         headless: bool = False,
+        block_service_workers: bool = False,
     ) -> None:
         profile_name = _AUTH_PROFILE_NAMES.get(auth_profile_key)
         if not profile_name:
@@ -192,6 +193,7 @@ class GoogleFlowAgentOnlyPort:
         self.model_display_names = dict(model_display_names)
         self.expected_email = expected_email.casefold() if expected_email else None
         self.headless = headless
+        self.block_service_workers = block_service_workers
         self._session_verified = False
         self._session_email: str | None = None
         self._playwright: Playwright | None = None
@@ -211,6 +213,7 @@ class GoogleFlowAgentOnlyPort:
         model_display_names: Mapping[str, str],
         expected_email: str | None = None,
         headless: bool = False,
+        block_service_workers: bool = False,
     ) -> GoogleFlowAgentOnlyPort:
         """Verify the existing profile session without starting a login flow."""
         port = cls(
@@ -221,6 +224,7 @@ class GoogleFlowAgentOnlyPort:
             model_display_names=model_display_names,
             expected_email=expected_email,
             headless=headless,
+            block_service_workers=block_service_workers,
         )
         status = await verify_flow_profile(port.profile_dir, source="v2-agent-only")
         if status.outcome is not FlowSessionOutcome.AUTHENTICATED:
@@ -438,8 +442,11 @@ class GoogleFlowAgentOnlyPort:
 
         self._playwright = await async_playwright().start()
         try:
+            launch_kwargs = login_launch_kwargs(self.profile_dir, self.headless, channel=channel)
+            if self.block_service_workers:
+                launch_kwargs["service_workers"] = "block"
             self._context = await self._playwright.chromium.launch_persistent_context(
-                **login_launch_kwargs(self.profile_dir, self.headless, channel=channel)
+                **launch_kwargs
             )
             self._page = (
                 self._context.pages[0] if self._context.pages else await self._context.new_page()
