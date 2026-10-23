@@ -10,7 +10,15 @@ import pytest
 import gflow_cli.v2_runtime.phase_g_live_flow as live_flow
 from gflow_cli.api.transports.batchexecute import TEXT_TO_VIDEO_SUBMIT_RPC
 from gflow_cli.v2_runtime.phase_g import FlowSubmissionBaseline, PhaseGError
-from gflow_cli.v2_runtime.phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
+from gflow_cli.v2_runtime.phase_g_live_flow import (
+    GoogleFlowAgentOnlyGenerationPort,
+    _finished_tile_hashes,
+    _new_finished_tile_hashes,
+    canonical_finished_tile_identity,
+    canonical_finished_tile_url_hash,
+    canonical_finished_tile_url_identity,
+    provider_directive_sha256,
+)
 
 
 class _Gate:
@@ -148,6 +156,161 @@ UUID_C = "cccccccc-0000-0000-0000-000000000003"
 UUID_D = "dddddddd-0000-0000-0000-000000000004"
 UUID_E = "eeeeeeee-0000-0000-0000-000000000005"
 UUID_F = "ffffffff-0000-0000-0000-000000000006"
+
+
+def test_signed_tile_url_query_rotation_keeps_media_identity() -> None:
+    first = f"https://flow-content.google/video/{UUID_B}?Expires=1&Signature=old"
+    refreshed = f"https://flow-content.google/video/{UUID_B}?Expires=2&KeyName=k&Signature=new"
+
+    assert canonical_finished_tile_url_identity(first) == f"media:{UUID_B}"
+    assert canonical_finished_tile_url_identity(refreshed) == f"media:{UUID_B}"
+    assert canonical_finished_tile_url_hash(first) == canonical_finished_tile_url_hash(refreshed)
+    assert _finished_tile_hashes(
+        {
+            "finished_tile_locations": [
+                {"origin": "https://flow-content.google", "pathname": f"/video/{UUID_B}"}
+            ]
+        }
+    ) == [canonical_finished_tile_url_hash(first)]
+
+
+def test_signed_image_url_query_rotation_keeps_finished_tile_identity() -> None:
+    first = f"https://flow-content.google/image/{UUID_B}?Expires=1&Signature=old"
+    refreshed = f"https://flow-content.google/image/{UUID_B}?Expires=2&Signature=new"
+
+    assert canonical_finished_tile_url_identity(first) == canonical_finished_tile_url_identity(
+        refreshed
+    )
+
+
+def test_different_finished_media_uuid_is_a_different_identity() -> None:
+    first = f"https://flow-content.google/video/{UUID_B}?Signature=old"
+    second = f"https://flow-content.google/video/{UUID_C}?Signature=old"
+
+    assert canonical_finished_tile_url_identity(first) != canonical_finished_tile_url_identity(
+        second
+    )
+
+
+def test_existing_media_uuid_beats_legacy_signed_url_hash_delta() -> None:
+    baseline = FlowSubmissionBaseline(
+        "project",
+        frozenset({UUID_B}),
+        frozenset(),
+        0,
+        frozenset(),
+        "0:",
+        (),
+        ("f" * 64,),
+        frozenset(),
+    )
+    state = {
+        "finished_tile_locations": [
+            {"origin": "https://flow-content.google", "pathname": f"/video/{UUID_B}"}
+        ],
+        "finished_tile_identity_records": [{"identity_hash": "0" * 64, "media_id": UUID_B}],
+    }
+
+    assert _finished_tile_hashes(state) == [
+        canonical_finished_tile_url_hash(f"https://flow-content.google/video/{UUID_B}")
+    ]
+    assert _new_finished_tile_hashes(state, baseline) == set()
+
+
+def test_different_canonical_media_uuid_is_new_finished_media() -> None:
+    baseline = FlowSubmissionBaseline(
+        "project", frozenset({UUID_B}), frozenset(), 0, frozenset(), "0:"
+    )
+    state = {"finished_tile_identity_records": [{"identity_hash": "0" * 64, "media_id": UUID_C}]}
+
+    assert _new_finished_tile_hashes(state, baseline) == {"0" * 64}
+
+
+def test_asb_tile_uses_measured_stable_token_and_rejects_unknown_routes() -> None:
+    token = "opaque-token_123"
+    first = f"https://lh3.googleusercontent.com/asb/{token}?x=1"
+    refreshed = f"https://flow.google.com/asb/{token}?x=2"
+
+    assert canonical_finished_tile_url_identity(first) == f"asb:{token}"
+    assert canonical_finished_tile_url_identity(refreshed) == f"asb:{token}"
+    assert canonical_finished_tile_identity("https://example.com", f"/asb/{token}") is None
+    assert canonical_finished_tile_url_identity("https://flow-content.google/asb/unknown") is None
+
+
+def test_agent_turn_identity_ignores_historical_bubble_ui_hash_drift() -> None:
+    port = _port(None)
+    directive = "exact provider directive"
+    port._provider_directive_sha256 = provider_directive_sha256(directive)
+    baseline = FlowSubmissionBaseline(
+        "project",
+        frozenset(),
+        frozenset(),
+        0,
+        frozenset(),
+        "6:old-tail",
+        tuple("a" * 64 for _ in range(6)),
+        (),
+        frozenset(),
+    )
+    state = {
+        "chat_count": 7,
+        "chat_tail_hash": "changed-by-controls",
+        "chat_bubble_hashes": ["b" * 64 for _ in range(6)] + ["c" * 64],
+    }
+
+    assert port._new_agent_turn_bubble_index(state, baseline) is None
+
+
+def test_only_post_baseline_exact_directive_bubble_is_agent_turn() -> None:
+    port = _port(None)
+    directive_hash = provider_directive_sha256("exact   provider\n directive")
+    port._provider_directive_sha256 = directive_hash
+    baseline = FlowSubmissionBaseline(
+        "project",
+        frozenset(),
+        frozenset(),
+        0,
+        frozenset(),
+        "6:old-tail",
+        (directive_hash, *("a" * 64 for _ in range(5))),
+        (),
+        frozenset(),
+    )
+    state = {
+        "chat_count": 8,
+        "chat_tail_hash": "reply",
+        "chat_bubble_hashes": [
+            directive_hash,
+            *("b" * 64 for _ in range(5)),
+            directive_hash,
+            "c" * 64,
+        ],
+    }
+
+    assert port._new_agent_turn_bubble_index(state, baseline) == 6
+
+
+def test_historical_directive_match_cannot_qualify_without_new_turn() -> None:
+    port = _port(None)
+    directive_hash = provider_directive_sha256("exact provider directive")
+    port._provider_directive_sha256 = directive_hash
+    baseline = FlowSubmissionBaseline(
+        "project",
+        frozenset(),
+        frozenset(),
+        0,
+        frozenset(),
+        "6:old-tail",
+        tuple("a" * 64 for _ in range(6)),
+        (),
+        frozenset(),
+    )
+    state = {
+        "chat_count": 7,
+        "chat_bubble_hashes": [directive_hash, *("b" * 64 for _ in range(6))],
+    }
+
+    assert port._new_agent_turn_bubble_index(state, baseline) is None
 
 
 @pytest.mark.asyncio

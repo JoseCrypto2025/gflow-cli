@@ -5,7 +5,7 @@ import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -34,6 +34,9 @@ from gflow_cli.v2_runtime.phase_g import (
 )
 from gflow_cli.v2_runtime.phase_g_artifacts import sha256_file
 from gflow_cli.v2_runtime.phase_g_live_flow import parse_confirmation_quote
+from gflow_cli.v2_runtime.phase_g_test_session_no_charge import (
+    preapproval_no_charge_evidence_digest,
+)
 from gflow_cli.v2_runtime.production_execution import (
     CreditBudgetContext,
     ProductionCreditGuard,
@@ -1468,6 +1471,360 @@ def test_test_session_quote_above_visible_balance_fails_before_approval(tmp_path
         )
     assert insufficient.value.code == "PHASE_G_TEST_SESSION_QUOTE_INVALID"
     assert ledger.attempts()[0]["approval_action_count"] == 0
+
+
+def test_test_session_approval_accepts_missing_visible_balance_from_pre_attempt_budget(
+    tmp_path: Path,
+) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger, starting_balance=40)
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        request,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.observe_confirmation(
+        request.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=10,
+        visible_balance=None,
+    )
+
+    approved = ledger.approve_gate(
+        request.d2_run_id,
+        video_count=1,
+        credit_cost=10,
+        confirmation_id="new-confirmation",
+        visible_balance=None,
+    )
+
+    assert approved["approval_action_count"] == 1
+    assert approved["observed_visible_balance"] is None
+    assert approved["quoted_credit_cost"] == "10"
+
+
+def test_test_session_approval_rejects_visible_balance_mismatch(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger, starting_balance=40)
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        request,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.observe_confirmation(
+        request.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=10,
+        visible_balance=39,
+    )
+
+    with pytest.raises(PhaseGError) as mismatch:
+        ledger.approve_gate(
+            request.d2_run_id,
+            video_count=1,
+            credit_cost=10,
+            confirmation_id="new-confirmation",
+            visible_balance=39,
+        )
+
+    assert mismatch.value.code == "PHASE_G_TEST_SESSION_QUOTE_INVALID"
+    assert ledger.attempts()[0]["approval_action_count"] == 0
+
+
+def test_test_session_approval_rejects_quote_above_captured_pre_attempt_balance(
+    tmp_path: Path,
+) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger, starting_balance=5)
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        request,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=5,
+    )
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.observe_confirmation(
+        request.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=10,
+        visible_balance=None,
+    )
+
+    with pytest.raises(PhaseGError) as insufficient:
+        ledger.approve_gate(
+            request.d2_run_id,
+            video_count=1,
+            credit_cost=10,
+            confirmation_id="new-confirmation",
+            visible_balance=None,
+        )
+
+    assert insufficient.value.code == "PHASE_G_TEST_SESSION_QUOTE_INVALID"
+    assert ledger.attempts()[0]["approval_action_count"] == 0
+
+
+def test_unknown_no_charge_requires_evidence_operator(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_attempt(request)
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.record_state(request.d2_run_id, submission_state="UNKNOWN_SUBMISSION_STATE")
+
+    with pytest.raises(PhaseGError) as blocked:
+        ledger.record_state(
+            request.d2_run_id,
+            submission_state="RECONCILED_NO_CHARGE",
+            terminal_state="RECONCILED_NO_CHARGE",
+            accounted_credit_cost=0,
+        )
+
+    assert blocked.value.code == "PHASE_G_TEST_SESSION_OPERATOR_REQUIRED"
+    assert ledger.attempts()[0]["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
+
+
+def _prepare_test_session_unknown(
+    tmp_path: Path,
+) -> tuple[D2DailyCreditLedger, str, PhaseGExecutionRequest]:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger, starting_balance=50)
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        request,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=50,
+    )
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id,
+            frozenset({"baseline-media"}),
+            frozenset({"baseline-execution"}),
+            0,
+            frozenset({"baseline-confirmation"}),
+            "3:" + "a" * 64,
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.record_submit_transport_evidence(
+        request.d2_run_id,
+        PhaseGSubmitTransportEvidence(
+            generate_click_dispatched=True,
+            provider_submit_rpc_observed=False,
+            provider_submit_request_count=0,
+            provider_submit_dispatch_window_completed=True,
+            provider_submit_response_observed=False,
+            submission_surface="AGENT_ONLY",
+            agent_turn_dispatched=True,
+        ),
+    )
+    ledger.observe_confirmation(
+        request.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=10,
+        visible_balance=None,
+    )
+    ledger.record_state(request.d2_run_id, submission_state="UNKNOWN_SUBMISSION_STATE")
+    session = ledger.reconcile_test_session_attempt(
+        request.d2_run_id,
+        provider_credits_before=50,
+        provider_credits_after=50,
+    )
+    assert session["status"] == "STOPPED"
+    return ledger, session_id, request
+
+
+def _preapproval_no_charge_evidence(
+    ledger: D2DailyCreditLedger, run_id: str, *, captured_at: str | None = None
+) -> dict[str, object]:
+    attempt = next(row for row in ledger.attempts() if row["d2_run_id"] == run_id)
+    session_id = str(attempt["test_session_id"])
+    evidence: dict[str, object] = {
+        "SCHEMA_VERSION": "D2_TEST_SESSION_PREAPPROVAL_NO_CHARGE_V1",
+        "D2_RUN_ID": run_id,
+        "CANONICAL_LEDGER_SHA256": sha256_file(ledger.path),
+        "IMPLEMENTATION_COMMIT": "a" * 40,
+        "RUNTIME_STATE_ROOT": str(ledger.root.parent.resolve()),
+        "TEST_PROFILE_KEY": "GFLOW_V2_TEST_AUTH",
+        "PROVIDER_ACCOUNT_ID": "PVA_0001",
+        "PROVIDER_PROJECT_ID": str(attempt["provider_project_id"]),
+        "SESSION_ID": session_id,
+        "CURRENT_SUBMISSION_STATE": "UNKNOWN_SUBMISSION_STATE",
+        "CURRENT_TERMINAL_STATE": None,
+        "GENERATE_ACTION_COUNT": 1,
+        "APPROVAL_ACTION_COUNT": 0,
+        "REQUESTED_OUTPUT_COUNT": 1,
+        "AGENT_TURN_DISPATCHED": True,
+        "OBSERVED_CONFIRMATION_ID": "new-confirmation",
+        "OBSERVED_VIDEO_COUNT": 1,
+        "OBSERVED_CREDIT_COST": "10",
+        "OBSERVED_VISIBLE_BALANCE": None,
+        "PROVIDER_EXECUTION_ID": None,
+        "PROVIDER_MEDIA_ID": None,
+        "PROVIDER_MEDIA_IDS": [],
+        "BASELINE_MEDIA_IDS": ["baseline-media"],
+        "CURRENT_PROJECT_MEDIA_IDS": ["baseline-media"],
+        "BASELINE_EXECUTION_IDS": ["baseline-execution"],
+        "CURRENT_PROJECT_EXECUTION_IDS": ["baseline-execution"],
+        "BASELINE_CONFIRMATION_IDS": ["baseline-confirmation"],
+        "CURRENT_PROJECT_CONFIRMATION_IDS": ["baseline-confirmation", "new-confirmation"],
+        "BASELINE_CHAT_COUNT": 3,
+        "CURRENT_PROJECT_CHAT_COUNT": 4,
+        "PROVIDER_DIRECTIVE_SHA256": str(attempt["provider_directive_sha256"]),
+        "NEW_AGENT_PROMPT_BUBBLE_INDEX": 3,
+        "PROVIDER_DIRECTIVE_MATCH_COUNT": 1,
+        "CHAT_ENUMERATION_COMPLETE": True,
+        "BASELINE_PENDING_COUNT": 0,
+        "CURRENT_PROJECT_PENDING_COUNT": 0,
+        "NEW_FINISHED_MEDIA_IDS": [],
+        "NEW_AGENT_ASSOCIATED_MEDIA_IDS": [],
+        "PROJECT_SNAPSHOT_HYDRATED": True,
+        "PROJECT_ENUMERATION_COMPLETE": True,
+        "PROGRESS_BEFORE_CONFIRMATION": False,
+        "PROVIDER_GENERATION_STARTED": False,
+        "PROVIDER_REFUSAL": False,
+        "WAF_REFUSAL": False,
+        "NO_OTHER_ACCOUNT_ACTIVITY": True,
+        "CREDITS_BEFORE": "50",
+        "CREDITS_AFTER": "50",
+        "CAPTURED_AT": captured_at or datetime.now(UTC).isoformat(),
+    }
+    return evidence
+
+
+def test_evidence_bound_preapproval_no_charge_reconciles_unknown_attempt(
+    tmp_path: Path,
+) -> None:
+    ledger, session_id, request = _prepare_test_session_unknown(tmp_path)
+    evidence = _preapproval_no_charge_evidence(ledger, request.d2_run_id)
+    evidence_sha = preapproval_no_charge_evidence_digest(evidence)
+    before_attempt = ledger.attempts()[0]
+    previous_reconciled_at = before_attempt["test_session_reconciled_at"]
+
+    result = ledger.reconcile_test_session_preapproval_no_charge(
+        request.d2_run_id,
+        expected_ledger_sha256=sha256_file(ledger.path),
+        evidence_sha256=evidence_sha,
+        implementation_commit="a" * 40,
+        evidence=evidence,
+    )
+
+    attempt = ledger.attempts()[0]
+    assert attempt["submission_state"] == "RECONCILED_NO_CHARGE"
+    assert attempt["terminal_state"] == "RECONCILED_NO_CHARGE"
+    assert attempt["provider_billing_outcome"] == "UNKNOWN"
+    assert attempt["accounted_credit_cost"] == before_attempt["accounted_credit_cost"]
+    assert attempt["observed_visible_balance"] is None
+    assert attempt["test_session_previous_reconciled_at"] == previous_reconciled_at
+    assert attempt["test_session_no_charge_evidence_sha256"] == evidence_sha
+    assert result["status"] == "ACTIVE"
+    assert result["spent_credits"] == "0"
+    assert result["reserved_credits"] == "40"
+    assert result["in_flight_run_id"] is None
+    assert result["session_id"] == session_id
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("APPROVAL_ACTION_COUNT", 1),
+        ("PROVIDER_EXECUTION_ID", "new-execution"),
+        ("PROVIDER_MEDIA_ID", "new-media"),
+        ("PROVIDER_MEDIA_IDS", ["new-media"]),
+        ("NEW_FINISHED_MEDIA_IDS", ["new-media"]),
+        ("NEW_AGENT_ASSOCIATED_MEDIA_IDS", ["new-media"]),
+        ("CURRENT_PROJECT_PENDING_COUNT", 1),
+        ("CREDITS_AFTER", "49"),
+        ("PROGRESS_BEFORE_CONFIRMATION", True),
+        ("PROVIDER_GENERATION_STARTED", True),
+        ("PROVIDER_REFUSAL", True),
+        ("WAF_REFUSAL", True),
+        ("NO_OTHER_ACCOUNT_ACTIVITY", False),
+        ("PROJECT_ENUMERATION_COMPLETE", False),
+        ("CHAT_ENUMERATION_COMPLETE", False),
+        ("NEW_AGENT_PROMPT_BUBBLE_INDEX", 2),
+        ("PROVIDER_DIRECTIVE_MATCH_COUNT", 2),
+        ("CURRENT_PROJECT_CHAT_COUNT", 3),
+    ],
+)
+def test_no_charge_reconciliation_rejects_unsafe_or_incomplete_evidence(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    ledger, _, request = _prepare_test_session_unknown(tmp_path)
+    evidence = _preapproval_no_charge_evidence(ledger, request.d2_run_id)
+    evidence[field] = value
+
+    with pytest.raises(PhaseGError):
+        ledger.reconcile_test_session_preapproval_no_charge(
+            request.d2_run_id,
+            expected_ledger_sha256=sha256_file(ledger.path),
+            evidence_sha256=preapproval_no_charge_evidence_digest(evidence),
+            implementation_commit="a" * 40,
+            evidence=evidence,
+        )
+
+    assert ledger.attempts()[0]["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
+    session = json.loads(ledger.path.read_text(encoding="utf-8"))["test_sessions"][0]
+    assert session["status"] == "STOPPED"
+    assert session["in_flight_run_id"] == request.d2_run_id
+
+
+def test_no_charge_reconciliation_rejects_stale_ledger_or_evidence_hash(tmp_path: Path) -> None:
+    ledger, _, request = _prepare_test_session_unknown(tmp_path)
+    evidence = _preapproval_no_charge_evidence(ledger, request.d2_run_id)
+    evidence_sha = preapproval_no_charge_evidence_digest(evidence)
+    with pytest.raises(PhaseGError):
+        ledger.reconcile_test_session_preapproval_no_charge(
+            request.d2_run_id,
+            expected_ledger_sha256="0" * 64,
+            evidence_sha256=evidence_sha,
+            implementation_commit="a" * 40,
+            evidence=evidence,
+        )
+    with pytest.raises(PhaseGError):
+        ledger.reconcile_test_session_preapproval_no_charge(
+            request.d2_run_id,
+            expected_ledger_sha256=sha256_file(ledger.path),
+            evidence_sha256="0" * 64,
+            implementation_commit="a" * 40,
+            evidence=evidence,
+        )
+    assert ledger.attempts()[0]["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
 
 
 def test_test_session_rejects_prod_execution_context(tmp_path: Path) -> None:

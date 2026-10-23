@@ -41,8 +41,13 @@ The session reserves its full remaining authorization before a D2 row is
 created and records the live balance before that attempt. Phase G rechecks the
 session and exact live adapter profile immediately before Generate. Before a
 one-time approval it requires one video, a known positive quote, a quote no
-greater than the remaining session cap, and a visible balance equal to the
-captured pre-attempt balance and sufficient for the quote.
+greater than the remaining session cap, and a captured pre-attempt balance
+known to be sufficient for the quote. If Flow exposes a visible balance in the
+gate, it must equal the captured pre-attempt balance; if the gate omits it, the
+recorded UI value remains null and the captured live pre-attempt balance is the
+budget evidence. The TEST-session lane must not be used for any other paid
+action during that attempt; see the versioned pre-approval reconciliation
+contract below before clearing an UNKNOWN outcome.
 
 After the attempt, the operator reads the supported live credits command once
 and reconciles the before/after values. The session records the quoted cost and
@@ -77,6 +82,13 @@ TEST account for another paid action during a session attempt. Any unexplained
 balance movement is a stop, not a basis for estimating spend.
 
 ## Operators
+
+The narrow absent-visible-balance approval rule and exact evidence-backed
+pre-approval reconciliation are specified in
+[`D2_TEST_SESSION_PREAPPROVAL_NO_CHARGE_V1.md`](D2_TEST_SESSION_PREAPPROVAL_NO_CHARGE_V1.md).
+That operator is the only supported way to transition an UNKNOWN TEST-session
+attempt to `RECONCILED_NO_CHARGE`; `record_state()` and the ordinary session
+reconciler remain fail-closed.
 
 Open once with `scripts/operations/open_d2_test_session.py` after the code is
 committed/pushed, the tracked worktree is clean, the current ledger SHA is

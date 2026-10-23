@@ -1406,6 +1406,196 @@ class D2DailyCreditLedger:
 
         return self._mutate(update)
 
+    def reconcile_test_session_preapproval_no_charge(
+        self,
+        d2_run_id: str,
+        *,
+        expected_ledger_sha256: str,
+        evidence_sha256: str,
+        implementation_commit: str,
+        evidence: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Release one TEST-session hold with complete evidence of a pre-approval stop."""
+        if not _SHA256_RE.fullmatch(expected_ledger_sha256):
+            raise PhaseGError("PHASE_G_LEDGER_SHA_INVALID", "expected ledger SHA-256 is invalid")
+        if not _SHA256_RE.fullmatch(evidence_sha256):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_EVIDENCE_HASH_INVALID", "evidence SHA-256 is invalid"
+            )
+        if not re.fullmatch(r"[0-9a-f]{40,64}", implementation_commit):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_COMMIT_INVALID", "implementation commit SHA is invalid"
+            )
+        from .phase_g_test_session_no_charge import (
+            preapproval_no_charge_evidence_digest,
+            validate_preapproval_no_charge_evidence,
+        )
+
+        summary = validate_preapproval_no_charge_evidence(evidence)
+        if (
+            summary["D2_RUN_ID"] != d2_run_id
+            or summary["CANONICAL_LEDGER_SHA256"] != expected_ledger_sha256
+            or summary["IMPLEMENTATION_COMMIT"] != implementation_commit
+            or preapproval_no_charge_evidence_digest(summary) != evidence_sha256
+        ):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_EVIDENCE_HASH_MISMATCH",
+                "evidence does not match the expected run, ledger, implementation, or digest",
+            )
+        with self._locked_file():
+            if self.path.is_symlink() or not self.path.is_file():
+                raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "D2 ledger is missing or unsafe")
+            if sha256_file(self.path) != expected_ledger_sha256:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CHANGED", "D2 ledger changed since evidence was collected"
+                )
+            payload = self._read()
+            matches = [
+                row
+                for row in cast(list[dict[str, object]], payload["attempts"])
+                if row.get("d2_run_id") == d2_run_id
+            ]
+            if len(matches) != 1:
+                raise PhaseGError("PHASE_G_ATTEMPT_NOT_UNIQUE", "D2 run must exist exactly once")
+            attempt = matches[0]
+            session_id = attempt.get("test_session_id")
+            if not isinstance(session_id, str):
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_ATTEMPT_MISMATCH", "attempt has no TEST-session binding"
+                )
+            session = self._test_session(payload, session_id)
+            expected_root = str(self.root.parent.resolve())
+            before = _decimal(evidence.get("CREDITS_BEFORE"))
+            after = _decimal(evidence.get("CREDITS_AFTER"))
+            spent = _decimal(session.get("spent_credits"))
+            reserved = _decimal(session.get("reserved_credits"))
+            baseline_media = attempt.get("baseline_media_ids")
+            baseline_execution = attempt.get("baseline_execution_ids")
+            baseline_confirmations = attempt.get("baseline_confirmation_ids")
+            baseline_agent_turn_id = attempt.get("baseline_agent_turn_id")
+            baseline_chat_count = (
+                int(baseline_agent_turn_id.split(":", 1)[0])
+                if isinstance(baseline_agent_turn_id, str)
+                and baseline_agent_turn_id.split(":", 1)[0].isdigit()
+                else None
+            )
+            evidence_baseline_media = cast(list[str], evidence.get("BASELINE_MEDIA_IDS", []))
+            evidence_baseline_execution = cast(
+                list[str], evidence.get("BASELINE_EXECUTION_IDS", [])
+            )
+            evidence_baseline_confirmations = cast(
+                list[str], evidence.get("BASELINE_CONFIRMATION_IDS", [])
+            )
+            observed_quote = _decimal(attempt.get("observed_credit_cost"), allow_none=True)
+            evidence_quote = _decimal(evidence.get("OBSERVED_CREDIT_COST"), allow_none=True)
+            observed_balance = _decimal(attempt.get("observed_visible_balance"), allow_none=True)
+            evidence_balance = _decimal(evidence.get("OBSERVED_VISIBLE_BALANCE"), allow_none=True)
+            session_check = dict(session)
+            session_check.update(status="ACTIVE", stopped_reason=None)
+            self._require_test_session_active(session_check)
+            prior_reconciliation = attempt.get("test_session_reconciliation")
+            prior_reconciled_at = attempt.get("test_session_reconciled_at")
+            if (
+                attempt.get("submission_state") != "UNKNOWN_SUBMISSION_STATE"
+                or attempt.get("terminal_state") is not None
+                or _counter(attempt.get("generate_action_count")) != 1
+                or _counter(attempt.get("approval_action_count")) != 0
+                or attempt.get("requested_output_count") != 1
+                or attempt.get("agent_turn_dispatched") is not True
+                or attempt.get("confirmation_id") is not None
+                or attempt.get("observed_confirmation_id")
+                != evidence.get("OBSERVED_CONFIRMATION_ID")
+                or attempt.get("observed_video_count") != evidence.get("OBSERVED_VIDEO_COUNT")
+                or observed_quote is None
+                or observed_quote != evidence_quote
+                or observed_balance != evidence_balance
+                or attempt.get("provider_execution_id") is not None
+                or attempt.get("provider_media_id") is not None
+                or attempt.get("provider_media_ids") != []
+                or attempt.get("provider_project_id") != evidence.get("PROVIDER_PROJECT_ID")
+                or attempt.get("provider_account_id") != evidence.get("PROVIDER_ACCOUNT_ID")
+                or session.get("auth_profile_key") != evidence.get("TEST_PROFILE_KEY")
+                or attempt.get("baseline_captured") is not True
+                or not isinstance(baseline_media, list)
+                or not isinstance(baseline_execution, list)
+                or not isinstance(baseline_confirmations, list)
+                or set(cast(list[str], baseline_media)) != set(evidence_baseline_media)
+                or set(cast(list[str], baseline_execution)) != set(evidence_baseline_execution)
+                or set(cast(list[str], baseline_confirmations))
+                != set(evidence_baseline_confirmations)
+                or baseline_chat_count != evidence.get("BASELINE_CHAT_COUNT")
+                or attempt.get("provider_directive_sha256")
+                != evidence.get("PROVIDER_DIRECTIVE_SHA256")
+                or attempt.get("baseline_pending_count") != evidence.get("BASELINE_PENDING_COUNT")
+                or attempt.get("test_session_id") != evidence.get("SESSION_ID")
+                or _decimal(attempt.get("test_session_credits_before")) != before
+                or _decimal(session.get("last_provider_credits")) != before
+                or before is None
+                or after != before
+                or session.get("in_flight_run_id") != d2_run_id
+                or session.get("status") != "STOPPED"
+                or session.get("stopped_reason") != "UNKNOWN_OR_NONTERMINAL_OUTCOME"
+                or spent is None
+                or reserved != _TEST_SESSION_CREDIT_LIMIT - spent
+                or spent >= _TEST_SESSION_CREDIT_LIMIT
+                or str(evidence.get("RUNTIME_STATE_ROOT")) != expected_root
+                or attempt.get("local_artifact_sha256") is not None
+                or attempt.get("remote_file_id") is not None
+                or attempt.get("remote_verified") is True
+                or attempt.get("provider_billing_outcome") != "UNKNOWN"
+                or attempt.get("test_session_reconciliation") != "STOPPED"
+            ):
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_EVIDENCE_MISMATCH",
+                    "ledger attempt/session does not match complete pre-approval evidence",
+                )
+            now = _utc_now()
+            history_value = attempt.get("test_session_reconciliation_history")
+            history: list[object] = (
+                list(cast(list[object], history_value)) if isinstance(history_value, list) else []
+            )
+            history.append(
+                {
+                    "status": prior_reconciliation,
+                    "reconciled_at": prior_reconciled_at,
+                    "credit_delta": attempt.get("test_session_credit_delta"),
+                }
+            )
+            history.append(
+                {
+                    "status": "RECONCILED",
+                    "detail": "RECONCILED_PRE_APPROVAL_NO_CHARGE",
+                    "reconciled_at": now,
+                    "evidence_sha256": evidence_sha256,
+                }
+            )
+            attempt.update(
+                submission_state="RECONCILED_NO_CHARGE",
+                terminal_state="RECONCILED_NO_CHARGE",
+                test_session_previous_reconciliation=prior_reconciliation,
+                test_session_previous_reconciled_at=prior_reconciled_at,
+                test_session_reconciliation_history=history,
+                test_session_credits_after=str(after),
+                test_session_credit_delta="0",
+                test_session_reconciled_at=now,
+                test_session_reconciliation="RECONCILED",
+                test_session_reconciliation_detail="RECONCILED_PRE_APPROVAL_NO_CHARGE",
+                test_session_no_charge_evidence_sha256=evidence_sha256,
+                test_session_no_charge_implementation_commit=implementation_commit,
+                updated_at=now,
+            )
+            session.update(
+                status="ACTIVE",
+                spent_credits=str(spent),
+                reserved_credits=str(_TEST_SESSION_CREDIT_LIMIT - spent),
+                last_provider_credits=str(after),
+                in_flight_run_id=None,
+                stopped_reason=None,
+                updated_at=now,
+            )
+            self._write(payload)
+            return dict(session)
+
     def create_d6_attempt(
         self, request: PhaseGExecutionRequest, *, proof: D6PrerequisiteProof | None
     ) -> dict[str, object]:
@@ -1850,13 +2040,13 @@ class D2DailyCreditLedger:
                     session.get("in_flight_run_id") != d2_run_id
                     or spent is None
                     or quoted > _TEST_SESSION_CREDIT_LIMIT - spent
-                    or balance is None
                     or expected_balance is None
-                    or balance != expected_balance
+                    or quoted > expected_balance
+                    or (balance is not None and balance != expected_balance)
                 ):
                     raise PhaseGError(
                         "PHASE_G_TEST_SESSION_QUOTE_INVALID",
-                        "quote, visible balance, or session binding exceeds authorization",
+                        "quote, captured balance, or session binding exceeds authorization",
                     )
             else:
                 cumulative = self._accounted(payload, date)
@@ -2313,6 +2503,14 @@ class D2DailyCreditLedger:
                     "PHASE_G_FORENSIC_OPERATOR_REQUIRED",
                     "forensic closure requires the SHA-guarded evidence operator",
                 )
+            if (
+                current_state == "UNKNOWN_SUBMISSION_STATE"
+                and submission_state == "RECONCILED_NO_CHARGE"
+            ):
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_OPERATOR_REQUIRED",
+                    "unknown no-charge reconciliation requires its evidence operator",
+                )
             if current_state in _TERMINAL_STATES:
                 raise PhaseGError(
                     "PHASE_G_ATTEMPT_TERMINAL", "terminal D2 attempt cannot be changed"
@@ -2372,7 +2570,6 @@ class D2DailyCreditLedger:
                     "UNEXPECTED_MULTI_OUTPUT",
                     "MEDIA_VALIDATION_FAILED",
                     "PERSISTENCE_FAILED",
-                    "RECONCILED_NO_CHARGE",
                     "FORENSICALLY_CLOSED_UNKNOWN",
                 },
                 "GENERATION_SUCCEEDED": {

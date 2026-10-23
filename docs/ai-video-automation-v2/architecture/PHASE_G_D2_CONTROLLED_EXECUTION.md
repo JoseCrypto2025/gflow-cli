@@ -221,6 +221,15 @@ sanitized evidence summary. Existing ledger records remain readable.
 `UNKNOWN_SUBMISSION_STATE`, `FORENSICALLY_CLOSED_UNKNOWN`,
 `RECONCILED_NO_CHARGE`, and `D2_SUCCEEDED` therefore have different meanings.
 
+The only post-submit path from an UNKNOWN TEST-session attempt to
+`RECONCILED_NO_CHARGE` is the exact evidence-bound pre-approval operator in
+[`../operations/D2_TEST_SESSION_PREAPPROVAL_NO_CHARGE_V1.md`](../operations/D2_TEST_SESSION_PREAPPROVAL_NO_CHARGE_V1.md).
+It requires zero approvals, a fresh one-video confirmation, complete
+baseline-relative project enumeration with no provider progress or refusal,
+and independently unchanged provider credits. Equal balance or absent media
+alone is not sufficient. Generic `record_state()` and the ordinary TEST-session
+reconciler cannot make this transition from UNKNOWN.
+
 ### D6 release prerequisite
 
 ### Versioned forensic closure for chat-only unknown activity

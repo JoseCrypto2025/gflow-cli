@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from gflow_cli.api.transports.batchexecute import (
     TEXT_TO_VIDEO_SUBMIT_RPC,
@@ -51,10 +51,25 @@ _FLOW_ORIGIN = "https://flow.google.com"
 _VIDEO_STATE_JS = r"""
 async () => {
   const source = (element) => element ? (element.currentSrc || element.src || '') : '';
+  const tileIdentity = (value) => {
+    let url;
+    try { url = new URL(value); } catch { return null; }
+    if (url.origin === 'https://flow-content.google') {
+      const mediaPattern = /^\/(?:video|image)\/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i;
+      const media = mediaPattern.exec(url.pathname);
+      return media ? `media:${media[1].toLowerCase()}` : null;
+    }
+    if (url.hostname === 'lh3.googleusercontent.com' || url.hostname === 'flow.google.com') {
+      const poster = /^\/asb\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
+      return poster ? `asb:${poster[1]}` : null;
+    }
+    return null;
+  };
   const mediaId = (value) => {
     let url;
     try { url = new URL(value); } catch { return null; }
-    const match = /^\/video\/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i.exec(url.pathname);
+    const mediaPattern = /^\/(?:video|image)\/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i;
+    const match = mediaPattern.exec(url.pathname);
     return url.origin === 'https://flow-content.google' && match
       ? match[1].toLowerCase()
       : null;
@@ -79,9 +94,20 @@ async () => {
   const finishedRows = finished.map(tile => {
     const video = source(tile.querySelector('video'));
     const image = source(tile.querySelector('img'));
-    return { key: video || image, media_id: mediaId(video) || mediaId(image) };
+    const value = video || image;
+    let location = null;
+    try {
+      const url = new URL(value);
+      location = { origin: url.origin, pathname: url.pathname };
+    } catch {}
+    return {
+      identity: tileIdentity(video) || tileIdentity(image),
+      location,
+      media_id: mediaId(video) || mediaId(image),
+    };
   });
-  const tileKeys = await Promise.all(finishedRows.map(row => digest(row.key)));
+  const finishedLocations = finishedRows.map(row => row.location).filter(Boolean);
+  const tileKeys = await Promise.all(finishedRows.map(row => digest(row.identity)));
   const options = [...document.querySelectorAll('flow-a2ui-video-option')];
   const optionIds = options
     .map(option => mediaId(source(option.querySelector('img'))))
@@ -93,17 +119,30 @@ async () => {
     )],
     finished_media_ids: [...new Set(finishedRows.map(row => row.media_id).filter(Boolean))],
     finished_tile_key_hashes: tileKeys.filter(Boolean),
+    finished_tile_locations: finishedLocations,
+    finished_tile_identity_records: finishedRows.map((row, index) => ({
+      identity_hash: tileKeys[index],
+      media_id: row.media_id,
+    })),
     chat_video_media_ids: [...new Set(videoOptions.map(option => option.media_id))],
     chat_video_options: videoOptions,
     chat_count: chat.length,
     chat_bubble_hashes: await Promise.all(chat.map(async bubble => {
-      const text = (bubble.innerText || bubble.textContent || '').trim();
+      const content = bubble.cloneNode(true);
+      const transientSelectors = [
+        'button', '[role="button"]', '[role="radio"]', '[role="toolbar"]',
+        '[role="progressbar"]', 'time', 'mat-icon', '[aria-live]', 'flow-permission-message',
+      ].join(',');
+      content.querySelectorAll(transientSelectors).forEach(element => element.remove());
+      const text = (content.innerText || content.textContent || '')
+        .replace(/\\s+/g, ' ').trim();
       const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
       return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, '0')).join('');
     })),
     chat_tail_hash: chat.length
       ? [...new Uint8Array(await crypto.subtle.digest(
-          'SHA-256', new TextEncoder().encode(chat[chat.length - 1].outerHTML)))].map(
+          'SHA-256', new TextEncoder().encode((chat[chat.length - 1].innerText || '')
+            .replace(/\\s+/g, ' ').trim())))].map(
           value => value.toString(16).padStart(2, '0')).join('')
       : '',
     chat_media_ids: chat.length ? [...new Set(videoOptions
@@ -175,6 +214,90 @@ def parse_confirmation_quote(text: str) -> tuple[int | None, Decimal | None]:
 def _gate_digest(markup: str) -> str:
     """Fingerprint a gate without persisting its prompt or raw markup."""
     return hashlib.sha256(markup.encode("utf-8")).hexdigest()
+
+
+def canonical_finished_tile_identity(origin: str, pathname: str) -> str | None:
+    """Return a stable media UUID or measured poster token, ignoring URL queries."""
+    media = re.fullmatch(
+        r"/(?:video|image)/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})",
+        pathname,
+        re.IGNORECASE,
+    )
+    if origin == "https://flow-content.google" and media:
+        return f"media:{media[1].lower()}"
+    if origin in {"https://lh3.googleusercontent.com", _FLOW_ORIGIN}:
+        poster = re.fullmatch(r"/asb/([A-Za-z0-9_-]+)", pathname)
+        if poster:
+            return f"asb:{poster[1]}"
+    return None
+
+
+def canonical_finished_tile_url_identity(value: str) -> str | None:
+    """Canonicalize a tile URL while discarding all query and fragment data."""
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    return canonical_finished_tile_identity(f"{parsed.scheme}://{parsed.netloc}", parsed.path)
+
+
+def canonical_finished_tile_url_hash(value: str) -> str | None:
+    """Return a digest of canonical tile identity without signed URL parameters."""
+    identity = canonical_finished_tile_url_identity(value)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest() if identity else None
+
+
+def provider_directive_sha256(prompt: str) -> str:
+    """Hash normalized visible message text so UI whitespace does not alter identity."""
+    return hashlib.sha256(" ".join(prompt.split()).encode("utf-8")).hexdigest()
+
+
+def _finished_tile_hashes(state: Mapping[str, object]) -> list[str]:
+    """Hash stable tile identities returned by the DOM probe without query strings."""
+    locations = state.get("finished_tile_locations")
+    if not isinstance(locations, list):
+        value = state.get("finished_tile_key_hashes")
+        if not isinstance(value, list):
+            return []
+        return [
+            item
+            for item in cast(list[object], value)
+            if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item)
+        ]
+    hashes: list[str] = []
+    for value in cast(list[object], locations):
+        if not isinstance(value, dict):
+            continue
+        location = cast(dict[str, object], value)
+        origin = location.get("origin")
+        pathname = location.get("pathname")
+        if isinstance(origin, str) and isinstance(pathname, str):
+            identity = canonical_finished_tile_identity(origin, pathname)
+            if identity is not None:
+                hashes.append(hashlib.sha256(identity.encode("utf-8")).hexdigest())
+    return hashes
+
+
+def _new_finished_tile_hashes(
+    state: Mapping[str, object], baseline: FlowSubmissionBaseline
+) -> set[str]:
+    """Compare tiles by stable identity, using baseline media IDs across hash migrations."""
+    raw_records = state.get("finished_tile_identity_records")
+    if not isinstance(raw_records, list):
+        return set(_finished_tile_hashes(state)) - set(baseline.finished_tile_key_hashes)
+    result: set[str] = set()
+    for value in cast(list[object], raw_records):
+        if not isinstance(value, dict):
+            continue
+        record = cast(dict[str, object], value)
+        tile_hash = record.get("identity_hash")
+        media_id = record.get("media_id")
+        if not isinstance(tile_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", tile_hash):
+            continue
+        if isinstance(media_id, str) and media_id.lower() in baseline.media_ids:
+            continue
+        if tile_hash not in baseline.finished_tile_key_hashes:
+            result.add(tile_hash)
+    return result
 
 
 class GoogleFlowAgentOnlyGenerationPort:
@@ -363,7 +486,7 @@ class GoogleFlowAgentOnlyGenerationPort:
                 "PHASE_G_NEGATIVE_PROMPT_UNSUPPORTED", "D2 requires an empty negative prompt"
             )
         await self._base.fill_prompt(prompt)
-        self._provider_directive_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        self._provider_directive_sha256 = provider_directive_sha256(prompt)
 
     async def read_prompt(self) -> str | None:
         return (await self._base.readback()).prompt
@@ -401,7 +524,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         media_ids.update(record.media_id.lower() for record in self._records.values())
         execution_ids = {record.workflow_id.lower() for record in self._records.values()}
         pending = self._integer(state.get("pending"))
-        finished_tile_key_hashes = tuple(self._valid_hashes(state.get("finished_tile_key_hashes")))
+        finished_tile_key_hashes = tuple(_finished_tile_hashes(cast(Mapping[str, object], state)))
         baseline = FlowSubmissionBaseline(
             request.provider_project_id,
             frozenset(media_ids),
@@ -694,13 +817,25 @@ class GoogleFlowAgentOnlyGenerationPort:
                 )
             wire_done = [record for record in wire_new if record.is_done]
             finished_dom_ids = set(self._valid_ids(state.get("finished_media_ids")))
-            current_tile_hashes = self._valid_hashes(state.get("finished_tile_key_hashes"))
-            new_tile_hashes = set(current_tile_hashes) - set(baseline.finished_tile_key_hashes)
-            newest_tile_changed = bool(
-                current_tile_hashes
-                and (
-                    not baseline.finished_tile_key_hashes
-                    or current_tile_hashes[0] != baseline.finished_tile_key_hashes[0]
+            current_tile_hashes = _finished_tile_hashes(state)
+            new_tile_hashes = _new_finished_tile_hashes(state, baseline)
+            tile_records = state.get("finished_tile_identity_records")
+            first_tile_hash = None
+            if (
+                isinstance(tile_records, list)
+                and tile_records
+                and isinstance(tile_records[0], dict)
+            ):
+                first_tile_hash = cast(dict[str, object], tile_records[0]).get("identity_hash")
+            newest_tile_changed = (
+                first_tile_hash in new_tile_hashes
+                if tile_records is not None
+                else bool(
+                    current_tile_hashes
+                    and (
+                        not baseline.finished_tile_key_hashes
+                        or current_tile_hashes[0] != baseline.finished_tile_key_hashes[0]
+                    )
                 )
             )
             dom_correlated_media_ids: set[str]
@@ -974,10 +1109,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._observed_finished_media_ids.update(
             set(self._valid_ids(state.get("finished_media_ids"))) - baseline.media_ids
         )
-        self._observed_finished_tile_key_hashes.update(
-            set(self._valid_hashes(state.get("finished_tile_key_hashes")))
-            - set(baseline.finished_tile_key_hashes)
-        )
+        self._observed_finished_tile_key_hashes.update(_new_finished_tile_hashes(state, baseline))
         if self._observed_new_turn_bubble_index is None:
             self._observed_new_turn_bubble_index = self._new_agent_turn_bubble_index(
                 state, baseline
@@ -989,17 +1121,15 @@ class GoogleFlowAgentOnlyGenerationPort:
     ) -> int | None:
         if self._provider_directive_sha256 is None:
             return None
-        baseline_count, _, baseline_hash = (baseline.agent_turn_id or "0:").partition(":")
+        baseline_count, _, _ = (baseline.agent_turn_id or "0:").partition(":")
         hashes = self._valid_hashes(state.get("chat_bubble_hashes"))
-        first_new_index = len(baseline.agent_turn_bubble_hashes)
-        if (
-            self._integer(state.get("chat_count")) <= int(baseline_count or "0")
-            or str(state.get("chat_tail_hash") or "") == baseline_hash
-        ):
+        current_count = self._integer(state.get("chat_count"))
+        baseline_index = int(baseline_count or "0")
+        if current_count <= baseline_index or len(hashes) != current_count:
             return None
         matching = [
             index
-            for index in range(first_new_index, len(hashes))
+            for index in range(baseline_index, current_count)
             if hashes[index] == self._provider_directive_sha256
         ]
         return matching[0] if len(matching) == 1 else None

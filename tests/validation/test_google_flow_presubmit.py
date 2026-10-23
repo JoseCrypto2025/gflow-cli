@@ -269,7 +269,11 @@ async def test_agent_only_settings_are_journaled_restored_and_marked_clean(
     )
 
     assert outcome.state == "FLOW_PRESUBMIT_READY"
-    assert "target a duration of 8 seconds" in (port.prompt or "")
+    expected_provider_prompt = flow.build_agent_only_directive(
+        request.prompt_version.compiled_prompt_text,
+        request.preflight.technical_configuration,
+    )
+    assert port.prompt == expected_provider_prompt
     assert port.calls.index("snapshot_settings") < port.calls.index("apply_settings")
     assert port.calls.index("apply_settings") < port.calls.index("restore_settings")
     assert port.applied == port.original_settings
