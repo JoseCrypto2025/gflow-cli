@@ -14,10 +14,86 @@ from gflow_cli.v2_runtime.google_sheets import (
     SOURCE_LIVE_GOOGLE_SHEETS,
     GoogleSheetsApiTransport,
     GoogleSheetsReadError,
+    GoogleSheetsSnapshot,
     GoogleSheetsSnapshotSource,
     GoogleWorkspaceCredentialProvider,
     write_snapshot_atomic,
 )
+
+_BOOL_FALSE = {"false", "0", "no"}
+
+
+def _normalized_cell(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _load_snapshot_row_rules(schema_dir: Path) -> dict[str, tuple[str, frozenset[str]]]:
+    rules: dict[str, tuple[str, frozenset[str]]] = {}
+    for subdir in ("master", "transaction", "relation"):
+        for schema_path in sorted((schema_dir / subdir).glob("*.schema.json")):
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            table_name = str(schema["table_name"])
+            primary_key = str(schema["primary_key"])
+            fields = schema["fields"]
+            field_names = {str(field["field_name"]) for field in fields}
+            if primary_key not in field_names:
+                raise GoogleSheetsReadError("snapshot schema primary key is invalid")
+            boolean_fields = frozenset(
+                str(field["field_name"])
+                for field in fields
+                if str(field.get("data_type", "")).upper() == "BOOLEAN"
+            )
+            if table_name in rules:
+                raise GoogleSheetsReadError("duplicate snapshot schema table")
+            rules[table_name] = (primary_key, boolean_fields)
+    return rules
+
+
+def _normalize_snapshot_rows(
+    snapshot: GoogleSheetsSnapshot, schema_dir: Path
+) -> tuple[GoogleSheetsSnapshot, int]:
+    """Remove checkbox-only phantom rows while failing closed on real orphan data."""
+    rules = _load_snapshot_row_rules(schema_dir)
+    if set(snapshot.tables) != set(rules):
+        raise GoogleSheetsReadError("snapshot table set does not match schema")
+
+    normalized_tables: dict[str, list[dict[str, object]]] = {}
+    removed = 0
+    for table_name, rows in snapshot.tables.items():
+        primary_key, boolean_fields = rules[table_name]
+        kept_rows: list[dict[str, object]] = []
+        for raw_row in rows:
+            row = dict(raw_row)
+            if _normalized_cell(row.get(primary_key)):
+                kept_rows.append(row)
+                continue
+
+            has_substantive_value = False
+            for field_name, raw_value in row.items():
+                value = _normalized_cell(raw_value)
+                if not value:
+                    continue
+                if field_name in boolean_fields and value.lower() in _BOOL_FALSE:
+                    continue
+                has_substantive_value = True
+                break
+
+            if has_substantive_value:
+                raise GoogleSheetsReadError(
+                    f"{table_name} contains data without its primary key"
+                )
+            removed += 1
+        normalized_tables[table_name] = kept_rows
+
+    return (
+        GoogleSheetsSnapshot(
+            spreadsheet_id=snapshot.spreadsheet_id,
+            read_at=snapshot.read_at,
+            source=snapshot.source,
+            tables=normalized_tables,
+        ),
+        removed,
+    )
 
 
 def export_d2_master_snapshot(credential_path: Path, runtime_root: Path) -> dict[str, object]:
@@ -37,6 +113,9 @@ def export_d2_master_snapshot(credential_path: Path, runtime_root: Path) -> dict
         or snapshot.source != SOURCE_LIVE_GOOGLE_SHEETS
     ):
         raise GoogleSheetsReadError("snapshot did not come from the approved live source")
+
+    snapshot, phantom_rows_removed = _normalize_snapshot_rows(snapshot, schema_dir)
+    logical_row_count = sum(len(rows) for rows in snapshot.tables.values())
 
     root = runtime_root.resolve(strict=True)
     if runtime_root.is_symlink() or not root.is_dir():
@@ -61,6 +140,8 @@ def export_d2_master_snapshot(credential_path: Path, runtime_root: Path) -> dict
         "read_at": snapshot.read_at,
         "source": snapshot.source,
         "table_count": len(snapshot.tables),
+        "logical_row_count": logical_row_count,
+        "phantom_rows_removed": phantom_rows_removed,
         "file_sha256": digest,
         "write_performed": True,
     }
