@@ -8,10 +8,14 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
+from urllib.parse import parse_qs, urlsplit
 
+from gflow_cli.api.transports.batchexecute import generation_records, parse_frames
 from gflow_cli.v2_runtime.google_flow import FlowPresubmitRequest
 from gflow_cli.v2_runtime.phase_g import D2DailyCreditLedger, PhaseGError, PhaseGExecutionRequest
 from gflow_cli.v2_runtime.phase_g_artifacts import sha256_file
@@ -27,6 +31,9 @@ _RUN_ID = "D2_8d892c38cc8f4c99"
 _PROJECT_ID = "34e60953-e534-46e9-ac65-993893e61065"
 _PROJECT_NAME = "AI Video Automation V2 - TEST"
 _ACCOUNT_ID = "PVA_0001"
+_HISTORICAL_WORKFLOW_ID = "9dc0380b-0a38-44f7-9c6c-8fe5262fdc2a"
+_HISTORICAL_MEDIA_ID = "d6e85926-120f-40ab-bfc0-6a788c521339"
+_PROJECT_LISTING_RPC = "Zzl0ze"
 _CHAT_SCAN_JS = r"""
 () => {
   const bubbles = [...document.querySelectorAll('flow-chat-bubble')];
@@ -139,6 +146,215 @@ def _uuid_ids(value: object, *, field: str) -> list[str]:
     return sorted({cast(str, item).lower() for item in values})
 
 
+@dataclass(frozen=True)
+class _SanitizedGenerationRecord:
+    workflow_id: str
+    project_id: str
+    media_id: str
+    status: int | None
+
+
+class _ProviderRecord(Protocol):
+    workflow_id: str
+    project_id: str
+    media_id: str
+    status: int | None
+
+
+def _is_project_listing_response(response_url: str) -> bool:
+    parsed = urlsplit(response_url)
+    if parsed.hostname != "flow.google.com" or "batchexecute" not in parsed.path:
+        return False
+    return any(
+        _PROJECT_LISTING_RPC in value.split(",")
+        for value in parse_qs(parsed.query).get("rpcids", [])
+    )
+
+
+class _ProjectListingObserver:
+    """Collect sanitized records from one explicitly armed project reload."""
+
+    def __init__(self, page: object) -> None:
+        self._page = page
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._armed = False
+        self._event: asyncio.Event | None = None
+        self._response_count = 0
+        self._records: list[_SanitizedGenerationRecord] = []
+        self._error: str | None = None
+        self._page.on("response", self._on_response)  # type: ignore[attr-defined]
+
+    def begin_snapshot(self) -> None:
+        self._event = asyncio.Event()
+        self._response_count = 0
+        self._records = []
+        self._error = None
+        self._armed = True
+
+    def _on_response(self, response: object) -> None:
+        if not self._armed or not _is_project_listing_response(str(getattr(response, "url", ""))):
+            return
+        self._response_count += 1
+        task = asyncio.create_task(self._capture_response(response))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _capture_response(self, response: object) -> None:
+        try:
+            body = await response.text()  # type: ignore[attr-defined]
+            frames = parse_frames(body)
+            payloads = [payload for rpcid, payload in frames if rpcid == _PROJECT_LISTING_RPC]
+            if not payloads:
+                self._error = "project listing response did not contain its requested RPC frame"
+                return
+            decoded = [
+                record
+                for payload in payloads
+                for record in generation_records(_PROJECT_LISTING_RPC, payload)
+            ]
+            if not decoded:
+                self._error = "project listing RPC was observed but no video record shape decoded"
+                return
+            self._records.extend(
+                _SanitizedGenerationRecord(
+                    record.workflow_id.lower(),
+                    record.project_id.lower(),
+                    record.media_id.lower(),
+                    record.status,
+                )
+                for record in decoded
+            )
+        except Exception:  # noqa: BLE001 - response/parser details may contain sensitive data
+            self._error = "project listing response could not be read or decoded"
+        finally:
+            event = self._event
+            if event is not None:
+                event.set()
+
+    async def wait_snapshot(self, *, timeout_s: float = 30.0) -> list[_SanitizedGenerationRecord]:
+        event = self._event
+        if not self._armed or event is None:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE", "project listing observer is not armed"
+            )
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout_s)
+            tasks = tuple(self._tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except TimeoutError as exc:
+            self._armed = False
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                "project listing RPC was not observed for this reload",
+            ) from exc
+        finally:
+            self._armed = False
+        if self._response_count != 1:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                "project listing reload did not yield exactly one RPC response",
+            )
+        if self._error is not None:
+            raise PhaseGError("PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE", self._error)
+        if not self._records:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                "project listing RPC was observed with zero video records",
+            )
+        return list(self._records)
+
+    async def close(self) -> None:
+        self._armed = False
+        self._page.remove_listener("response", self._on_response)  # type: ignore[attr-defined]
+        pending = tuple(self._tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _reload_project_listing(
+    page: object,
+    observer: _ProjectListingObserver,
+    *,
+    timeout_s: float = 30.0,
+    deadline: float | None = None,
+) -> list[_SanitizedGenerationRecord]:
+    if deadline is None:
+        deadline = time.monotonic() + timeout_s
+
+    def timeout_ms() -> int:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                "project listing observation exceeded its bounded deadline",
+            )
+        return max(1, min(30_000, int(remaining * 1000)))
+
+    observer.begin_snapshot()
+    try:
+        await page.reload(  # type: ignore[attr-defined]
+            wait_until="domcontentloaded", timeout=timeout_ms()
+        )
+        await page.wait_for_load_state(  # type: ignore[attr-defined]
+            "domcontentloaded", timeout=timeout_ms()
+        )
+        if getattr(page, "url", None) != f"https://flow.google.com/project/{_PROJECT_ID}":
+            raise PhaseGError(
+                "PHASE_G_PROJECT_MISMATCH", "project reload left the pinned TEST project"
+            )
+        return await observer.wait_snapshot(timeout_s=min(30.0, (deadline - time.monotonic())))
+    except PhaseGError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - do not expose response/navigation details
+        raise PhaseGError(
+            "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE", "project listing reload did not complete"
+        ) from exc
+
+
+def _merge_project_records(
+    listing_records: Iterable[_ProviderRecord], live_records: Iterable[_ProviderRecord]
+) -> list[_SanitizedGenerationRecord]:
+    records: dict[tuple[str, str, str], _SanitizedGenerationRecord] = {}
+    for record in [*listing_records, *live_records]:
+        item = _SanitizedGenerationRecord(
+            record.workflow_id.lower(),
+            record.project_id.lower(),
+            record.media_id.lower(),
+            record.status,
+        )
+        if item.project_id != _PROJECT_ID.lower():
+            continue
+        key = (item.workflow_id, item.project_id, item.media_id)
+        previous = records.get(key)
+        if previous is not None and previous.status != item.status:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                "project listing and live status records disagree",
+            )
+        records[key] = item
+    return sorted(
+        records.values(), key=lambda item: (item.workflow_id, item.project_id, item.media_id)
+    )
+
+
+def _require_historical_records(
+    records: list[_SanitizedGenerationRecord],
+    historical_execution_ids: list[str],
+    historical_media_ids: list[str],
+) -> None:
+    record_exec = {item.workflow_id for item in records}
+    record_media = {item.media_id for item in records}
+    if not record_exec.issubset(historical_execution_ids) or not record_media.issubset(
+        historical_media_ids
+    ):
+        raise PhaseGError(
+            "PHASE_G_PROVIDER_OUTCOME_PRESENT", "new structured provider output found"
+        )
+
+
 async def _collect(args: argparse.Namespace) -> dict[str, object]:
     ledger = D2DailyCreditLedger(args.runtime_state_root)
     if ledger.path.is_symlink() or not ledger.path.is_file():
@@ -154,25 +370,43 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
         )
     historical_execution_ids, historical_media_ids = _historical_ids(ledger, attempt)
     port = await GoogleFlowAgentOnlyGenerationPort.open(expected_email=args.expected_email)
+    listing_observer: _ProjectListingObserver | None = None
     try:
         await port.bind_request(_request_from_attempt(attempt))
         page = port._require_page()
         if page.url != f"https://flow.google.com/project/{_PROJECT_ID}":
             raise PhaseGError("PHASE_G_PROJECT_MISMATCH", "TEST project URL is not selected")
-        # Reload the same project after the read-only response observer is attached so the
-        # existing structured GenerationRecord parser sees the project's current wire data.
-        await page.reload(wait_until="domcontentloaded", timeout=30_000)
-        await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        listing_observer = _ProjectListingObserver(page)
         snapshots: list[dict[str, object]] = []
         chat_metadata: dict[str, object] | None = None
         chat_hashes: list[str] = []
         chat_provider_identifiers: set[str] = set()
         previous_record_signature: tuple[tuple[str, str, str, int | None], ...] | None = None
+        listing_records: list[_SanitizedGenerationRecord] = []
         start = time.monotonic()
+        deadline = start + 120.0
         for elapsed in (0, 30, 60):
             if elapsed:
-                await asyncio.sleep(elapsed - int(time.monotonic() - start))
+                await asyncio.sleep(max(0.0, elapsed - (time.monotonic() - start)))
+            if time.monotonic() >= deadline:
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                    "project listing observation exceeded its bounded deadline",
+                )
             await port._raise_wire_refusal()
+            listing_records = await _reload_project_listing(
+                page, listing_observer, deadline=deadline
+            )
+            if not any(
+                item.project_id == _PROJECT_ID.lower()
+                and item.workflow_id == _HISTORICAL_WORKFLOW_ID
+                and item.media_id == _HISTORICAL_MEDIA_ID
+                for item in listing_records
+            ):
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                    "project listing did not contain the known historical record",
+                )
             state_value = await page.evaluate(_VIDEO_STATE_JS)
             chat_value = await page.evaluate(_CHAT_SCAN_JS)
             if not isinstance(state_value, dict) or not isinstance(chat_value, dict):
@@ -218,23 +452,24 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
                 )
             await port._raise_wire_refusal()
             confirmation_ids = sorted(await port._confirmation_ids())
-            records = sorted(
-                port._records.values(),
-                key=lambda item: (item.workflow_id, item.project_id, item.media_id),
-            )
+            records = _merge_project_records(listing_records, list(port._records.values()))
             if not records:
                 raise PhaseGError(
                     "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
                     "structured GenerationRecord enumeration is unavailable",
                 )
+            if not any(
+                item.workflow_id == _HISTORICAL_WORKFLOW_ID
+                and item.media_id == _HISTORICAL_MEDIA_ID
+                for item in records
+            ):
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                    "merged provider records omit the known historical record",
+                )
             record_exec = sorted({item.workflow_id for item in records})
             record_media = sorted({item.media_id.lower() for item in records})
-            if not set(record_exec).issubset(historical_execution_ids) or not set(
-                record_media
-            ).issubset(historical_media_ids):
-                raise PhaseGError(
-                    "PHASE_G_PROVIDER_OUTCOME_PRESENT", "new structured provider output found"
-                )
+            _require_historical_records(records, historical_execution_ids, historical_media_ids)
             record_signature = tuple(
                 (item.workflow_id, item.project_id, item.media_id.lower(), item.status)
                 for item in records
@@ -300,10 +535,7 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
             raise PhaseGError(
                 "PHASE_G_PROVIDER_OUTCOME_PRESENT", "new final DOM media identity found"
             )
-        final_records = sorted(
-            port._records.values(),
-            key=lambda item: (item.workflow_id, item.project_id, item.media_id),
-        )
+        final_records = _merge_project_records(listing_records, list(port._records.values()))
         final_record_signature = tuple(
             (item.workflow_id, item.project_id, item.media_id.lower(), item.status)
             for item in final_records
@@ -351,7 +583,7 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
             {
                 "WORKFLOW_ID": item.workflow_id,
                 "PROJECT_ID": item.project_id,
-                "MEDIA_ID": item.media_id.lower(),
+                "MEDIA_ID": item.media_id,
                 "STATUS": item.status,
             }
             for item in records
@@ -449,6 +681,9 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
             "evidence_path": str(evidence_path),
             "evidence_sha256": hashlib.sha256(raw).hexdigest(),
             "snapshot_count": len(snapshots),
+            "project_listing_rpc_observed": True,
+            "project_listing_enumeration": "PROVEN",
+            "listing_snapshot_count": len(snapshots),
             "observation_duration_seconds": evidence["LIVE_OBSERVATION_DURATION_SECONDS"],
             "pending_count": evidence["LIVE_PENDING_COUNT"],
             "confirmation_count": evidence["LIVE_CONFIRMATION_COUNT"],
@@ -457,6 +692,8 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
             "chat_hash_prefix_stable": hash_prefix_stable,
         }
     finally:
+        if listing_observer is not None:
+            await listing_observer.close()
         await port.close()
 
 

@@ -238,6 +238,21 @@ def _discovery_head(payload: Any) -> str:
     return redact_error_detail(_TOKEN_RE.sub("<token>", head))
 
 
+def _decode_generation_record(rec: list[Any]) -> GenerationRecord:
+    status_cell = _as_list(_at(rec, 5, 8))
+    status: Any = status_cell[0] if status_cell else None
+    size: Any = _at(rec, 5, 13)
+    return GenerationRecord(
+        workflow_id=rec[0],
+        project_id=rec[1],
+        media_id=rec[2],
+        status=status if isinstance(status, int) else None,
+        video_url=_url(_at(rec, 7, 0, 8)),
+        poster_url=_url(_at(rec, 5, 10)),
+        size_bytes=size if isinstance(size, int) else None,
+    )
+
+
 def generation_record(
     rpcid: str,
     payload: Any,
@@ -274,18 +289,38 @@ def generation_record(
             route=f"batchexecute:{rpcid}",
             discovery={"rpcid": rpcid, "payload_head": _discovery_head(payload)},
         )
-    status_cell = _as_list(_at(rec, 5, 8))
-    status: Any = status_cell[0] if status_cell else None
-    size: Any = _at(rec, 5, 13)
-    return GenerationRecord(
-        workflow_id=rec[0],
-        project_id=rec[1],
-        media_id=rec[2],
-        status=status if isinstance(status, int) else None,
-        video_url=_url(_at(rec, 7, 0, 8)),
-        poster_url=_url(_at(rec, 5, 10)),
-        size_bytes=size if isinstance(size, int) else None,
-    )
+    return _decode_generation_record(rec)
+
+
+def generation_records(rpcid: str, payload: Any) -> list[GenerationRecord]:
+    """Decode every unique video generation record in one payload.
+
+    The project listing can contain image records alongside video generations. A video
+    record must pass the existing three-UUID/details-list invariant and expose the
+    measured eight-slot shape with a media-info list at slot 7. Other payload lists,
+    including image records and unrelated UUID triples, are ignored. Identical decoded
+    records are returned once, in deterministic depth-first payload order.
+
+    Unlike :func:`generation_record`, an empty list is returned when no video record
+    matches; callers that require a complete listing must treat that as unavailable
+    evidence rather than as proof that the project has no provider history.
+    """
+    stack: list[object] = [payload]
+    records: list[GenerationRecord] = []
+    seen: set[GenerationRecord] = set()
+    while stack:
+        node = stack.pop()
+        items = _as_list(node)
+        if items is None:
+            continue
+        if len(items) == 8 and isinstance(items[7], list) and _is_record(items):
+            record = _decode_generation_record(items)
+            if record not in seen:
+                seen.add(record)
+                records.append(record)
+        # Reverse the push order to preserve the parser's established depth-first order.
+        stack.extend(reversed(items))
+    return records
 
 
 def image_records(rpcid: str, payload: Any) -> list[ImageGenerationRecord]:

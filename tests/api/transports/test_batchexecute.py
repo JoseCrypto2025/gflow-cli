@@ -227,6 +227,51 @@ def test_missing_record_warns_that_the_submit_may_be_billed_948() -> None:
     assert "billed" in hint and "simpler prompt" not in hint
 
 
+def test_generation_records_enumerates_one_existing_video_record() -> None:
+    from gflow_cli.api.transports.batchexecute import generation_records
+
+    records = generation_records("Zzl0ze", submit_payload())
+
+    assert len(records) == 1
+    assert (records[0].workflow_id, records[0].project_id, records[0].media_id) == (
+        WF,
+        PROJ,
+        MEDIA,
+    )
+    assert records[0].status == 6
+
+
+def test_generation_records_enumerates_nested_video_records_and_deduplicates() -> None:
+    from gflow_cli.api.transports.batchexecute import generation_records
+
+    second = _record(7, done_urls=True, size=2213107)
+    second[0] = "44444444-4444-4444-8444-444444444444"
+    second[2] = "55555555-5555-4555-8555-555555555555"
+    payload = [None, [[_record(2), [second, _record(2)]]]]
+
+    records = generation_records("Zzl0ze", payload)
+
+    assert [(item.workflow_id, item.media_id, item.status) for item in records] == [
+        (WF, MEDIA, 2),
+        (second[0], second[2], 7),
+    ]
+    assert records[1].video_url == VIDEO_URL
+    assert records[1].poster_url == POSTER_URL
+    assert records[1].size_bytes == 2213107
+
+
+def test_generation_records_ignores_image_and_unrelated_uuid_arrays() -> None:
+    from gflow_cli.api.transports.batchexecute import generation_records
+
+    image = [WF, PROJ, MEDIA, None, None, _record(2)[5], None]
+    unrelated = [WF, PROJ, MEDIA, "marker", None, ["not a video media-info arm"]]
+    records = generation_records("Zzl0ze", [unrelated, [image], [[_record(3)]]])
+
+    assert len(records) == 1
+    assert records[0].media_id == MEDIA
+    assert records[0].status == 3
+
+
 # --- error envelopes: a refusal is a frame with a null payload -----------------------
 #
 # Captured 2026-09-27 on ``ogiZ0b`` with a tampered reCAPTCHA token (spike
