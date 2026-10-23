@@ -12,6 +12,7 @@ from scripts.operations.collect_provider_silent_d2_evidence_v3 import (
     _HISTORICAL_MEDIA_ID,
     _HISTORICAL_WORKFLOW_ID,
     _PROJECT_ID,
+    _finalize_last_snapshot,
     _is_project_listing_response,
     _merge_project_records,
     _minimum_observation_delay,
@@ -101,6 +102,46 @@ def test_minimum_observation_delay_prevents_integer_duration_truncation(
     elapsed: float, expected_delay: float
 ) -> None:
     assert _minimum_observation_delay(10.0, 10.0 + elapsed) == pytest.approx(expected_delay)
+
+
+def test_final_read_updates_last_snapshot_elapsed_to_match_observation_duration() -> None:
+    snapshots = [{"ELAPSED_SECONDS": 59}, {"ELAPSED_SECONDS": 30}, {"ELAPSED_SECONDS": 59}]
+
+    duration = _finalize_last_snapshot(
+        snapshots,
+        elapsed_seconds=60.4,
+        pending_count=0,
+        confirmation_ids=[],
+        execution_ids=[_HISTORICAL_WORKFLOW_ID],
+        media_ids=[_HISTORICAL_MEDIA_ID],
+        dom_media_ids=[_HISTORICAL_MEDIA_ID],
+        dom_finished_media_ids=[_HISTORICAL_MEDIA_ID],
+    )
+
+    assert duration == 60
+    assert snapshots[-1] == {
+        "ELAPSED_SECONDS": duration,
+        "PENDING_COUNT": 0,
+        "CONFIRMATION_IDS": [],
+        "EXECUTION_IDS": [_HISTORICAL_WORKFLOW_ID],
+        "MEDIA_IDS": [_HISTORICAL_MEDIA_ID],
+        "DOM_MEDIA_IDS": [_HISTORICAL_MEDIA_ID],
+        "DOM_FINISHED_MEDIA_IDS": [_HISTORICAL_MEDIA_ID],
+    }
+
+
+def test_final_read_rejects_duration_below_contract_minimum() -> None:
+    with pytest.raises(PhaseGError, match="observation span is outside"):
+        _finalize_last_snapshot(
+            [{"ELAPSED_SECONDS": 59}],
+            elapsed_seconds=59.99,
+            pending_count=0,
+            confirmation_ids=[],
+            execution_ids=[_HISTORICAL_WORKFLOW_ID],
+            media_ids=[_HISTORICAL_MEDIA_ID],
+            dom_media_ids=[_HISTORICAL_MEDIA_ID],
+            dom_finished_media_ids=[_HISTORICAL_MEDIA_ID],
+        )
 
 
 def test_three_project_reloads_require_three_independent_listing_responses() -> None:

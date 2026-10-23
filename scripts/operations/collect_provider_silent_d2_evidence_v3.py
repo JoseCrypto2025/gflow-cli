@@ -361,6 +361,37 @@ def _minimum_observation_delay(started_at: float, now: float) -> float:
     return max(0.0, _MIN_OBSERVATION_SECONDS - (now - started_at))
 
 
+def _finalize_last_snapshot(
+    snapshots: list[dict[str, object]],
+    *,
+    elapsed_seconds: float,
+    pending_count: object,
+    confirmation_ids: list[str],
+    execution_ids: list[str],
+    media_ids: list[str],
+    dom_media_ids: list[str],
+    dom_finished_media_ids: list[str],
+) -> int:
+    duration = int(elapsed_seconds)
+    if not snapshots or not 60 <= duration <= 120:
+        raise PhaseGError(
+            "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+            "observation span is outside 60-120 seconds",
+        )
+    snapshots[-1].update(
+        {
+            "ELAPSED_SECONDS": duration,
+            "PENDING_COUNT": pending_count,
+            "CONFIRMATION_IDS": confirmation_ids,
+            "EXECUTION_IDS": execution_ids,
+            "MEDIA_IDS": media_ids,
+            "DOM_MEDIA_IDS": dom_media_ids,
+            "DOM_FINISHED_MEDIA_IDS": dom_finished_media_ids,
+        }
+    )
+    return duration
+
+
 async def _collect(args: argparse.Namespace) -> dict[str, object]:
     ledger = D2DailyCreditLedger(args.runtime_state_root)
     if ledger.path.is_symlink() or not ledger.path.is_file():
@@ -607,6 +638,16 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
             raise PhaseGError(
                 "PHASE_G_PROVIDER_OUTCOME_PRESENT", "project activity changed during observation"
             )
+        observation_duration_seconds = _finalize_last_snapshot(
+            snapshots,
+            elapsed_seconds=time.monotonic() - start,
+            pending_count=final_state.get("pending"),
+            confirmation_ids=final_confirmation_ids,
+            execution_ids=record_exec,
+            media_ids=record_media,
+            dom_media_ids=final_dom_media_ids,
+            dom_finished_media_ids=final_dom_finished_media_ids,
+        )
         evidence: dict[str, object] = {
             "SCHEMA_VERSION": "D2_FORENSIC_PROVIDER_SILENT_CLOSURE_V3",
             "D2_RUN_ID": _RUN_ID,
@@ -646,7 +687,7 @@ async def _collect(args: argparse.Namespace) -> dict[str, object]:
             "REMOTE_VERIFIED_ABSENT": attempt.get("remote_verified") in (None, False),
             "LIVE_PROJECT_HYDRATED": True,
             "LIVE_SNAPSHOT_COUNT": len(snapshots),
-            "LIVE_OBSERVATION_DURATION_SECONDS": int(time.monotonic() - start),
+            "LIVE_OBSERVATION_DURATION_SECONDS": observation_duration_seconds,
             "LIVE_PENDING_COUNT": final_state.get("pending"),
             "LIVE_CONFIRMATION_COUNT": len(final_confirmation_ids),
             "LIVE_CONFIRMATION_IDS": final_confirmation_ids,
