@@ -386,7 +386,13 @@ def validate_provider_silent_evidence_v3(evidence: Mapping[str, object]) -> dict
     duration_seconds = _int(
         evidence.get("LIVE_OBSERVATION_DURATION_SECONDS"), field="observation duration"
     )
-    if first_elapsed != 0 or last_elapsed != duration_seconds or not 60 <= duration_seconds <= 120:
+    if (
+        first_elapsed is None
+        or last_elapsed is None
+        or last_elapsed != duration_seconds
+        or not 60 <= duration_seconds <= 120
+        or last_elapsed - first_elapsed < 60
+    ):
         raise PhaseGError(
             "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE", "observation span is outside 60-120 seconds"
         )

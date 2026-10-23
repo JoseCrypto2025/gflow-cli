@@ -199,6 +199,35 @@ def test_v3_chat_hash_prefix_stability_is_context_only(tmp_path: Path) -> None:
     assert _preview(ledger, evidence)["evidence"]["PROVIDER_OUTCOME"] == "UNKNOWN"
 
 
+def test_v3_observation_span_allows_first_hydrated_snapshot_after_zero(
+    tmp_path: Path,
+) -> None:
+    _ledger, evidence = _fixture(tmp_path)
+    evidence["LIVE_OBSERVATION_DURATION_SECONDS"] = 62
+    snapshots = evidence["LIVE_SNAPSHOTS"]
+    assert isinstance(snapshots, list)
+    for snapshot, elapsed in zip(snapshots, (2, 31, 62), strict=True):
+        assert isinstance(snapshot, dict)
+        snapshot["ELAPSED_SECONDS"] = elapsed
+
+    assert validate_provider_silent_evidence_v3(evidence)["ATTRIBUTION_CLASSIFICATION"] == (
+        "NO_PROVIDER_EVIDENCE"
+    )
+
+
+def test_v3_rejects_observation_span_shorter_than_sixty_seconds(tmp_path: Path) -> None:
+    _ledger, evidence = _fixture(tmp_path)
+    evidence["LIVE_OBSERVATION_DURATION_SECONDS"] = 61
+    snapshots = evidence["LIVE_SNAPSHOTS"]
+    assert isinstance(snapshots, list)
+    for snapshot, elapsed in zip(snapshots, (2, 31, 61), strict=True):
+        assert isinstance(snapshot, dict)
+        snapshot["ELAPSED_SECONDS"] = elapsed
+
+    with pytest.raises(PhaseGError, match="observation span is outside"):
+        validate_provider_silent_evidence_v3(evidence)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
