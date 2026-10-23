@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,6 +32,8 @@ _STATE_ROOT = "GFLOW_CLI_E2E_PHASE_G_STATE_ROOT"
 _TEMP_ROOT = "GFLOW_CLI_E2E_PHASE_G_TEMP_ROOT"
 _RETRY_PREDECESSOR = "GFLOW_CLI_E2E_PHASE_G_RETRY_PREDECESSOR"
 _RETRY_EXPECTED_STATE = "GFLOW_CLI_E2E_PHASE_G_RETRY_EXPECTED_STATE"
+_TEST_SESSION_ID = "GFLOW_CLI_E2E_PHASE_G_TEST_SESSION_ID"
+_TEST_SESSION_CREDITS_BEFORE = "GFLOW_CLI_E2E_PHASE_G_TEST_CREDITS_BEFORE"
 
 
 @pytest.mark.asyncio
@@ -54,6 +57,16 @@ async def test_phase_g_one_approved_test_clip(e2e_profile_dir: Path) -> None:
     retry_authorization = (
         D2RetryAuthorization(retry_predecessor, retry_expected_state) if retry_predecessor else None
     )
+    test_session_id = os.environ.get(_TEST_SESSION_ID, "").strip()
+    test_session_balance_raw = os.environ.get(_TEST_SESSION_CREDITS_BEFORE, "").strip()
+    if bool(test_session_id) != bool(test_session_balance_raw):
+        pytest.fail("TEST-session authorization requires its ID and live before-balance")
+    if test_session_id and retry_authorization is not None:
+        pytest.fail("TEST-session authorization cannot be combined with retry authorization")
+    try:
+        test_session_balance = Decimal(test_session_balance_raw) if test_session_id else None
+    except InvalidOperation:
+        pytest.fail("TEST-session live before-balance must be a decimal credit count")
 
     request = build_phase_g_request_from_snapshot(
         snapshot_path,
@@ -66,6 +79,8 @@ async def test_phase_g_one_approved_test_clip(e2e_profile_dir: Path) -> None:
         request,
         expected_email=expected_email,
         retry_authorization=retry_authorization,
+        test_session_id=test_session_id or None,
+        test_session_credits_before=test_session_balance,
     )
     assert run.result.submission_state == "GENERATION_SUCCEEDED"
     assert run.result.provider_media_id

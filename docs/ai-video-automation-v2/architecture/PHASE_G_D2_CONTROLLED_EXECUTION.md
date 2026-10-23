@@ -119,6 +119,15 @@ terminal `UNEXPECTED_MULTI_OUTPUT` predecessor. An already generated media ID
 may be recovered and validated again under the same D2 run ID; this recovery
 path cannot click Generate.
 
+The separately versioned
+[`D2_TEST_SESSION_BUDGET_V1.md`](../operations/D2_TEST_SESSION_BUDGET_V1.md)
+defines one exact TEST-only session exception authorized for no more than 40
+new credits. It leaves the ordinary daily budget fixed at 50 and preserves all
+historical rows and reservations. Ordinary TEST requests and PROD remain on
+the default daily guard. The exception is active only when the exact session is
+bound to `gflow-v2-test`, `PVA_0001`, project
+`34e60953-e534-46e9-ac65-993893e61065`, and the authorized runtime root.
+
 ## Output attribution and media verification
 
 The generation port must link observed provider execution/media evidence to

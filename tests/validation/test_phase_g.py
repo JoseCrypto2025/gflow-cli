@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -21,6 +22,7 @@ from gflow_cli.v2_runtime.phase_e import PreflightResult
 from gflow_cli.v2_runtime.phase_g import (
     D2DailyCreditLedger,
     D2RetryAuthorization,
+    D2TestSessionAuthorization,
     FlowConfirmationGate,
     FlowSubmissionBaseline,
     GoogleFlowAgentOnlyGenerationExecutor,
@@ -1123,6 +1125,569 @@ def test_phase_g_retry_requires_daily_budget_headroom(tmp_path: Path) -> None:
         ledger.create_authorized_retry_attempt(request, authorization)
     assert budget.value.code == "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED"
     assert ledger.accounted_today() == Decimal("50")
+
+
+def _test_budget_session_authorization(
+    ledger: D2DailyCreditLedger,
+    *,
+    starting_balance: int = 40,
+    session_id: str = "D2TS_0123456789abcdef",
+    **changes: object,
+) -> D2TestSessionAuthorization:
+    now_bangkok = datetime.now(timezone(timedelta(hours=7)))
+    expiry = now_bangkok.replace(hour=23, minute=59, second=59, microsecond=0)
+    authorization = D2TestSessionAuthorization(
+        session_id=session_id,
+        provider_account_id="PVA_0001",
+        provider_project_id="34e60953-e534-46e9-ac65-993893e61065",
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        runtime_state_root=ledger.root.parent,
+        starting_provider_credits=Decimal(starting_balance),
+        authorization_evidence_sha256="d" * 64,
+        implementation_commit="a" * 40,
+        expires_at=expiry.isoformat(),
+    )
+    return replace(authorization, **changes)
+
+
+def _open_test_budget_session(ledger: D2DailyCreditLedger, *, starting_balance: int = 40) -> str:
+    authorization = _test_budget_session_authorization(ledger, starting_balance=starting_balance)
+    ledger_sha = (
+        sha256_file(ledger.path) if ledger.path.exists() else hashlib.sha256(b"").hexdigest()
+    )
+    ledger.open_test_session(authorization, expected_ledger_sha256=ledger_sha)
+    return authorization.session_id
+
+
+def test_test_session_migrates_v1_without_changing_historical_attempts(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    ledger.root.mkdir(parents=True)
+    historical = {
+        "d2_run_id": "D2_history-0001",
+        "submission_state": "FORENSICALLY_CLOSED_UNKNOWN",
+        "terminal_state": "FORENSICALLY_CLOSED_UNKNOWN",
+        "accounted_credit_cost": "50",
+        "accounting_date": datetime.now(timezone(timedelta(hours=7))).date().isoformat(),
+        "generate_action_count": 1,
+    }
+    legacy = {"schema_version": 1, "daily_budget": 50, "attempts": [historical]}
+    ledger.path.write_text(json.dumps(legacy), encoding="utf-8")
+    before = json.loads(ledger.path.read_text(encoding="utf-8"))["attempts"]
+
+    _open_test_budget_session(ledger)
+
+    migrated = json.loads(ledger.path.read_text(encoding="utf-8"))
+    assert migrated["schema_version"] == 2
+    assert migrated["daily_budget"] == 50
+    assert migrated["attempts"] == before
+    assert migrated["attempts"][0]["accounted_credit_cost"] == "50"
+    assert len(migrated["test_sessions"]) == 1
+
+
+def test_test_session_authorizes_exact_lane_over_historical_daily_reservation(
+    tmp_path: Path,
+) -> None:
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
+    ledger.root.mkdir(parents=True)
+    historical = {
+        "d2_run_id": "D2_history-0001",
+        "submission_state": "FORENSICALLY_CLOSED_UNKNOWN",
+        "terminal_state": "FORENSICALLY_CLOSED_UNKNOWN",
+        "accounted_credit_cost": "50",
+        "accounting_date": datetime.now(timezone(timedelta(hours=7))).date().isoformat(),
+        "generate_action_count": 1,
+    }
+    ledger.path.write_text(
+        json.dumps({"schema_version": 1, "daily_budget": 50, "attempts": [historical]}),
+        encoding="utf-8",
+    )
+    session_id = _open_test_budget_session(ledger)
+
+    created = ledger.create_test_session_attempt(
+        request,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id,
+            frozenset(),
+            frozenset(),
+            0,
+            frozenset(),
+            "0:",
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.observe_confirmation(
+        request.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=10,
+        visible_balance=40,
+    )
+    approved = ledger.approve_gate(
+        request.d2_run_id,
+        video_count=1,
+        credit_cost=10,
+        confirmation_id="new-confirmation",
+        visible_balance=40,
+    )
+    assert created["test_session_id"] == session_id
+    assert approved["approval_action_count"] == 1
+    assert ledger.accounted_today() == Decimal("60")
+
+
+def test_test_session_rejects_concurrent_attempt_and_unknown_outcome(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger)
+    first = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    second = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0002")
+    ledger.create_test_session_attempt(
+        first,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        first.d2_run_id,
+        FlowSubmissionBaseline(
+            first.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(first.d2_run_id)
+    with pytest.raises(PhaseGError) as concurrent:
+        ledger.create_test_session_attempt(
+            second,
+            session_id=session_id,
+            auth_profile_key="GFLOW_V2_TEST_AUTH",
+            provider_credits_before=40,
+        )
+    assert concurrent.value.code == "PHASE_G_TEST_SESSION_IN_FLIGHT"
+
+    ledger.record_state(first.d2_run_id, submission_state="UNKNOWN_SUBMISSION_STATE")
+    stopped = ledger.reconcile_test_session_attempt(
+        first.d2_run_id, provider_credits_before=40, provider_credits_after=30
+    )
+    assert stopped["status"] == "STOPPED"
+    assert stopped["stopped_reason"] == "UNKNOWN_OR_NONTERMINAL_OUTCOME"
+    assert stopped["reserved_credits"] == "40"
+    with pytest.raises(PhaseGError) as subsequent:
+        ledger.create_test_session_attempt(
+            second,
+            session_id=session_id,
+            auth_profile_key="GFLOW_V2_TEST_AUTH",
+            provider_credits_before=30,
+        )
+    assert subsequent.value.code == "PHASE_G_TEST_SESSION_STOPPED"
+
+
+def test_test_session_known_failure_reconciles_and_caps_new_spend(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger)
+    first = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        first,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        first.d2_run_id,
+        FlowSubmissionBaseline(
+            first.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(first.d2_run_id)
+    ledger.observe_confirmation(
+        first.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=10,
+        visible_balance=40,
+    )
+    ledger.approve_gate(
+        first.d2_run_id,
+        video_count=1,
+        credit_cost=10,
+        confirmation_id="new-confirmation",
+        visible_balance=40,
+    )
+    ledger.record_state(
+        first.d2_run_id,
+        submission_state="GENERATION_FAILED",
+        terminal_state="GENERATION_FAILED",
+        accounted_credit_cost=10,
+    )
+    reconciled = ledger.reconcile_test_session_attempt(
+        first.d2_run_id, provider_credits_before=40, provider_credits_after=30
+    )
+    assert reconciled["status"] == "ACTIVE"
+    assert reconciled["spent_credits"] == "10"
+    assert reconciled["reserved_credits"] == "30"
+    assert ledger.attempts()[0]["test_session_reconciliation"] == "RECONCILED"
+    second = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0002")
+    next_attempt = ledger.create_test_session_attempt(
+        second,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=30,
+    )
+    assert next_attempt["test_session_id"] == session_id
+    assert next_attempt["test_session_credits_before"] == "30"
+
+
+def test_test_session_concurrent_reservations_are_atomic(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger)
+    requests = [
+        PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), f"D2_test-session-{index:04d}")
+        for index in (1, 2)
+    ]
+
+    def reserve(candidate: PhaseGExecutionRequest) -> str:
+        try:
+            ledger.create_test_session_attempt(
+                candidate,
+                session_id=session_id,
+                auth_profile_key="GFLOW_V2_TEST_AUTH",
+                provider_credits_before=40,
+            )
+        except PhaseGError as exc:
+            return exc.code
+        return "CREATED"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, requests))
+
+    assert results.count("CREATED") == 1
+    assert results.count("PHASE_G_TEST_SESSION_IN_FLIGHT") == 1
+    session = json.loads(ledger.path.read_text(encoding="utf-8"))["test_sessions"][0]
+    assert len(session["attempt_run_ids"]) == 1
+
+
+def test_test_session_rejects_wrong_profile_and_tampered_authorization(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger)
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    with pytest.raises(PhaseGError) as wrong_profile:
+        ledger.create_test_session_attempt(
+            request,
+            session_id=session_id,
+            auth_profile_key="GFLOW_V2_PROD_AUTH",
+            provider_credits_before=40,
+        )
+    assert wrong_profile.value.code == "PHASE_G_TEST_SESSION_LANE_MISMATCH"
+
+    payload = json.loads(ledger.path.read_text(encoding="utf-8"))
+    payload["test_sessions"][0]["authorized_new_credits"] = "400"
+    ledger.path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PhaseGError) as tampered:
+        ledger.create_test_session_attempt(
+            request,
+            session_id=session_id,
+            auth_profile_key="GFLOW_V2_TEST_AUTH",
+            provider_credits_before=40,
+        )
+    assert tampered.value.code == "PHASE_G_TEST_SESSION_INVALID"
+    assert ledger.attempts() == ()
+
+
+def test_test_session_quote_above_remaining_budget_fails_before_approval(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger)
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        request,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.observe_confirmation(
+        request.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=41,
+        visible_balance=40,
+    )
+    with pytest.raises(PhaseGError) as over_budget:
+        ledger.approve_gate(
+            request.d2_run_id,
+            video_count=1,
+            credit_cost=41,
+            confirmation_id="new-confirmation",
+            visible_balance=40,
+        )
+    assert over_budget.value.code == "PHASE_G_TEST_SESSION_QUOTE_INVALID"
+    attempt = ledger.attempts()[0]
+    assert attempt["approval_action_count"] == 0
+    assert attempt["generate_action_count"] == 1
+
+
+def test_test_session_quote_above_visible_balance_fails_before_approval(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger)
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        request,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.observe_confirmation(
+        request.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=10,
+        visible_balance=5,
+    )
+    with pytest.raises(PhaseGError) as insufficient:
+        ledger.approve_gate(
+            request.d2_run_id,
+            video_count=1,
+            credit_cost=10,
+            confirmation_id="new-confirmation",
+            visible_balance=5,
+        )
+    assert insufficient.value.code == "PHASE_G_TEST_SESSION_QUOTE_INVALID"
+    assert ledger.attempts()[0]["approval_action_count"] == 0
+
+
+def test_test_session_rejects_prod_execution_context(tmp_path: Path) -> None:
+    base = request_for(tmp_path)
+    request_id = "D2_test-session-prod-context"
+    prod_context = ProductionExecutionContext(
+        "PROD",
+        "PRV_0001",
+        "PVA_0001",
+        "34e60953-e534-46e9-ac65-993893e61065",
+        "GFLOW_V2_TEST_AUTH",
+        "SCN_000001",
+        "GPR_0001",
+        "SPV_000002",
+        request_id,
+        CreditBudgetContext(provider_remaining_free=Decimal("40")),
+    )
+    request = PhaseGExecutionRequest.from_presubmit(
+        base, request_id, execution_context=prod_context
+    )
+    ledger = D2DailyCreditLedger(base.runtime_state_root)
+    session_id = _open_test_budget_session(ledger)
+
+    with pytest.raises(PhaseGError) as rejected:
+        ledger.create_test_session_attempt(
+            request,
+            session_id=session_id,
+            auth_profile_key="GFLOW_V2_TEST_AUTH",
+            provider_credits_before=40,
+        )
+    assert rejected.value.code == "PHASE_G_TEST_SESSION_LANE_MISMATCH"
+    assert ledger.attempts() == ()
+
+
+def test_test_session_stops_at_exact_40_credit_cap(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger)
+    request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        request,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.observe_confirmation(
+        request.d2_run_id,
+        confirmation_id="new-confirmation",
+        video_count=1,
+        credit_cost=40,
+        visible_balance=40,
+    )
+    ledger.approve_gate(
+        request.d2_run_id,
+        video_count=1,
+        credit_cost=40,
+        confirmation_id="new-confirmation",
+        visible_balance=40,
+    )
+    ledger.record_state(
+        request.d2_run_id,
+        submission_state="GENERATION_FAILED",
+        terminal_state="GENERATION_FAILED",
+        accounted_credit_cost=40,
+    )
+    session = ledger.reconcile_test_session_attempt(
+        request.d2_run_id, provider_credits_before=40, provider_credits_after=0
+    )
+    assert session["spent_credits"] == "40"
+    assert session["reserved_credits"] == "0"
+    assert session["status"] == "CREDIT_CAP_EXHAUSTED"
+    next_request = PhaseGExecutionRequest.from_presubmit(
+        request_for(tmp_path), "D2_test-session-0002"
+    )
+    with pytest.raises(PhaseGError) as exhausted:
+        ledger.create_test_session_attempt(
+            next_request,
+            session_id=session_id,
+            auth_profile_key="GFLOW_V2_TEST_AUTH",
+            provider_credits_before=0,
+        )
+    assert exhausted.value.code == "PHASE_G_TEST_SESSION_STOPPED"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("provider_account_id", "PVA_0002"),
+        ("provider_project_id", "other-project"),
+        ("auth_profile_key", "GFLOW_V2_PROD_AUTH"),
+        ("runtime_state_root", Path("C:/other/state")),
+        ("authorization_evidence_sha256", "malformed-evidence"),
+    ],
+)
+def test_test_session_rejects_wrong_authorization_binding(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    authorization = _test_budget_session_authorization(ledger, **{field: value})
+    with pytest.raises(PhaseGError) as mismatch:
+        ledger.open_test_session(
+            authorization, expected_ledger_sha256=hashlib.sha256(b"").hexdigest()
+        )
+    expected_code = (
+        "PHASE_G_TEST_SESSION_ROOT_MISMATCH"
+        if field == "runtime_state_root"
+        else "PHASE_G_TEST_SESSION_AUTHORIZATION_INVALID"
+    )
+    assert mismatch.value.code == expected_code
+    assert ledger.attempts() == ()
+
+
+def test_test_session_rejects_expired_authorization_and_replay(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    now_bangkok = datetime.now(timezone(timedelta(hours=7)))
+    expired = now_bangkok - timedelta(days=1)
+    authorization = _test_budget_session_authorization(ledger, expires_at=expired.isoformat())
+    with pytest.raises(PhaseGError) as stale:
+        ledger.open_test_session(
+            authorization, expected_ledger_sha256=hashlib.sha256(b"").hexdigest()
+        )
+    assert stale.value.code == "PHASE_G_TEST_SESSION_EXPIRED"
+
+    _open_test_budget_session(ledger)
+    current_sha = sha256_file(ledger.path)
+    replay = _test_budget_session_authorization(ledger, session_id="D2TS_fedcba9876543210")
+    with pytest.raises(PhaseGError) as reused:
+        ledger.open_test_session(replay, expected_ledger_sha256=current_sha)
+    assert reused.value.code == "PHASE_G_TEST_SESSION_ALREADY_AUTHORIZED"
+
+
+def test_test_session_waf_and_success_permanently_stop_new_attempts(tmp_path: Path) -> None:
+    for run_id, terminal_state, expected_status in (
+        ("D2_test-session-waf", "WAF_REJECTED", "STOPPED"),
+        ("D2_test-session-success", "D2_SUCCEEDED", "SUCCEEDED"),
+    ):
+        case_root = tmp_path / terminal_state
+        ledger = D2DailyCreditLedger(case_root / "state")
+        session_id = _open_test_budget_session(ledger)
+        request = PhaseGExecutionRequest.from_presubmit(request_for(case_root), run_id)
+        ledger.create_test_session_attempt(
+            request,
+            session_id=session_id,
+            auth_profile_key="GFLOW_V2_TEST_AUTH",
+            provider_credits_before=40,
+        )
+        ledger.capture_baseline(
+            run_id,
+            FlowSubmissionBaseline(
+                request.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+            ),
+        )
+        ledger.mark_generate_action(run_id)
+        ledger.record_state(run_id, submission_state="UNKNOWN_SUBMISSION_STATE")
+        if terminal_state == "D2_SUCCEEDED":
+            ledger.record_state(run_id, submission_state="GENERATION_SUCCEEDED")
+        ledger.record_state(run_id, submission_state=terminal_state, terminal_state=terminal_state)
+        session = ledger.reconcile_test_session_attempt(
+            run_id, provider_credits_before=40, provider_credits_after=40
+        )
+        assert session["status"] == expected_status
+        next_request = PhaseGExecutionRequest.from_presubmit(
+            request_for(case_root), f"D2_{terminal_state.lower()}-next"
+        )
+        with pytest.raises(PhaseGError) as stopped:
+            ledger.create_test_session_attempt(
+                next_request,
+                session_id=session_id,
+                auth_profile_key="GFLOW_V2_TEST_AUTH",
+                provider_credits_before=40,
+            )
+        assert stopped.value.code == "PHASE_G_TEST_SESSION_STOPPED"
+
+
+def test_test_session_rejects_next_attempt_when_prior_media_needs_recovery(
+    tmp_path: Path,
+) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    session_id = _open_test_budget_session(ledger)
+    first = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0001")
+    ledger.create_test_session_attempt(
+        first,
+        session_id=session_id,
+        auth_profile_key="GFLOW_V2_TEST_AUTH",
+        provider_credits_before=40,
+    )
+    ledger.capture_baseline(
+        first.d2_run_id,
+        FlowSubmissionBaseline(
+            first.provider_project_id, frozenset(), frozenset(), 0, frozenset(), "0:"
+        ),
+    )
+    ledger.mark_generate_action(first.d2_run_id)
+    ledger.record_state(first.d2_run_id, submission_state="UNKNOWN_SUBMISSION_STATE")
+    ledger.record_state(
+        first.d2_run_id,
+        submission_state="GENERATION_FAILED",
+        terminal_state="GENERATION_FAILED",
+        provider_media_id="media-needs-recovery",
+    )
+    session = ledger.reconcile_test_session_attempt(
+        first.d2_run_id, provider_credits_before=40, provider_credits_after=40
+    )
+    assert session["status"] == "ACTIVE"
+
+    second = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-session-0002")
+    with pytest.raises(PhaseGError) as recovery:
+        ledger.create_test_session_attempt(
+            second,
+            session_id=session_id,
+            auth_profile_key="GFLOW_V2_TEST_AUTH",
+            provider_credits_before=40,
+        )
+    assert recovery.value.code == "PHASE_G_ARTIFACT_RECOVERY_REQUIRED"
 
 
 def test_full_bangkok_day_budget_blocks_generate_before_action_is_consumed(

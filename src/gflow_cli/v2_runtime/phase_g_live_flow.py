@@ -283,6 +283,11 @@ class GoogleFlowAgentOnlyGenerationPort:
         finally:
             self._lease.release()
 
+    @property
+    def auth_profile_key(self) -> str:
+        """Return the profile key pinned when this live port was opened."""
+        return self._auth_profile_key
+
     async def bind_request(self, request: PhaseGExecutionRequest) -> None:
         """Pin this live adapter to exactly the approved environment job identity."""
         if self._request is not None or self._generate_clicked:

@@ -37,7 +37,14 @@ _RUN_ID_RE = re.compile(r"^(?:D2|D6)_[A-Za-z0-9_-]{8,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _D6_RELEASE_CONTRACT_VERSION = 1
-_LEDGER_SCHEMA = 1
+_LEDGER_SCHEMA = 2
+_TEST_SESSION_CONTRACT = "D2_TEST_SESSION_BUDGET_V1"
+_TEST_SESSION_CREDIT_LIMIT = Decimal("40")
+_TEST_SESSION_MAX_ATTEMPTS = 40
+_TEST_PROVIDER_ACCOUNT = "PVA_0001"
+_TEST_PROVIDER_PROJECT = "34e60953-e534-46e9-ac65-993893e61065"
+_TEST_AUTH_PROFILE_KEY = "GFLOW_V2_TEST_AUTH"
+_TEST_PROFILE_NAME = "gflow-v2-test"
 _BANGKOK = timezone(timedelta(hours=7), name="Asia/Bangkok")
 _SUBMISSION_STATES = frozenset(
     {
@@ -103,6 +110,23 @@ class D2RetryAuthorization:
 
     predecessor_d2_run_id: str
     expected_terminal_state: str
+
+
+@dataclass(frozen=True, slots=True)
+class D2TestSessionAuthorization:
+    """Explicit one-session authorization for the exact TEST lane and 40-credit cap."""
+
+    session_id: str
+    provider_account_id: str
+    provider_project_id: str
+    auth_profile_key: str
+    runtime_state_root: Path
+    starting_provider_credits: Decimal
+    authorization_evidence_sha256: str
+    implementation_commit: str
+    expires_at: str
+    authorized_new_credits: Decimal = _TEST_SESSION_CREDIT_LIMIT
+    max_attempts: int = _TEST_SESSION_MAX_ATTEMPTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,9 +342,30 @@ class GoogleFlowAgentOnlyGenerationExecutor:
         request: PhaseGExecutionRequest,
         *,
         retry_authorization: D2RetryAuthorization | None = None,
+        test_session_id: str | None = None,
+        test_session_credits_before: Decimal | None = None,
     ) -> PhaseGExecutionResult:
         """Apply settings, click once, validate one new gate and restore defaults."""
         validate_phase_g_request(request)
+        if (test_session_id is None) != (test_session_credits_before is None):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_AUTHORIZATION_INVALID",
+                "TEST-session ID and live pre-attempt balance must be supplied together",
+            )
+        if test_session_id is not None and retry_authorization is not None:
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_AUTHORIZATION_INVALID",
+                "TEST-session authorization cannot be combined with retry authorization",
+            )
+        if test_session_id is not None and (
+            request.provider_account_id != _TEST_PROVIDER_ACCOUNT
+            or request.provider_project_id != _TEST_PROVIDER_PROJECT
+            or request.output_count != 1
+        ):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_LANE_MISMATCH",
+                "TEST-session execution is restricted to the exact one-output TEST project",
+            )
         if request.d2_run_id.startswith("D6_") and retry_authorization is not None:
             raise PhaseGError(
                 "D6_RELEASE_PATH_REQUIRED", "D6 attempts cannot use D2 retry authorization"
@@ -355,6 +400,19 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                     "D6_PRODUCTION_CONTEXT_REQUIRED",
                     "D6 requires a PROD execution context and shared production credit guard",
                 )
+        if test_session_id is not None:
+            profile_key = getattr(self.port, "auth_profile_key", None)
+            if not isinstance(profile_key, str) or test_session_credits_before is None:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_PROFILE_UNVERIFIED",
+                    "verified TEST profile and live pre-attempt balance are required",
+                )
+            self.ledger.validate_test_session_request(
+                request,
+                session_id=test_session_id,
+                auth_profile_key=profile_key,
+                provider_credits_before=test_session_credits_before,
+            )
         try:
             self.recovery_journal.require_clean_or_missing()
         except RecoveryJournalError as exc:
@@ -395,6 +453,20 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             try:
                 if d6_proof is not None:
                     self.ledger.create_d6_attempt(request, proof=d6_proof)
+                elif test_session_id is not None:
+                    profile_key = getattr(self.port, "auth_profile_key", None)
+                    if not isinstance(profile_key, str):
+                        raise PhaseGError(
+                            "PHASE_G_TEST_SESSION_PROFILE_UNVERIFIED",
+                            "live Flow adapter does not expose its verified TEST profile",
+                        )
+                    assert test_session_credits_before is not None
+                    self.ledger.create_test_session_attempt(
+                        request,
+                        session_id=test_session_id,
+                        auth_profile_key=profile_key,
+                        provider_credits_before=test_session_credits_before,
+                    )
                 elif retry_authorization is not None:
                     self.ledger.create_authorized_retry_attempt(request, retry_authorization)
                 else:
@@ -1077,6 +1149,263 @@ class D2DailyCreditLedger:
             lambda payload: self._create(payload, request, retry_authorization=authorization)
         )
 
+    def open_test_session(
+        self,
+        authorization: D2TestSessionAuthorization,
+        *,
+        expected_ledger_sha256: str,
+    ) -> dict[str, object]:
+        """Persist the one explicit TEST-session exception without changing old rows."""
+        self._validate_test_session_authorization(authorization)
+        if not _SHA256_RE.fullmatch(expected_ledger_sha256):
+            raise PhaseGError("PHASE_G_LEDGER_SHA_INVALID", "expected ledger SHA-256 is invalid")
+
+        with self._locked_file():
+            if self.path.is_symlink():
+                raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "ledger may not be a symlink")
+            actual_sha = (
+                sha256_file(self.path) if self.path.is_file() else hashlib.sha256(b"").hexdigest()
+            )
+            if actual_sha != expected_ledger_sha256:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CHANGED", "ledger changed before session authorization"
+                )
+            payload = self._read()
+            sessions = cast(list[dict[str, object]], payload["test_sessions"])
+            if sessions:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_ALREADY_AUTHORIZED",
+                    "this ledger already contains a TEST-session authorization",
+                )
+            root = str(self.root.parent.resolve())
+            if str(authorization.runtime_state_root.resolve()) != root:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_ROOT_MISMATCH",
+                    "TEST-session authorization names a different runtime root",
+                )
+            record: dict[str, object] = {
+                "contract_version": _TEST_SESSION_CONTRACT,
+                "session_id": authorization.session_id,
+                "authorization_evidence_sha256": authorization.authorization_evidence_sha256,
+                "implementation_commit": authorization.implementation_commit,
+                "starting_ledger_sha256": expected_ledger_sha256,
+                "runtime_state_root": root,
+                "profile_name": _TEST_PROFILE_NAME,
+                "auth_profile_key": authorization.auth_profile_key,
+                "provider_account_id": authorization.provider_account_id,
+                "provider_project_id": authorization.provider_project_id,
+                "authorized_new_credits": str(_TEST_SESSION_CREDIT_LIMIT),
+                "max_attempts": _TEST_SESSION_MAX_ATTEMPTS,
+                "attempt_run_ids": [],
+                "spent_credits": "0",
+                "reserved_credits": str(_TEST_SESSION_CREDIT_LIMIT),
+                "starting_provider_credits": str(authorization.starting_provider_credits),
+                "last_provider_credits": str(authorization.starting_provider_credits),
+                "in_flight_run_id": None,
+                "status": "ACTIVE",
+                "expires_at": authorization.expires_at,
+                "created_at": _utc_now(),
+                "stopped_reason": None,
+            }
+            record["authorization_sha256"] = _test_session_authorization_digest(record)
+            sessions.append(record)
+            self._write(payload)
+            return dict(record)
+
+    def create_test_session_attempt(
+        self,
+        request: PhaseGExecutionRequest,
+        *,
+        session_id: str,
+        auth_profile_key: str,
+        provider_credits_before: Decimal | int | float | str,
+    ) -> dict[str, object]:
+        """Atomically bind one new D2 row to an active, exact-lane TEST session."""
+        validate_phase_g_request(request)
+        balance = _decimal(provider_credits_before)
+        if balance is None:
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_BALANCE_UNKNOWN", "pre-attempt provider balance is required"
+            )
+        if request.d2_run_id.startswith("D6_"):
+            raise PhaseGError("D6_RELEASE_PATH_REQUIRED", "TEST session authorization is D2-only")
+
+        def create(payload: dict[str, object]) -> dict[str, object]:
+            session = self._test_session(payload, session_id)
+            self._validate_test_session_lane(session, request, auth_profile_key)
+            self._require_test_session_active(session)
+            if session.get("in_flight_run_id") is not None:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_IN_FLIGHT", "a TEST-session attempt is already in flight"
+                )
+            if _decimal(session.get("last_provider_credits")) != balance:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_BALANCE_CHANGED",
+                    "provider balance changed since the last session reconciliation",
+                )
+            run_ids = session.get("attempt_run_ids")
+            if not isinstance(run_ids, list):
+                raise PhaseGError("PHASE_G_TEST_SESSION_INVALID", "session attempt list is invalid")
+            run_id_list = cast(list[object], run_ids)
+            if len(run_id_list) >= _TEST_SESSION_MAX_ATTEMPTS:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_ATTEMPT_LIMIT", "TEST-session attempt limit is exhausted"
+                )
+            attempts = cast(list[dict[str, object]], payload["attempts"])
+            self._require_test_session_predecessors_reconciled(session, attempts)
+            self._create(payload, request, test_session=session)
+            attempt = self._attempt(payload, request.d2_run_id)
+            attempt["test_session_id"] = session_id
+            attempt["test_session_credits_before"] = str(balance)
+            session["in_flight_run_id"] = request.d2_run_id
+            run_id_list.append(request.d2_run_id)
+            return dict(attempt)
+
+        return self._mutate(create)
+
+    def validate_test_session_request(
+        self,
+        request: PhaseGExecutionRequest,
+        *,
+        session_id: str,
+        auth_profile_key: str,
+        provider_credits_before: Decimal | int | float | str,
+    ) -> None:
+        """Read-only preflight for session identity and budget before UI mutation."""
+        balance = _decimal(provider_credits_before)
+        if balance is None:
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_BALANCE_UNKNOWN", "pre-attempt provider balance is required"
+            )
+        with self._locked_file():
+            payload = self._read()
+            session = self._test_session(payload, session_id)
+            self._validate_test_session_lane(session, request, auth_profile_key)
+            self._require_test_session_active(session)
+            if session.get("in_flight_run_id") is not None:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_IN_FLIGHT", "a TEST-session attempt is already in flight"
+                )
+            if _decimal(session.get("last_provider_credits")) != balance:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_BALANCE_CHANGED",
+                    "provider balance changed since the last session reconciliation",
+                )
+            attempts = cast(list[dict[str, object]], payload["attempts"])
+            if any(row.get("d2_run_id") == request.d2_run_id for row in attempts):
+                raise PhaseGError(
+                    "PHASE_G_DUPLICATE_RUN_ID", "D2 run ID already exists in the ledger"
+                )
+            self._require_test_session_predecessors_reconciled(session, attempts)
+
+    def reconcile_test_session_attempt(
+        self,
+        d2_run_id: str,
+        *,
+        provider_credits_before: Decimal | int | float | str,
+        provider_credits_after: Decimal | int | float | str,
+    ) -> dict[str, object]:
+        """Reconcile one terminal attempt from exact before/after live balance reads."""
+        before = _decimal(provider_credits_before)
+        after = _decimal(provider_credits_after)
+        if before is None or after is None or after > before:
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_BALANCE_UNKNOWN", "provider balance delta is not reconcilable"
+            )
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            attempt = self._attempt(payload, d2_run_id)
+            session_id = attempt.get("test_session_id")
+            if not isinstance(session_id, str):
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_ATTEMPT_MISMATCH",
+                    "attempt is not bound to a TEST session",
+                )
+            session = self._test_session(payload, session_id)
+            if (
+                session.get("in_flight_run_id") != d2_run_id
+                or _decimal(attempt.get("test_session_credits_before")) != before
+                or _decimal(session.get("last_provider_credits")) != before
+            ):
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_BALANCE_CHANGED",
+                    "balance reads do not match the active session attempt",
+                )
+            state = attempt.get("submission_state")
+            terminal = attempt.get("terminal_state")
+            delta = before - after
+            quote = _decimal(attempt.get("quoted_credit_cost"), allow_none=True)
+            pre_submit_no_action = (
+                state == "PREPARED"
+                and _counter(attempt.get("generate_action_count")) == 0
+                and _counter(attempt.get("approval_action_count")) == 0
+                and attempt.get("provider_execution_id") is None
+                and attempt.get("provider_media_id") is None
+                and not attempt.get("provider_media_ids")
+                and delta == 0
+            )
+            known_terminal = (
+                pre_submit_no_action
+                or (state == "D2_SUCCEEDED" and terminal == "D2_SUCCEEDED")
+                or (state == "WAF_REJECTED" and terminal == "WAF_REJECTED")
+                or (
+                    state in {"GENERATION_FAILED", "PROVIDER_REFUSED", "RECONCILED_NO_CHARGE"}
+                    and terminal == state
+                )
+            )
+            stop_reason = None if known_terminal else "UNKNOWN_OR_NONTERMINAL_OUTCOME"
+            if known_terminal and (
+                (quote is None and delta != 0)
+                or (quote is not None and delta not in {Decimal(0), quote})
+            ):
+                stop_reason = "BILLING_DELTA_MISMATCH"
+            spent = _decimal(session.get("spent_credits"))
+            if spent is None or spent + delta > _TEST_SESSION_CREDIT_LIMIT:
+                stop_reason = "SESSION_CREDIT_CAP_EXCEEDED"
+            if stop_reason is None:
+                assert spent is not None
+                session["spent_credits"] = str(spent + delta)
+                session["last_provider_credits"] = str(after)
+                session["in_flight_run_id"] = None
+                attempt.update(
+                    test_session_credits_after=str(after),
+                    test_session_credit_delta=str(delta),
+                    test_session_reconciled_at=_utc_now(),
+                    test_session_reconciliation=(
+                        "RECONCILED_PRE_GENERATE" if pre_submit_no_action else "RECONCILED"
+                    ),
+                )
+                session["stopped_reason"] = None
+                if state == "D2_SUCCEEDED":
+                    session["status"] = "SUCCEEDED"
+                    session["reserved_credits"] = "0"
+                elif state == "WAF_REJECTED":
+                    session["status"] = "STOPPED"
+                    session["stopped_reason"] = "WAF_REJECTED"
+                    session["reserved_credits"] = "0"
+                elif spent + delta >= _TEST_SESSION_CREDIT_LIMIT:
+                    session["status"] = "CREDIT_CAP_EXHAUSTED"
+                    session["reserved_credits"] = "0"
+                else:
+                    session["reserved_credits"] = str(_TEST_SESSION_CREDIT_LIMIT - (spent + delta))
+            else:
+                session["status"] = "STOPPED"
+                session["stopped_reason"] = stop_reason
+                # Keep the full session reservation and in-flight identity on ambiguity.
+                attempt.update(
+                    test_session_credits_after=str(after),
+                    test_session_credit_delta=str(delta),
+                    test_session_reconciled_at=_utc_now(),
+                    test_session_reconciliation="STOPPED",
+                )
+            if stop_reason == "UNKNOWN_OR_NONTERMINAL_OUTCOME":
+                session["stopped_reason"] = stop_reason
+            attempt["updated_at"] = _utc_now()
+            session["updated_at"] = _utc_now()
+            return dict(session)
+
+        return self._mutate(update)
+
     def create_d6_attempt(
         self, request: PhaseGExecutionRequest, *, proof: D6PrerequisiteProof | None
     ) -> dict[str, object]:
@@ -1171,12 +1500,22 @@ class D2DailyCreditLedger:
                 raise PhaseGError(
                     "PHASE_G_BASELINE_REQUIRED", "attempt has no durable pre-submit baseline"
                 )
-            today = datetime.now(_BANGKOK).date().isoformat()
-            if self._accounted(payload, today) >= Decimal(self.daily_budget):
-                raise PhaseGError(
-                    "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
-                    "Bangkok-day accounting already reaches the D2 credit ceiling",
-                )
+            session_id = attempt.get("test_session_id")
+            if isinstance(session_id, str):
+                session = self._test_session(payload, session_id)
+                self._require_test_session_active(session)
+                if session.get("in_flight_run_id") != d2_run_id:
+                    raise PhaseGError(
+                        "PHASE_G_TEST_SESSION_ATTEMPT_MISMATCH",
+                        "session does not authorize this Generate action",
+                    )
+            else:
+                today = datetime.now(_BANGKOK).date().isoformat()
+                if self._accounted(payload, today) >= Decimal(self.daily_budget):
+                    raise PhaseGError(
+                        "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
+                        "Bangkok-day accounting already reaches the D2 credit ceiling",
+                    )
             attempt["generate_action_count"] = 1
             attempt["submission_state"] = "GENERATE_ACTION_RECORDED"
             attempt["updated_at"] = _utc_now()
@@ -1501,14 +1840,33 @@ class D2DailyCreditLedger:
                     "confirmation is stale or this attempt already has a gate",
                 )
             date = datetime.now(_BANGKOK).date().isoformat()
-            cumulative = self._accounted(payload, date)
-            if late_reconciled and attempt.get("accounting_date") == date:
-                cumulative -= _decimal(attempt.get("accounted_credit_cost")) or Decimal(0)
-            if cumulative + quoted > self.daily_budget:
-                raise PhaseGError(
-                    "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
-                    "quoted cost exceeds remaining D2 daily budget",
-                )
+            session_id = attempt.get("test_session_id")
+            if isinstance(session_id, str):
+                session = self._test_session(payload, session_id)
+                self._require_test_session_active(session)
+                spent = _decimal(session.get("spent_credits"))
+                expected_balance = _decimal(attempt.get("test_session_credits_before"))
+                if (
+                    session.get("in_flight_run_id") != d2_run_id
+                    or spent is None
+                    or quoted > _TEST_SESSION_CREDIT_LIMIT - spent
+                    or balance is None
+                    or expected_balance is None
+                    or balance != expected_balance
+                ):
+                    raise PhaseGError(
+                        "PHASE_G_TEST_SESSION_QUOTE_INVALID",
+                        "quote, visible balance, or session binding exceeds authorization",
+                    )
+            else:
+                cumulative = self._accounted(payload, date)
+                if late_reconciled and attempt.get("accounting_date") == date:
+                    cumulative -= _decimal(attempt.get("accounted_credit_cost")) or Decimal(0)
+                if cumulative + quoted > self.daily_budget:
+                    raise PhaseGError(
+                        "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
+                        "quoted cost exceeds remaining D2 daily budget",
+                    )
             if balance is not None and quoted > balance:
                 raise PhaseGError(
                     "PHASE_G_VISIBLE_BALANCE_INSUFFICIENT",
@@ -2570,6 +2928,7 @@ class D2DailyCreditLedger:
         request: PhaseGExecutionRequest,
         *,
         retry_authorization: D2RetryAuthorization | None = None,
+        test_session: dict[str, object] | None = None,
     ) -> dict[str, object]:
         attempts = cast(list[dict[str, object]], payload["attempts"])
         if any(row["d2_run_id"] == request.d2_run_id for row in attempts):
@@ -2622,13 +2981,27 @@ class D2DailyCreditLedger:
                     previous, attempts
                 ):
                     continue
+                if (
+                    test_session is not None
+                    and previous.get("test_session_id") == test_session.get("session_id")
+                    and previous.get("test_session_reconciliation") == "RECONCILED"
+                ):
+                    continue
                 raise PhaseGError(
                     "PHASE_G_PAID_ATTEMPT_ALREADY_STARTED",
                     "the authorized D2 live attempt has already used its Generate action",
                 )
+            if (
+                test_session is not None
+                and previous.get("test_session_id") == test_session.get("session_id")
+                and previous.get("test_session_reconciliation") == "RECONCILED_PRE_GENERATE"
+            ):
+                continue
             if state not in _TERMINAL_STATES:
                 raise PhaseGError("PHASE_G_ATTEMPT_UNRESOLVED", "prior D2 attempt is not terminal")
         attempt = self._new_attempt(request)
+        if test_session is not None:
+            attempt["test_session_id"] = test_session["session_id"]
         if retry_authorization is not None:
             attempt["retry_authorization"] = {
                 "contract_version": 1,
@@ -2844,6 +3217,175 @@ class D2DailyCreditLedger:
                 total += _decimal(attempt.get("accounted_credit_cost")) or Decimal(0)
         return total
 
+    def _test_session(self, payload: Mapping[str, object], session_id: str) -> dict[str, object]:
+        sessions = payload.get("test_sessions")
+        if not isinstance(sessions, list):
+            raise PhaseGError("PHASE_G_LEDGER_CORRUPT", "TEST session ledger data is invalid")
+        matches: list[dict[str, object]] = []
+        for item in cast(list[object], sessions):
+            if isinstance(item, dict):
+                session_item = cast(dict[str, object], item)
+                if session_item.get("session_id") == session_id:
+                    matches.append(session_item)
+        if len(matches) != 1:
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_NOT_FOUND", "authorized TEST session is missing or ambiguous"
+            )
+        session = matches[0]
+        if (
+            session.get("contract_version") != _TEST_SESSION_CONTRACT
+            or session.get("profile_name") != _TEST_PROFILE_NAME
+            or session.get("provider_account_id") != _TEST_PROVIDER_ACCOUNT
+            or session.get("provider_project_id") != _TEST_PROVIDER_PROJECT
+            or session.get("auth_profile_key") != _TEST_AUTH_PROFILE_KEY
+            or session.get("authorized_new_credits") != str(_TEST_SESSION_CREDIT_LIMIT)
+            or session.get("max_attempts") != _TEST_SESSION_MAX_ATTEMPTS
+            or session.get("runtime_state_root") != str(self.root.parent.resolve())
+        ):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_INVALID", "persisted TEST-session authorization is invalid"
+            )
+        auth_digest = session.get("authorization_sha256")
+        if not isinstance(auth_digest, str) or auth_digest != _test_session_authorization_digest(
+            session
+        ):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_INVALID", "TEST-session authorization digest does not match"
+            )
+        return session
+
+    @staticmethod
+    def _require_test_session_active(session: Mapping[str, object]) -> None:
+        if session.get("status") != "ACTIVE":
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_STOPPED", "TEST-session authorization is not active"
+            )
+        expires = session.get("expires_at")
+        try:
+            expiry = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_INVALID", "TEST-session expiry is invalid"
+            ) from exc
+        if expiry.tzinfo is None or datetime.now(UTC) > expiry.astimezone(UTC):
+            raise PhaseGError("PHASE_G_TEST_SESSION_EXPIRED", "TEST-session authorization expired")
+
+    def _validate_test_session_lane(
+        self,
+        session: Mapping[str, object],
+        request: PhaseGExecutionRequest,
+        auth_profile_key: str,
+    ) -> None:
+        request_root = request.presubmit_request.runtime_state_root.resolve()
+        if (
+            request.provider_id != "PRV_0001"
+            or request.provider_account_id != _TEST_PROVIDER_ACCOUNT
+            or request.provider_project_id != _TEST_PROVIDER_PROJECT
+            or request.output_count != 1
+            or auth_profile_key != _TEST_AUTH_PROFILE_KEY
+            or session.get("auth_profile_key") != auth_profile_key
+            or session.get("provider_account_id") != request.provider_account_id
+            or session.get("provider_project_id") != request.provider_project_id
+            or session.get("runtime_state_root") != str(request_root)
+            or str(self.root.parent.resolve()) != str(request_root)
+            or (
+                request.execution_context is not None
+                and (
+                    request.execution_context.environment != "TEST"
+                    or request.execution_context.auth_profile != _TEST_AUTH_PROFILE_KEY
+                    or request.execution_context.provider_account_id != _TEST_PROVIDER_ACCOUNT
+                    or request.execution_context.provider_project_id != _TEST_PROVIDER_PROJECT
+                )
+            )
+        ):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_LANE_MISMATCH",
+                "authorization is restricted to the exact TEST profile, account, project, and root",
+            )
+
+    @staticmethod
+    def _require_test_session_predecessors_reconciled(
+        session: Mapping[str, object], attempts: Sequence[Mapping[str, object]]
+    ) -> None:
+        run_ids = session.get("attempt_run_ids")
+        if not isinstance(run_ids, list):
+            raise PhaseGError("PHASE_G_TEST_SESSION_INVALID", "session attempt list is invalid")
+        for run_id in cast(list[object], run_ids):
+            prior = next((row for row in attempts if row.get("d2_run_id") == run_id), None)
+            if prior is None:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_INVALID", "session references a missing attempt"
+                )
+            state = prior.get("submission_state")
+            terminal = prior.get("terminal_state")
+            pre_submit_no_action = (
+                state == "PREPARED"
+                and _counter(prior.get("generate_action_count")) == 0
+                and _counter(prior.get("approval_action_count")) == 0
+                and prior.get("test_session_reconciliation") == "RECONCILED_PRE_GENERATE"
+            )
+            if state in {"WAF_REJECTED", "D2_SUCCEEDED"}:
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_STOPPED", "WAF refusal or D2 success stops the session"
+                )
+            if not pre_submit_no_action and (
+                state not in {"GENERATION_FAILED", "PROVIDER_REFUSED", "RECONCILED_NO_CHARGE"}
+                or terminal != state
+                or prior.get("test_session_reconciliation") != "RECONCILED"
+            ):
+                raise PhaseGError(
+                    "PHASE_G_TEST_SESSION_ATTEMPT_UNRESOLVED",
+                    "previous session attempt requires same-attempt recovery",
+                )
+            if (
+                prior.get("provider_media_id") is not None
+                or prior.get("provider_media_ids")
+                or prior.get("local_artifact_sha256") is not None
+                or prior.get("remote_verified") is True
+            ):
+                raise PhaseGError(
+                    "PHASE_G_ARTIFACT_RECOVERY_REQUIRED",
+                    "previous attempt has provider or artifact evidence requiring recovery",
+                )
+
+    def _validate_test_session_authorization(
+        self, authorization: D2TestSessionAuthorization
+    ) -> None:
+        if (
+            not re.fullmatch(r"D2TS_[a-f0-9]{16,32}", authorization.session_id)
+            or authorization.provider_account_id != _TEST_PROVIDER_ACCOUNT
+            or authorization.provider_project_id != _TEST_PROVIDER_PROJECT
+            or authorization.auth_profile_key != _TEST_AUTH_PROFILE_KEY
+            or not authorization.runtime_state_root.is_absolute()
+            or authorization.authorized_new_credits != _TEST_SESSION_CREDIT_LIMIT
+            or authorization.max_attempts != _TEST_SESSION_MAX_ATTEMPTS
+            or _decimal(authorization.starting_provider_credits) is None
+            or not _SHA256_RE.fullmatch(authorization.authorization_evidence_sha256)
+            or not re.fullmatch(r"[0-9a-f]{40,64}", authorization.implementation_commit)
+        ):
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_AUTHORIZATION_INVALID",
+                "TEST-session authorization fields do not match the approved bounded lane",
+            )
+        self._require_test_session_active(
+            {"status": "ACTIVE", "expires_at": authorization.expires_at}
+        )
+        now_bangkok = datetime.now(_BANGKOK)
+        try:
+            expires_bangkok = datetime.fromisoformat(
+                authorization.expires_at.replace("Z", "+00:00")
+            ).astimezone(_BANGKOK)
+        except ValueError as exc:
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_AUTHORIZATION_INVALID",
+                "TEST-session expiry is invalid",
+            ) from exc
+        if expires_bangkok.date() != now_bangkok.date():
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_AUTHORIZATION_INVALID",
+                "TEST-session authorization must expire on the current Bangkok accounting date",
+            )
+
     @staticmethod
     def _attempt(payload: dict[str, object], d2_run_id: str) -> dict[str, object]:
         for row in cast(list[dict[str, object]], payload["attempts"]):
@@ -2868,6 +3410,7 @@ class D2DailyCreditLedger:
                 "schema_version": _LEDGER_SCHEMA,
                 "daily_budget": self.daily_budget,
                 "attempts": [],
+                "test_sessions": [],
             }
         if self.path.is_symlink():
             raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "ledger may not be a symlink")
@@ -2878,16 +3421,31 @@ class D2DailyCreditLedger:
         if not isinstance(payload_value, dict):
             raise PhaseGError("PHASE_G_LEDGER_CORRUPT", "D2 credit ledger has an invalid shape")
         payload = cast(dict[str, object], payload_value)
-        if set(payload) != {
+        schema_version = payload.get("schema_version")
+        if schema_version == 1 and set(payload) == {
             "schema_version",
             "daily_budget",
             "attempts",
         }:
+            if payload.get("daily_budget") != self.daily_budget or not isinstance(
+                payload.get("attempts"), list
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CORRUPT", "legacy D2 credit ledger version or budget is invalid"
+                )
+            return {
+                "schema_version": _LEDGER_SCHEMA,
+                "daily_budget": self.daily_budget,
+                "attempts": payload["attempts"],
+                "test_sessions": [],
+            }
+        if set(payload) != {"schema_version", "daily_budget", "attempts", "test_sessions"}:
             raise PhaseGError("PHASE_G_LEDGER_CORRUPT", "D2 credit ledger has an invalid shape")
         if (
-            payload["schema_version"] != _LEDGER_SCHEMA
+            schema_version != _LEDGER_SCHEMA
             or payload["daily_budget"] != self.daily_budget
             or not isinstance(payload["attempts"], list)
+            or not isinstance(payload["test_sessions"], list)
         ):
             raise PhaseGError(
                 "PHASE_G_LEDGER_CORRUPT", "D2 credit ledger version or budget is invalid"
@@ -2982,6 +3540,29 @@ def _decimal(value: object, *, allow_none: bool = False) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return result if result.is_finite() and result >= 0 else None
+
+
+def _test_session_authorization_digest(session: Mapping[str, object]) -> str:
+    fields = (
+        "contract_version",
+        "session_id",
+        "authorization_evidence_sha256",
+        "implementation_commit",
+        "starting_ledger_sha256",
+        "runtime_state_root",
+        "profile_name",
+        "auth_profile_key",
+        "provider_account_id",
+        "provider_project_id",
+        "authorized_new_credits",
+        "max_attempts",
+        "starting_provider_credits",
+        "expires_at",
+        "created_at",
+    )
+    canonical = {key: session.get(key) for key in fields}
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
 def _counter(value: object) -> int:

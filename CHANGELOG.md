@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bounded TEST-only D2 credit session.** Adds a versioned, exact-account and
+  project authorization for up to 40 new provider credits while preserving the
+  ordinary 50-credit daily policy and all historical ledger rows. Unknown
+  outcomes, WAF refusals, successful D2s, and artifact recovery stop another
+  attempt; PROD and ordinary TEST requests keep the existing guard.
+
 - **Phase G outbound Flow submit attestation.** The pinned generation port
   arms a passive request observer before the one-time Generate click and
   records sanitized `YhhmEf` dispatch/response evidence. Missing or duplicate

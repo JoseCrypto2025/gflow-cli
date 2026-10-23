@@ -8,6 +8,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -304,6 +305,8 @@ async def execute_and_validate(
     *,
     expected_email: str,
     retry_authorization: D2RetryAuthorization | None = None,
+    test_session_id: str | None = None,
+    test_session_credits_before: Decimal | None = None,
 ) -> PhaseGD2Run:
     """Perform one request, recover only its media ID, and fully validate the MP4."""
     context = request.execution_context
@@ -313,6 +316,18 @@ async def execute_and_validate(
         # provider/day ceiling across all new TEST and PROD attempts.
         ledger_root = ledger_root / "production"
     ledger = D2DailyCreditLedger(ledger_root)
+    if test_session_id is not None:
+        if test_session_credits_before is None:
+            raise PhaseGError(
+                "PHASE_G_TEST_SESSION_BALANCE_UNKNOWN",
+                "pre-attempt provider balance is required for the authorized session",
+            )
+        ledger.validate_test_session_request(
+            request,
+            session_id=test_session_id,
+            auth_profile_key=_AUTH_PROFILE,
+            provider_credits_before=test_session_credits_before,
+        )
     credit_guard = (
         ProductionCreditGuard(request.presubmit_request.runtime_state_root) if context else None
     )
@@ -325,7 +340,12 @@ async def execute_and_validate(
     try:
         result = await GoogleFlowAgentOnlyGenerationExecutor(
             port, ledger, journal, production_credit_guard=credit_guard
-        ).execute(request, retry_authorization=retry_authorization)
+        ).execute(
+            request,
+            retry_authorization=retry_authorization,
+            test_session_id=test_session_id,
+            test_session_credits_before=test_session_credits_before,
+        )
         if result.submission_state != "GENERATION_SUCCEEDED" or not result.provider_media_id:
             raise PhaseGError(
                 "PHASE_G_OUTPUT_NOT_READY", "attempt has not produced one attributable media ID"
