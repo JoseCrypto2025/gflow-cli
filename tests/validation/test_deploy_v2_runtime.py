@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import tarfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -91,10 +93,89 @@ def test_rollback_manifest_rejects_unrecorded_files(tmp_path) -> None:
         '{"commit_sha":"' + "a" * 40 + '"}\n', encoding="utf-8"
     )
     (backup / "runtime.py").write_text("original", encoding="utf-8")
-    deploy._write_rollback_manifest(backup)
+    manifest_path, manifest_sha = deploy._write_rollback_manifest(backup)
 
+    assert deploy._sha256_file(manifest_path) == manifest_sha
     assert deploy._verify_rollback_manifest(backup) == "a" * 40
 
     (backup / "unrecorded.py").write_text("unrecorded", encoding="utf-8")
     with pytest.raises(deploy.DeploymentError, match="contents"):
         deploy._verify_rollback_manifest(backup)
+
+
+def test_promotion_restores_runtime_if_rollback_backup_is_not_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "runtime"
+    venv = target / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("existing interpreter", encoding="utf-8")
+    (target / ".gflow-v2-build.json").write_text(
+        '{"commit_sha":"' + "b" * 40 + '"}\n', encoding="utf-8"
+    )
+    backups = tmp_path / "backups"
+    backups.mkdir()
+
+    monkeypatch.setattr(deploy, "TARGET_ROOT", target)
+    monkeypatch.setattr(deploy, "BACKUP_ROOT", backups)
+    monkeypatch.setattr(deploy.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(deploy, "_check_no_runtime_processes", lambda: None)
+    real_mkdtemp = deploy.tempfile.mkdtemp
+    monkeypatch.setattr(
+        deploy.tempfile,
+        "mkdtemp",
+        lambda *, prefix, dir: real_mkdtemp(prefix=prefix, dir=tmp_path),
+    )
+    real_stat = Path.stat
+
+    def deployment_root_stat(path: Path, *args: object, **kwargs: object) -> object:
+        info = real_stat(path, *args, **kwargs)
+        if path in {target, backups}:
+            return SimpleNamespace(
+                st_dev=1,
+                st_uid=0,
+                st_gid=0,
+                st_mode=0o40755,
+            )
+        return info
+
+    monkeypatch.setattr(Path, "stat", deployment_root_stat)
+    monkeypatch.setattr(
+        deploy,
+        "_extract_archive",
+        lambda data, plan, destination, commit: (destination / "candidate.py").write_text(
+            "candidate", encoding="utf-8"
+        ),
+    )
+    verification_calls = 0
+    runtime_check_calls = 0
+
+    def reject_backup(backup: Path) -> str:
+        nonlocal verification_calls
+        verification_calls += 1
+        return "c" * 40
+
+    def runtime_checks(commit: str) -> str:
+        nonlocal runtime_check_calls
+        runtime_check_calls += 1
+        return "PASS"
+
+    monkeypatch.setattr(deploy, "_verify_rollback_manifest", reject_backup)
+    monkeypatch.setattr(deploy, "_run_runtime_checks", runtime_checks)
+
+    with pytest.raises(deploy.DeploymentError, match="rollback backup is not ready"):
+        deploy._promote(
+            b"archive",
+            deploy.ArchivePlan("c" * 64, {}, {}, 0),
+            "a" * 40,
+            "b" * 40,
+            venv,
+        )
+
+    assert verification_calls == 1
+    assert runtime_check_calls == 0
+    assert target.is_dir()
+    assert (target / ".gflow-v2-build.json").read_text(encoding="utf-8") == (
+        '{"commit_sha":"' + "b" * 40 + '"}\n'
+    )
+    assert list(backups.iterdir()) == []

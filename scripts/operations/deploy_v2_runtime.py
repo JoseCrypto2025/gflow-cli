@@ -349,7 +349,7 @@ def _write_rollback_manifest(backup: Path) -> tuple[Path, str]:
     manifest = _tree_manifest(backup)
     payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
     target = backup.with_name(backup.name + ".manifest.json")
-    target.write_text(payload, encoding="utf-8")
+    target.write_bytes(payload.encode("utf-8"))
     return target, hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -532,6 +532,7 @@ def _promote(
     stage = Path(tempfile.mkdtemp(prefix=".gflow-v2-stage-", dir="/opt"))
     backup_created = False
     deployed = False
+    backup_manifest: Path | None = None
     try:
         _extract_archive(data, plan, stage, commit)
         shutil.copytree(venv, stage / ".venv", symlinks=True, copy_function=shutil.copy2)
@@ -552,14 +553,21 @@ def _promote(
             raise DeploymentError("timestamped rollback path already exists")
         TARGET_ROOT.rename(backup)
         backup_created = True
+        manifest_path, manifest_sha = _write_rollback_manifest(backup)
+        backup_manifest = manifest_path
+        if (
+            _sha256_file(manifest_path) != manifest_sha
+            or _verify_rollback_manifest(backup) != old_commit
+        ):
+            raise DeploymentError("rollback backup is not ready for restoration")
         try:
             stage.rename(TARGET_ROOT)
             deployed = True
         except OSError:
             backup.rename(TARGET_ROOT)
             backup_created = False
+            backup_manifest.unlink(missing_ok=True)
             raise
-        manifest_path, manifest_sha = _write_rollback_manifest(backup)
         if json.loads((TARGET_ROOT / ".gflow-v2-build.json").read_text(encoding="utf-8")) != {
             "commit_sha": commit
         }:
@@ -582,8 +590,12 @@ def _promote(
             if not failed.exists():
                 TARGET_ROOT.rename(failed)
             backup.rename(TARGET_ROOT)
+            if backup_manifest is not None:
+                backup_manifest.unlink(missing_ok=True)
         elif backup_created and not TARGET_ROOT.exists():
             backup.rename(TARGET_ROOT)
+            if backup_manifest is not None:
+                backup_manifest.unlink(missing_ok=True)
         raise
     finally:
         if stage.exists():
