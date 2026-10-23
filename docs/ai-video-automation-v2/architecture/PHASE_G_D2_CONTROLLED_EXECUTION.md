@@ -191,6 +191,16 @@ D2 success, unresolved, and artifact-recovery stops remain in force. The
 ledger checks the current Bangkok-day 50-credit ceiling again when it records
 the Generate action, before the UI click.
 
+### Versioned forensic closure for provider-silent unknown attempts
+
+The separately versioned, TEST-only
+[`D2_FORENSIC_PROVIDER_SILENT_CLOSURE_V3` contract](../operations/D2_FORENSIC_PROVIDER_SILENT_CLOSURE_V3.md)
+applies only to its exact provider-silent run. It keeps chat non-authoritative, requires
+fresh hydrated structured-provider snapshots with no pending or confirmation state, stable
+provider identity sets, and no new project or finished-media DOM identifiers. Unmatched
+provider identifiers in chat also fail closed. It preserves the attempt's unknown outcomes
+and full daily credit reservation. V1 and V2 remain unchanged.
+
 ### D6 release prerequisite
 
 Every D6 request must name one exact `prerequisite_d2_run_id`. The centralized

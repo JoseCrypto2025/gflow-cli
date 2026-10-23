@@ -2063,6 +2063,81 @@ class D2DailyCreditLedger:
             self._write(payload)
             return dict(attempt)
 
+    def close_provider_silent_forensic_v3(
+        self,
+        d2_run_id: str,
+        *,
+        expected_ledger_sha256: str,
+        evidence_sha256: str,
+        implementation_commit: str,
+        evidence: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Close the exact provider-silent unknown D2 under the V3 evidence contract."""
+        if not _SHA256_RE.fullmatch(expected_ledger_sha256):
+            raise PhaseGError("PHASE_G_LEDGER_SHA_INVALID", "expected ledger SHA-256 is invalid")
+        if not _SHA256_RE.fullmatch(evidence_sha256):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_HASH_INVALID", "evidence SHA-256 is invalid"
+            )
+        if not re.fullmatch(r"[0-9a-f]{40,64}", implementation_commit):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_COMMIT_INVALID", "implementation commit SHA is invalid"
+            )
+
+        from .phase_g_forensic_provider_silent_v3 import (
+            forensic_provider_silent_digest_v3,
+            validate_provider_silent_attempt_binding_v3,
+            validate_provider_silent_evidence_v3,
+        )
+
+        summary = validate_provider_silent_evidence_v3(evidence)
+        if (
+            summary["D2_RUN_ID"] != d2_run_id
+            or summary["CANONICAL_LEDGER_SHA256"] != expected_ledger_sha256
+            or summary["IMPLEMENTATION_COMMIT"] != implementation_commit
+        ):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INVALID", "V3 evidence binding differs from operator"
+            )
+        if forensic_provider_silent_digest_v3(summary) != evidence_sha256:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_HASH_MISMATCH",
+                "V3 evidence SHA differs from canonical evidence content",
+            )
+        with self._locked_file():
+            if self.path.is_symlink() or not self.path.is_file():
+                raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "D2 ledger is missing or unsafe")
+            try:
+                current_sha256 = sha256_file(self.path)
+            except OSError as exc:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_READ_FAILED", "D2 ledger could not be hashed"
+                ) from exc
+            if current_sha256 != expected_ledger_sha256:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CHANGED", "D2 ledger changed since V3 operator review"
+                )
+            payload = self._read()
+            attempt = self._attempt(payload, d2_run_id)
+            validate_provider_silent_attempt_binding_v3(self.root.parent, payload, attempt, summary)
+            attempt.update(
+                submission_state="FORENSICALLY_CLOSED_UNKNOWN",
+                terminal_state="FORENSICALLY_CLOSED_UNKNOWN",
+                provider_outcome="UNKNOWN",
+                credit_outcome="UNKNOWN",
+                provider_billing_outcome="UNKNOWN",
+                forensic_closure_contract_version="D2_FORENSIC_PROVIDER_SILENT_CLOSURE_V3",
+                forensic_classification="NO_PROVIDER_EVIDENCE",
+                forensic_closed_at=summary["FORENSIC_COMPLETED_AT"],
+                forensic_reason=summary["FORENSIC_REASON"],
+                forensic_evidence_sha256=evidence_sha256,
+                forensic_implementation_commit=implementation_commit,
+                forensic_closure_evidence=summary,
+                updated_at=_utc_now(),
+            )
+            self._write(payload)
+            return dict(attempt)
+
     def attempts(self) -> tuple[Mapping[str, object], ...]:
         """Return a defensive snapshot of the sanitized attempt records."""
         with self._locked_file():
