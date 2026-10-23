@@ -193,3 +193,47 @@ validated at `94c15a5b9fe07fac64cea7bc71d246b47d1d36c0`:
   opening Flow. At the time of this checkpoint, `/opt/gflow-v2` still held
   `9bb6e88b4805d63a59d0ff218e24b38f3117db0a`; the validated source update had
   been pushed but not yet deployed.
+
+## Read-only production readiness reconciliation — 2026-10-23
+
+The following state was freshly inspected without changing Google Sheets,
+Flow, services, or the deployed runtime:
+
+- The isolated source checkout `/opt/gflow-v2-src` was on `automation-v2` at
+  `39f980fe59a22ca299f1dd1ac18a73a8c487d3f8`, with a clean tracked worktree at
+  inspection start. Its Python 3.12.3 venv ran 351 relevant Phase E/G,
+  production execution, snapshot, Sheets, and presubmit tests successfully
+  after test fixtures were made POSIX-portable. Ruff, format, Pyright, hygiene,
+  and documentation gates also passed.
+- One new read-only canonical Sheet snapshot was exported at
+  `2026-10-23T13:51:10Z`: 34 tables, 58 logical rows, zero phantom rows, SHA-256
+  `c8b8f05239d4c1b9f686e18cd1908067f438084403b26a9a46c9c2461654df0c`. Pure
+  Phase E and production request construction passed for `SCN_000001`,
+  `GPR_0002`, `PVA_0002`, `MDL_0001`, `PMT_0001`, and the single approved
+  `SPV_000007` version 7 prompt. The four transaction tables were empty.
+- The Sheet-bound provider project ID is
+  `aafe9282-071f-4333-baa4-92b9f76a9c27`. The production presubmit code still
+  names its project `AI Video Automation V2 - PROD`, which differs from the
+  separately supplied expected name `Google Flow V2 PROD`; the live project
+  name was not verified during this read-only review.
+- `/opt/gflow-v2` is a non-Git application tree with build manifest commit
+  `42787383505b43394b3657b5138d137a259c3185` and Python 3.12.3. Its
+  `phase_g.py` and `phase_g_run.py` checksums differ from the source checkout.
+  No V2 systemd unit was present; the only matching service was the unrelated
+  private relay. The existing runtime was not modified or deployed.
+- The expected `gflow-prod` browser-profile directory exists with owner
+  `gflow:gflow` and mode `0700`; its contents were not opened. The desktop
+  Computer Use browser inventory did not expose that VPS profile or a Flow
+  session. Consequently Flow login/account, live project name, composer state,
+  selections, assets, and current credits remain unverified.
+- The live F5 operator calls `prepare_live_flow()`, which applies and restores
+  Flow settings. It was not run because this reconciliation authorized only
+  read-only Flow inspection. The current provider balance and generation quote
+  are therefore unknown, and pre-submit is not fully validated.
+
+`READY_TO_RELEASE_HOLD=NO`. Reconcile the project-name binding, provide a
+read-only view of the existing `gflow-prod` Flow session, verify the current
+credit balance/quote and live composer/assets, and deploy the approved source
+to `/opt/gflow-v2` only through a separately approved deployment workflow
+before reconsidering release readiness. Generate, Approve, and production D2
+remain unexecuted.

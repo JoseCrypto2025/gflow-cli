@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Mapping
 from copy import deepcopy
@@ -17,6 +18,12 @@ from gflow_cli.v2_runtime.google_flow import FlowPresubmitResult
 from gflow_cli.v2_runtime.phase_e import Row
 from scripts.operations import vps_flow_presubmit as presubmit
 from tests.validation.test_phase_e_prompt_preflight import _fixtures
+
+
+def _write_private_snapshot(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    if os.name == "posix":
+        path.chmod(0o600)
 
 
 def _settings(tmp_path: Path, environment: str = "production") -> RuntimeSettings:
@@ -221,9 +228,9 @@ def test_build_request_requires_explicit_identity_and_production_runtime(tmp_pat
 
 def test_snapshot_source_and_freshness_are_required(tmp_path: Path) -> None:
     path = tmp_path / "snapshot.json"
-    path.write_text(
+    _write_private_snapshot(
+        path,
         '{"spreadsheet_id":"wrong","read_at":"2026-10-18T00:00:00Z","tables":{}}',
-        encoding="utf-8",
     )
 
     with pytest.raises(presubmit.PresubmitInputError) as exc_info:
@@ -233,7 +240,8 @@ def test_snapshot_source_and_freshness_are_required(tmp_path: Path) -> None:
 
 def test_snapshot_validates_shape_and_secret_field_names(tmp_path: Path) -> None:
     path = tmp_path / "snapshot.json"
-    path.write_text(
+    _write_private_snapshot(
+        path,
         json.dumps(
             {
                 "spreadsheet_id": presubmit.SPREADSHEET_ID,
@@ -241,12 +249,12 @@ def test_snapshot_validates_shape_and_secret_field_names(tmp_path: Path) -> None
                 "tables": {"SCENES": [{"Scene_ID": "SCN_000001"}]},
             }
         ),
-        encoding="utf-8",
     )
     tables = presubmit.load_snapshot(path, now=datetime(2026, 10, 18, tzinfo=UTC))
     assert tables["SCENES"] == [{"Scene_ID": "SCN_000001"}]
 
-    path.write_text(
+    _write_private_snapshot(
+        path,
         json.dumps(
             {
                 "spreadsheet_id": presubmit.SPREADSHEET_ID,
@@ -254,7 +262,6 @@ def test_snapshot_validates_shape_and_secret_field_names(tmp_path: Path) -> None
                 "tables": {"SCENES": "not rows"},
             }
         ),
-        encoding="utf-8",
     )
     with pytest.raises(presubmit.PresubmitInputError) as exc_info:
         presubmit.load_snapshot(path, now=datetime(2026, 10, 18, tzinfo=UTC))
@@ -263,9 +270,9 @@ def test_snapshot_validates_shape_and_secret_field_names(tmp_path: Path) -> None
 
 def test_snapshot_rejects_stale_read_time(tmp_path: Path) -> None:
     path = tmp_path / "snapshot.json"
-    path.write_text(
+    _write_private_snapshot(
+        path,
         f'{{"spreadsheet_id":"{presubmit.SPREADSHEET_ID}","read_at":"2026-10-17T00:00:00Z","tables":{{}}}}',
-        encoding="utf-8",
     )
 
     with pytest.raises(presubmit.PresubmitInputError) as exc_info:
@@ -275,9 +282,9 @@ def test_snapshot_rejects_stale_read_time(tmp_path: Path) -> None:
 
 def test_snapshot_rejects_secret_shaped_fields(tmp_path: Path) -> None:
     path = tmp_path / "snapshot.json"
-    path.write_text(
+    _write_private_snapshot(
+        path,
         f'{{"spreadsheet_id":"{presubmit.SPREADSHEET_ID}","read_at":"2026-10-18T00:00:00Z","session_token":"hidden","tables":{{}}}}',
-        encoding="utf-8",
     )
 
     with pytest.raises(presubmit.PresubmitInputError) as exc_info:

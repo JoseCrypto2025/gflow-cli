@@ -1921,7 +1921,7 @@ def test_test_session_stops_at_exact_40_credit_cap(tmp_path: Path) -> None:
         ("provider_account_id", "PVA_0002"),
         ("provider_project_id", "other-project"),
         ("auth_profile_key", "GFLOW_V2_PROD_AUTH"),
-        ("runtime_state_root", Path("C:/other/state")),
+        ("runtime_state_root", Path(Path.cwd().anchor) / "other" / "state"),
         ("authorization_evidence_sha256", "malformed-evidence"),
     ],
 )
