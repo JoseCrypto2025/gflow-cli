@@ -1,5 +1,45 @@
 # VPS Browser Runtime Readiness
 
+## Controlled application deployment
+
+`scripts/operations/deploy_v2_runtime.py` is the application deployment
+operator. It defaults to a read-only preflight and requires an exact clean
+`automation-v2` commit. It packages only `src/`, `schemas/`, the production F5
+operator, the runtime doctor, `pyproject.toml`, and `uv.lock` from Git; it never
+copies `.git`, tests, docs, ignored files, credentials, or a source virtualenv.
+It preserves the existing runtime virtualenv and keeps browser state, OAuth,
+runtime state, logs, and temporary files at their separate documented paths.
+
+Run on the VPS as root from the approved source checkout:
+
+```sh
+python3 /opt/gflow-v2-src/scripts/operations/deploy_v2_runtime.py \
+  --commit <exact-40-character-commit>
+python3 /opt/gflow-v2-src/scripts/operations/deploy_v2_runtime.py \
+  --commit <exact-40-character-commit> --apply
+```
+
+The first command is a no-write preflight. Apply creates a full timestamped
+rollback copy under `/opt/gflow-v2-backups/`, stages the allowlisted archive,
+preserves the existing `.venv`, promotes atomically, verifies per-file hashes
+against `deployment-manifest.json`, and runs the runtime doctor as `gflow`.
+If promotion or those runtime checks fail, the previous application directory
+is restored automatically and the failed candidate is retained for diagnosis.
+The rollback copy also has a full-tree hash manifest. Restore only by naming
+that exact verified backup:
+
+```sh
+python3 /opt/gflow-v2-src/scripts/operations/deploy_v2_runtime.py \
+  --rollback /opt/gflow-v2-backups/<exact-backup-directory>
+```
+
+Deployment refuses a dirty/wrong source checkout, an unexpected runtime owner
+or mode, an active process using the application/profile, unsafe archive paths,
+insufficient space, or concurrent deployment. It does not restart services
+and does not read or modify protected data roots. Google Sheets connectivity
+is verified by the subsequent fresh canonical snapshot; F5 is a separate
+explicit step.
+
 ## Target (not deployed)
 
 - Application checkout: `/opt/gflow-v2`

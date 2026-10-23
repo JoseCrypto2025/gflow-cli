@@ -5,17 +5,32 @@ import asyncio
 import pytest
 
 from gflow_cli.v2_runtime.live_flow import GoogleFlowAgentOnlyPort
+from scripts.operations import agent_only_zero_credit_canary as canary
 from scripts.operations.agent_only_zero_credit_canary import (
     _sanitized_rpcids,
     _wait_for_stable_video_state,
 )
 
 
+class _FakeLoopClock:
+    def __init__(self) -> None:
+        self.current = 0.0
+
+    def time(self) -> float:
+        return self.current
+
+    def advance(self, milliseconds: int) -> None:
+        self.current += milliseconds / 1000
+
+
 class _FakePage:
-    def __init__(self, states: list[dict[str, object]]) -> None:
+    def __init__(
+        self, states: list[dict[str, object]], *, clock: _FakeLoopClock | None = None
+    ) -> None:
         self.states = states
         self.reads = 0
         self.waited_ms = 0
+        self.clock = clock
 
     async def evaluate(self, script: str) -> dict[str, object]:
         self.reads += 1
@@ -23,6 +38,9 @@ class _FakePage:
 
     async def wait_for_timeout(self, milliseconds: int) -> None:
         self.waited_ms += milliseconds
+        if self.clock is not None:
+            self.clock.advance(milliseconds)
+            return
         await asyncio.sleep(min(milliseconds / 1000, 0.001))
 
 
@@ -57,7 +75,11 @@ def test_canary_service_worker_block_is_explicit_and_opt_in() -> None:
     assert normal.block_service_workers is False
 
 
-async def test_canary_waits_for_project_state_to_hydrate_before_baseline() -> None:
+async def test_canary_waits_for_project_state_to_hydrate_before_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeLoopClock()
+    monkeypatch.setattr(canary.asyncio, "get_running_loop", lambda: clock)
     page = _FakePage(
         [
             {"chat_count": 0, "chat_bubble_hashes": []},
@@ -67,7 +89,8 @@ async def test_canary_waits_for_project_state_to_hydrate_before_baseline() -> No
             {"chat_count": 6, "chat_bubble_hashes": ["ready"]},
             {"chat_count": 6, "chat_bubble_hashes": ["ready"]},
             {"chat_count": 6, "chat_bubble_hashes": ["ready"]},
-        ]
+        ],
+        clock=clock,
     )
 
     state = await _wait_for_stable_video_state(page, expected_chat_count=6)
@@ -80,15 +103,18 @@ async def test_canary_waits_for_project_state_to_hydrate_before_baseline() -> No
 async def test_canary_fails_closed_if_project_state_never_stabilizes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scripts.operations import agent_only_zero_credit_canary as canary
-
-    monkeypatch.setattr(canary, "_STATE_STABILITY_TIMEOUT_S", 0.01)
+    clock = _FakeLoopClock()
+    monkeypatch.setattr(canary.asyncio, "get_running_loop", lambda: clock)
+    monkeypatch.setattr(canary, "_STATE_STABILITY_TIMEOUT_S", 0.003)
+    monkeypatch.setattr(canary, "_STATE_HYDRATION_SETTLE_MS", 0)
     monkeypatch.setattr(canary, "_STATE_STABILITY_INTERVAL_MS", 1)
     page = _FakePage(
         [
             {"chat_count": 0},
             {"chat_count": 1},
-        ]
+            {"chat_count": 0},
+        ],
+        clock=clock,
     )
 
     with pytest.raises(canary.FlowPresubmitError) as caught:
