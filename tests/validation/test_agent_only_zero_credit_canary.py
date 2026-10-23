@@ -15,12 +15,14 @@ class _FakePage:
     def __init__(self, states: list[dict[str, object]]) -> None:
         self.states = states
         self.reads = 0
+        self.waited_ms = 0
 
     async def evaluate(self, script: str) -> dict[str, object]:
         self.reads += 1
         return self.states[min(self.reads - 1, len(self.states) - 1)]
 
     async def wait_for_timeout(self, milliseconds: int) -> None:
+        self.waited_ms += milliseconds
         await asyncio.sleep(min(milliseconds / 1000, 0.001))
 
 
@@ -59,6 +61,8 @@ async def test_canary_waits_for_project_state_to_hydrate_before_baseline() -> No
     page = _FakePage(
         [
             {"chat_count": 0, "chat_bubble_hashes": []},
+            {"chat_count": 0, "chat_bubble_hashes": []},
+            {"chat_count": 0, "chat_bubble_hashes": []},
             {"chat_count": 6, "chat_bubble_hashes": ["loading"]},
             {"chat_count": 6, "chat_bubble_hashes": ["ready"]},
             {"chat_count": 6, "chat_bubble_hashes": ["ready"]},
@@ -66,10 +70,11 @@ async def test_canary_waits_for_project_state_to_hydrate_before_baseline() -> No
         ]
     )
 
-    state = await _wait_for_stable_video_state(page)
+    state = await _wait_for_stable_video_state(page, expected_chat_count=6)
 
     assert state["chat_count"] == 6
-    assert page.reads == 5
+    assert page.reads == 7
+    assert page.waited_ms >= 5_000
 
 
 async def test_canary_fails_closed_if_project_state_never_stabilizes(
@@ -87,6 +92,6 @@ async def test_canary_fails_closed_if_project_state_never_stabilizes(
     )
 
     with pytest.raises(canary.FlowPresubmitError) as caught:
-        await _wait_for_stable_video_state(page)
+        await _wait_for_stable_video_state(page, expected_chat_count=1)
 
     assert caught.value.code == "AGENT_CANARY_STATE_UNSTABLE"

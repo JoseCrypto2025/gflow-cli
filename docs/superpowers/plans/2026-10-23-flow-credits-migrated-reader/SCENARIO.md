@@ -19,7 +19,7 @@ Active dimensions: D1 auth/session lifecycle (signed-out and `/about` landings),
 | 9 | D12 Observability | Successful or failed read | High | Logs/errors contain no raw body, token, cookie, or signed URL | Integration |
 | 10 | D13 MCP | Agent calls `gflow_get_credits` | High | Preserve the result keys and report tier fields as `null` when unknown | Unit + E2E auth |
 | 11 | D8 Paths | Profile path contains Windows spaces/Unicode | Medium | Existing profile/client handling continues to work without path construction changes | Unit |
-| 12 | D5 Hydration | Agent-only project state hydrates after navigation/reload | High | The canary waits for three identical structured snapshots before baseline and after reload, then fails closed at its bounded deadline | Offline helper test + live canary |
+| 12 | D5 Hydration | Agent-only project state hydrates after navigation/reload | High | The canary allows initial hydration, waits for three identical structured snapshots, and requires the post-reload chat count to match the baseline | Offline helper test + live canary |
 
 ## Must-cover before merge (Critical + High)
 

@@ -33,6 +33,7 @@ _EMAIL = "singleava508@gmail.com"
 _PROJECT_ID = "34e60953-e534-46e9-ac65-993893e61065"
 _RPCID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
 _STATE_STABILITY_TIMEOUT_S = 15.0
+_STATE_HYDRATION_SETTLE_MS = 5_000
 _STATE_STABILITY_INTERVAL_MS = 500
 _STATE_STABILITY_SAMPLES = 3
 
@@ -56,13 +57,26 @@ def _state_dict(value: object) -> dict[str, Any]:
     return value
 
 
-async def _wait_for_stable_video_state(page: Any) -> dict[str, Any]:
+async def _wait_for_stable_video_state(
+    page: Any, *, expected_chat_count: int | None = None
+) -> dict[str, Any]:
     """Wait for Flow's project state to hydrate and repeat consistently."""
     deadline = asyncio.get_running_loop().time() + _STATE_STABILITY_TIMEOUT_S
     previous: dict[str, Any] | None = None
     repeated = 0
+    settle_ms = min(
+        _STATE_HYDRATION_SETTLE_MS,
+        max(0, int((deadline - asyncio.get_running_loop().time()) * 1000)),
+    )
+    if settle_ms:
+        await page.wait_for_timeout(settle_ms)
     while asyncio.get_running_loop().time() < deadline:
         current = _state_dict(await page.evaluate(_VIDEO_STATE_JS))
+        if expected_chat_count is not None and current.get("chat_count") != expected_chat_count:
+            previous = None
+            repeated = 0
+            await page.wait_for_timeout(_STATE_STABILITY_INTERVAL_MS)
+            continue
         if current == previous:
             repeated += 1
         else:
@@ -149,7 +163,8 @@ async def run_canary(snapshot: Path, runtime_root: Path, temp_root: Path) -> dic
         await context.unroute("**/*", intercept)
         await page.reload(wait_until="domcontentloaded")
         await page.locator("flow-project-page").wait_for(state="visible", timeout=15_000)
-        after = await _wait_for_stable_video_state(page)
+        baseline_chat_count = int((baseline.agent_turn_id or "0:").partition(":")[0] or "0")
+        after = await _wait_for_stable_video_state(page, expected_chat_count=baseline_chat_count)
         stable = True
         baseline_media = set(baseline.media_ids)
         after_media = set(port._valid_ids(after.get("media_ids")))
@@ -157,7 +172,6 @@ async def run_canary(snapshot: Path, runtime_root: Path, temp_root: Path) -> dic
         after_tiles = set(port._valid_hashes(after.get("finished_tile_key_hashes")))
         pending_after = port._integer(after.get("pending"))
         live_gates_after = await page.locator(_LIVE_GATE).count()
-        baseline_chat_count = int((baseline.agent_turn_id or "0:").partition(":")[0] or "0")
         rpc_events = [event for event in events if event["rpcids"]]
         passed = bool(
             port._submission_surface == "AGENT_ONLY"
@@ -178,6 +192,8 @@ async def run_canary(snapshot: Path, runtime_root: Path, temp_root: Path) -> dic
             "rpcids": sorted({rpcid for event in rpc_events for rpcid in event["rpcids"]}),
             "rpc_inventory": rpc_events,
             "post_snapshot_stable": stable,
+            "baseline_chat_count": baseline_chat_count,
+            "post_chat_count": port._integer(after.get("chat_count")),
             "new_media_count": len(after_media - baseline_media),
             "new_finished_tile_count": len(after_tiles - baseline_tiles),
             "pending_after": pending_after,
