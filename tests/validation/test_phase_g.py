@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -738,6 +739,25 @@ def test_phase_g_allows_only_one_generate_action_across_run_ids(tmp_path: Path) 
     assert stopped.value.code == "PHASE_G_PAID_ATTEMPT_ALREADY_STARTED"
 
 
+@pytest.mark.parametrize("state", ["GENERATION_SUCCEEDED", "PERSISTENCE_FAILED"])
+def test_artifact_recovery_states_still_block_a_new_attempt(tmp_path: Path, state: str) -> None:
+    request = phase_g_request(tmp_path)
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(request)
+    _capture_ledger_baseline(ledger)
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.record_state(request.d2_run_id, submission_state="SUBMISSION_ACKNOWLEDGED")
+    ledger.record_state(
+        request.d2_run_id,
+        submission_state=state,
+        terminal_state="PERSISTENCE_FAILED" if state == "PERSISTENCE_FAILED" else None,
+    )
+    next_request = PhaseGExecutionRequest.from_presubmit(request_for(tmp_path), "D2_test-run-0002")
+    with pytest.raises(PhaseGError) as blocked:
+        ledger.create_attempt(next_request)
+    assert blocked.value.code == "PHASE_G_ARTIFACT_RECOVERY_REQUIRED"
+
+
 def _retry_fixture(
     tmp_path: Path,
     *,
@@ -914,6 +934,48 @@ def test_phase_g_retry_requires_daily_budget_headroom(tmp_path: Path) -> None:
         ledger.create_authorized_retry_attempt(request, authorization)
     assert budget.value.code == "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED"
     assert ledger.accounted_today() == Decimal("50")
+
+
+def test_full_bangkok_day_budget_blocks_generate_before_action_is_consumed(
+    tmp_path: Path,
+) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(phase_g_request(tmp_path))
+    _capture_ledger_baseline(ledger)
+    today = datetime.now(timezone(timedelta(hours=7))).date().isoformat()
+    ledger._mutate(
+        lambda payload: _set_attempt_accounting(payload, "D2_test-run-0001", today, "50")
+    )
+    with pytest.raises(PhaseGError) as blocked:
+        ledger.mark_generate_action("D2_test-run-0001")
+    assert blocked.value.code == "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED"
+    attempt = ledger.attempts()[0]
+    assert attempt["generate_action_count"] == 0
+    assert attempt["submission_state"] == "PREPARED"
+
+
+def test_prior_bangkok_day_reservation_does_not_consume_today_budget(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(phase_g_request(tmp_path))
+    _capture_ledger_baseline(ledger)
+    today = datetime.now(timezone(timedelta(hours=7))).date()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    ledger._mutate(
+        lambda payload: _set_attempt_accounting(payload, "D2_test-run-0001", yesterday, "50")
+    )
+    assert ledger.accounted_today() == Decimal(0)
+    assert ledger.mark_generate_action("D2_test-run-0001")["generate_action_count"] == 1
+
+
+def _set_attempt_accounting(
+    payload: dict[str, object], run_id: str, date: str, cost: str
+) -> dict[str, object]:
+    attempts = payload["attempts"]
+    assert isinstance(attempts, list)
+    attempt = next(row for row in attempts if row["d2_run_id"] == run_id)
+    attempt["accounting_date"] = date
+    attempt["accounted_credit_cost"] = cost
+    return {"d2_run_id": run_id}
 
 
 @pytest.mark.asyncio

@@ -1095,6 +1095,12 @@ class D2DailyCreditLedger:
                 raise PhaseGError(
                     "PHASE_G_BASELINE_REQUIRED", "attempt has no durable pre-submit baseline"
                 )
+            today = datetime.now(_BANGKOK).date().isoformat()
+            if self._accounted(payload, today) >= Decimal(self.daily_budget):
+                raise PhaseGError(
+                    "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED",
+                    "Bangkok-day accounting already reaches the D2 credit ceiling",
+                )
             attempt["generate_action_count"] = 1
             attempt["submission_state"] = "GENERATE_ACTION_RECORDED"
             attempt["updated_at"] = _utc_now()
@@ -1391,6 +1397,269 @@ class D2DailyCreditLedger:
             )
             self._write(payload)
             return dict(attempt)
+
+    def close_misattributed_generation_forensic(
+        self,
+        d2_run_id: str,
+        *,
+        expected_ledger_sha256: str,
+        evidence_sha256: str,
+        implementation_commit: str,
+        evidence: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Close one historical-identity misattribution under its dedicated evidence contract."""
+        if not _SHA256_RE.fullmatch(expected_ledger_sha256):
+            raise PhaseGError("PHASE_G_LEDGER_SHA_INVALID", "expected ledger SHA-256 is invalid")
+        if not _SHA256_RE.fullmatch(evidence_sha256):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_HASH_INVALID", "evidence SHA-256 is invalid"
+            )
+        if not re.fullmatch(r"[0-9a-f]{40,64}", implementation_commit):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_COMMIT_INVALID", "implementation commit SHA is invalid"
+            )
+
+        from .phase_g_forensic_misattribution_closure import (
+            forensic_misattribution_evidence_digest,
+            validate_forensic_misattribution_evidence,
+        )
+
+        summary = validate_forensic_misattribution_evidence(evidence)
+        if summary["D2_RUN_ID"] != d2_run_id:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INVALID", "evidence belongs to a different D2 run"
+            )
+        if summary["CANONICAL_LEDGER_SHA256"] != expected_ledger_sha256:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INVALID", "evidence names a different ledger SHA"
+            )
+        if summary["IMPLEMENTATION_COMMIT"] != implementation_commit:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INVALID", "evidence names a different implementation"
+            )
+        if forensic_misattribution_evidence_digest(summary) != evidence_sha256:
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_HASH_MISMATCH",
+                "evidence SHA differs from canonical evidence content",
+            )
+
+        with self._locked_file():
+            if self.path.is_symlink() or not self.path.is_file():
+                raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "D2 ledger is missing or unsafe")
+            if sha256_file(self.path) != expected_ledger_sha256:
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CHANGED", "D2 ledger changed since operator review"
+                )
+            payload = self._read()
+            matches = [
+                row
+                for row in cast(list[dict[str, object]], payload["attempts"])
+                if row.get("d2_run_id") == d2_run_id
+            ]
+            if len(matches) != 1:
+                raise PhaseGError("PHASE_G_ATTEMPT_NOT_UNIQUE", "D2 run ID must exist exactly once")
+            attempt = matches[0]
+            if (
+                attempt.get("submission_state") != "GENERATION_SUCCEEDED"
+                or attempt.get("terminal_state") is not None
+            ):
+                raise PhaseGError(
+                    "PHASE_G_FORENSIC_STATE_MISMATCH",
+                    "misattribution closure requires nonterminal GENERATION_SUCCEEDED",
+                )
+            self.validate_misattributed_attempt(self.root.parent, payload, attempt, summary)
+            attempt.update(
+                submission_state="FORENSICALLY_CLOSED_UNKNOWN",
+                terminal_state="FORENSICALLY_CLOSED_UNKNOWN",
+                provider_billing_outcome="UNKNOWN",
+                provider_outcome="UNKNOWN",
+                credit_outcome="UNKNOWN",
+                attribution_invalidated=True,
+                artifact_attribution_valid=False,
+                forensic_closure_contract_version="D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1",
+                forensic_classification="NO_NEW_RETRY_OUTPUT_PROVEN",
+                forensic_closed_at=summary["FORENSIC_COMPLETED_AT"],
+                forensic_reason=summary["FORENSIC_REASON"],
+                forensic_evidence_sha256=evidence_sha256,
+                forensic_implementation_commit=implementation_commit,
+                forensic_closure_evidence=summary,
+                updated_at=_utc_now(),
+            )
+            self._write(payload)
+            return dict(attempt)
+
+    @staticmethod
+    def validate_misattributed_attempt(
+        runtime_state_root: Path,
+        payload: Mapping[str, object],
+        attempt: Mapping[str, object],
+        evidence: Mapping[str, object],
+    ) -> None:
+        if (
+            attempt.get("provider_account_id") != "PVA_0001"
+            or attempt.get("provider_project_id") != "34e60953-e534-46e9-ac65-993893e61065"
+            or evidence.get("PROVIDER_ACCOUNT_ID") != attempt.get("provider_account_id")
+            or evidence.get("PROVIDER_PROJECT_ID") != attempt.get("provider_project_id")
+        ):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_IDENTITY_MISMATCH",
+                "attempt is not the exact TEST account/project",
+            )
+        approval_count = attempt.get("approval_action_count", 0)
+        generate_count = attempt.get("generate_action_count")
+        if (
+            isinstance(generate_count, bool)
+            or generate_count != 1
+            or isinstance(approval_count, bool)
+            or not isinstance(approval_count, int)
+            or approval_count > 1
+            or evidence.get("GENERATE_ACTION_COUNT") != 1
+            or evidence.get("APPROVAL_ACTION_COUNT") != approval_count
+        ):
+            raise PhaseGError(
+                "PHASE_G_GENERATE_COUNT_MISMATCH", "misattribution evidence action counts differ"
+            )
+        authorization_value = attempt.get("retry_authorization")
+        if not isinstance(authorization_value, dict):
+            raise PhaseGError(
+                "PHASE_G_RETRY_AUTHORIZATION_INVALID",
+                "exact consumed retry authorization is required",
+            )
+        authorization = cast(dict[str, object], authorization_value)
+        if (
+            authorization.get("contract_version") != 1
+            or authorization.get("predecessor_d2_run_id") != "D2_2aebc5af59bd423b"
+            or authorization.get("expected_terminal_state") != "UNEXPECTED_MULTI_OUTPUT"
+            or not isinstance(authorization.get("consumed_at"), str)
+            or not authorization.get("consumed_at")
+            or evidence.get("RETRY_AUTHORIZATION_PRESENT") is not True
+            or evidence.get("RETRY_PREDECESSOR") != authorization.get("predecessor_d2_run_id")
+        ):
+            raise PhaseGError(
+                "PHASE_G_RETRY_AUTHORIZATION_INVALID",
+                "exact consumed retry authorization is required",
+            )
+        attempt_rows = cast(list[dict[str, object]], payload["attempts"])
+        predecessor_rows = [
+            row
+            for row in attempt_rows
+            if row.get("d2_run_id") == authorization.get("predecessor_d2_run_id")
+        ]
+        current_indexes = [
+            index
+            for index, row in enumerate(attempt_rows)
+            if row.get("d2_run_id") == attempt.get("d2_run_id")
+        ]
+        if len(current_indexes) != 1 or len(predecessor_rows) != 1:
+            raise PhaseGError(
+                "PHASE_G_RETRY_PREDECESSOR_MISMATCH",
+                "retry and predecessor IDs must each exist exactly once",
+            )
+        predecessor = predecessor_rows[0]
+        if attempt_rows.index(predecessor) >= current_indexes[0]:
+            raise PhaseGError(
+                "PHASE_G_RETRY_PREDECESSOR_MISMATCH",
+                "retry predecessor must be an earlier ledger attempt",
+            )
+        if (
+            predecessor.get("provider_project_id") != attempt.get("provider_project_id")
+            or predecessor.get("submission_state") != "UNEXPECTED_MULTI_OUTPUT"
+            or predecessor.get("terminal_state") != "UNEXPECTED_MULTI_OUTPUT"
+        ):
+            raise PhaseGError(
+                "PHASE_G_RETRY_PREDECESSOR_MISMATCH",
+                "retry predecessor is not the exact same-project failure",
+            )
+        prior_rows = [
+            row
+            for row in attempt_rows[: current_indexes[0]]
+            if row.get("provider_project_id") == attempt.get("provider_project_id")
+        ]
+        execution_ids = {
+            row.get("provider_execution_id")
+            for row in prior_rows
+            if isinstance(row.get("provider_execution_id"), str)
+        }
+        media_ids: set[str] = set()
+        for row in prior_rows:
+            prior_media_id = row.get("provider_media_id")
+            if isinstance(prior_media_id, str):
+                media_ids.add(prior_media_id)
+            prior_media_ids_value = row.get("provider_media_ids", [])
+            if not isinstance(prior_media_ids_value, list) or any(
+                not isinstance(identity, str)
+                for identity in cast(list[object], prior_media_ids_value)
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_INVALID", "historical provider media identities are invalid"
+                )
+            media_ids.update(cast(list[str], prior_media_ids_value))
+        recorded_execution = attempt.get("provider_execution_id")
+        recorded_media = attempt.get("provider_media_id")
+        recorded_media_ids_value = attempt.get("provider_media_ids", [])
+        if not isinstance(recorded_media_ids_value, list) or any(
+            not isinstance(identity, str)
+            for identity in cast(list[object], recorded_media_ids_value)
+        ):
+            raise PhaseGError(
+                "PHASE_G_LEDGER_INVALID", "recorded provider media identities are invalid"
+            )
+        recorded_media_ids = cast(list[str], recorded_media_ids_value)
+        if (
+            not isinstance(recorded_execution, str)
+            or recorded_execution not in execution_ids
+            or not isinstance(recorded_media, str)
+            or recorded_media not in media_ids
+            or not recorded_media_ids
+            or any(identity not in media_ids for identity in recorded_media_ids)
+            or evidence.get("RECORDED_PROVIDER_MEDIA_IDS") != recorded_media_ids
+            or evidence.get("RECORDED_PROVIDER_EXECUTION_ID") != recorded_execution
+            or evidence.get("RECORDED_PROVIDER_MEDIA_ID") != recorded_media
+            or evidence.get("RECORDED_PROVIDER_IDS_HISTORICAL") is not True
+            or evidence.get("HISTORICAL_EXECUTION_MATCH") is not True
+            or evidence.get("HISTORICAL_MEDIA_MATCH") is not True
+            or attempt.get("provider_outcome", "UNKNOWN") != "UNKNOWN"
+            or attempt.get("credit_outcome", "UNKNOWN") != "UNKNOWN"
+            or attempt.get("provider_billing_outcome") != "UNKNOWN"
+            or evidence.get("ACCOUNTED_CREDIT_COST_EXPECTED")
+            != attempt.get("accounted_credit_cost")
+            or evidence.get("ACCOUNTING_DATE_EXPECTED") != attempt.get("accounting_date")
+        ):
+            raise PhaseGError(
+                "PHASE_G_PROVIDER_OUTCOME_PRESENT", "recorded identities are not proven historical"
+            )
+        if (
+            evidence.get("CANDIDATE_NEW_EXECUTION_COUNT") != 0
+            or evidence.get("CANDIDATE_NEW_MEDIA_COUNT") != 0
+            or evidence.get("POST_BASELINE_NEW_MEDIA_ASSOCIATION") is not False
+            or evidence.get("ATTRIBUTION_CLASSIFICATION") != "NO_NEW_RETRY_OUTPUT_PROVEN"
+            or evidence.get("REMOTE_UPLOAD_OCCURRED") is not False
+            or evidence.get("REMOTE_VERIFIED") is not False
+            or attempt.get("remote_verified") is True
+            or attempt.get("remote_file_id") is not None
+            or attempt.get("submission_state") == "D2_SUCCEEDED"
+        ):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_EVIDENCE_INCOMPLETE",
+                "new output or verified remote artifact prevents misattribution closure",
+            )
+        journal = AgentSettingsRecoveryJournal(
+            runtime_state_root,
+            str(attempt.get("provider_account_id")),
+            str(attempt.get("provider_project_id")),
+        )
+        try:
+            record = journal.read()
+        except RecoveryJournalError as exc:
+            raise PhaseGError(
+                "PHASE_G_RECOVERY_JOURNAL_UNCLEAN", "recovery journal is invalid or unreadable"
+            ) from exc
+        if (
+            record is None
+            or record.state != "CLEAN"
+            or evidence.get("RECOVERY_JOURNAL_CLEAN") is not True
+        ):
+            raise PhaseGError("PHASE_G_RECOVERY_JOURNAL_UNCLEAN", "recovery journal must be CLEAN")
 
     def record_state(
         self,
@@ -2007,7 +2276,9 @@ class D2DailyCreditLedger:
                     "PHASE_G_LEDGER_INVALID", "stored Generate action count is invalid"
                 )
             if generate_count > 0:
-                if previous is retry_predecessor:
+                if previous is retry_predecessor or self._misattribution_retry_chain_closed(
+                    previous, attempts
+                ):
                     continue
                 raise PhaseGError(
                     "PHASE_G_PAID_ATTEMPT_ALREADY_STARTED",
@@ -2025,6 +2296,67 @@ class D2DailyCreditLedger:
             }
         attempts.append(attempt)
         return dict(attempt)
+
+    @staticmethod
+    def _misattribution_retry_chain_closed(
+        predecessor: Mapping[str, object], attempts: Sequence[Mapping[str, object]]
+    ) -> bool:
+        """Allow only the exact paid predecessor consumed by a validated closure chain."""
+        predecessor_id = predecessor.get("d2_run_id")
+        if predecessor.get("submission_state") != "UNEXPECTED_MULTI_OUTPUT":
+            return False
+        predecessor_indexes = [
+            index for index, row in enumerate(attempts) if row.get("d2_run_id") == predecessor_id
+        ]
+        if len(predecessor_indexes) != 1:
+            return False
+        for retry_index, retry in enumerate(attempts):
+            if retry_index <= predecessor_indexes[0]:
+                continue
+            authorization_value = retry.get("retry_authorization")
+            if not isinstance(authorization_value, dict):
+                continue
+            authorization = cast(dict[str, object], authorization_value)
+            if (
+                authorization.get("contract_version") != 1
+                or authorization.get("predecessor_d2_run_id") != predecessor_id
+                or authorization.get("expected_terminal_state") != "UNEXPECTED_MULTI_OUTPUT"
+                or not isinstance(authorization.get("consumed_at"), str)
+                or retry.get("generate_action_count") != 1
+                or retry.get("approval_action_count") != 0
+                or retry.get("provider_project_id") != predecessor.get("provider_project_id")
+                or retry.get("submission_state") != "FORENSICALLY_CLOSED_UNKNOWN"
+                or retry.get("terminal_state") != "FORENSICALLY_CLOSED_UNKNOWN"
+                or retry.get("attribution_invalidated") is not True
+                or retry.get("artifact_attribution_valid") is not False
+                or retry.get("forensic_closure_contract_version")
+                != "D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1"
+                or retry.get("forensic_classification") != "NO_NEW_RETRY_OUTPUT_PROVEN"
+            ):
+                continue
+            evidence = retry.get("forensic_closure_evidence")
+            evidence_sha = retry.get("forensic_evidence_sha256")
+            if not isinstance(evidence, dict) or not isinstance(evidence_sha, str):
+                continue
+            evidence = cast(dict[str, object], evidence)
+            try:
+                from .phase_g_forensic_misattribution_closure import (
+                    forensic_misattribution_evidence_digest,
+                )
+
+                if (
+                    evidence.get("D2_RUN_ID") == retry.get("d2_run_id")
+                    and evidence.get("RETRY_PREDECESSOR") == predecessor_id
+                    and evidence.get("IMPLEMENTATION_COMMIT")
+                    == retry.get("forensic_implementation_commit")
+                    and predecessor.get("terminal_state") == "UNEXPECTED_MULTI_OUTPUT"
+                    and predecessor.get("generate_action_count") == 1
+                    and forensic_misattribution_evidence_digest(evidence) == evidence_sha
+                ):
+                    return True
+            except PhaseGError:
+                continue
+        return False
 
     def _validate_retry_authorization(
         self,

@@ -173,6 +173,24 @@ be reconstructed afterward. V2 closure preserves the existing reservation and
 unknown provider, credit, and billing outcomes, remains non-retryable for the
 same run ID, and never releases D6.
 
+### Versioned forensic closure for historical provider-ID misattribution
+
+The separate [`D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1` contract](../operations/D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1.md)
+handles one exact retry recorded as `GENERATION_SUCCEEDED` when its provider
+IDs are independently found in an earlier same-project attempt and complete
+structured enumeration proves no new retry output. The SHA-guarded operator
+invalidates attribution while keeping provider, credit, and billing outcomes
+unknown. It preserves historical credits, IDs, and local artifact metadata.
+It requires a nonterminal `GENERATION_SUCCEEDED` row and does not weaken the
+unknown-state V1/V2 contracts or make any attempt D6-eligible.
+
+Only the exact `UNEXPECTED_MULTI_OUTPUT` predecessor named by the consumed
+authorization of a digest-verified, forensically closed misattribution retry
+may be skipped by future D2 creation. Other paid attempts and the global WAF,
+D2 success, unresolved, and artifact-recovery stops remain in force. The
+ledger checks the current Bangkok-day 50-credit ceiling again when it records
+the Generate action, before the UI click.
+
 ### D6 release prerequisite
 
 Every D6 request must name one exact `prerequisite_d2_run_id`. The centralized

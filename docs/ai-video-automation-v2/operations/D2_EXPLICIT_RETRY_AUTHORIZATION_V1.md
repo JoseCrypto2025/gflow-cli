@@ -20,9 +20,19 @@ current Bangkok-day accounted amount must be below 50 credits at row creation;
 the existing approval gate still checks the new quote against the same 50-credit
 ceiling, including all retained historical accounting.
 
+The durable Generate-action recorder checks the locked current-day accounted
+total once more immediately before the UI click. At or above 50 credits, the
+action count remains zero and the UI click is not reached. A later Bangkok
+accounting date evaluates independently; historical reservations retain their
+original dates.
+
 Normal `create_attempt()` remains deny-by-default after a paid terminal
 attempt, except where a separate forensic-closure contract already permits a
-distinct run. The retry authorization is consumed atomically with creation of
+distinct run. The narrow misattribution-closure exception can consume only the
+exact predecessor named by its closed, digest-verified retry descendant; it
+does not authorize a second retry. See
+[`D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1.md`](D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1.md).
+The retry authorization is consumed atomically with creation of
 the new `PREPARED` row under the ledger lock. The new row stores the contract
 version, predecessor ID, expected state, and consumption timestamp. The prior
 row is not edited. A consumed marker prevents reuse of the authorization or a
