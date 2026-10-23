@@ -60,9 +60,9 @@ gflow auth renew [--profile NAME | --all] [--json]        # headless cookie refr
 gflow auth                                                # bare: list profiles or trigger first login
 gflow auth logout                                         # delete a saved session
 
-# Veo video-credit balance (read-only; image models use separate daily quotas)
+# Veo video-credit balance (passive browser read; spends no credits; image models use separate daily quotas)
 gflow credits user [--profile NAME] [--refresh] [--json]
-gflow credits list [--refresh] [--json]                   # all saved profiles; --refresh renews expired sessions
+gflow credits list [--refresh] [--json]                   # opens saved profiles sequentially; --refresh renews expired sessions
 
 # Image generation (Imagen / Nano Banana)
 gflow image upload <path>                                 # → asset UUID + dimensions

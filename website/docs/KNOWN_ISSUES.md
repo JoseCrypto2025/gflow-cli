@@ -130,7 +130,8 @@ is a per-account setting the labs.google app applies on every load (measured
 once the account is flagged, re-running will not land the old frontend. Earlier text here said the rollout
 "flaps" and told you to retry; that observation straddled the account's one-time
 switch and is withdrawn. The REST surface (`gflow project list`, `gflow data …`)
-is unaffected; `gflow credits` is **not** — its token comes from `labs.google`, which mints none for a moved account ([#795](https://github.com/ffroliva/gflow-cli/issues/795), open; see the quota entry below). Automated callers now receive `retryable: false` so retry loops
+is unaffected; the former `gflow credits` reader also depended on the labs token route, now
+replaced by the migrated app's own balance response ([#795](https://github.com/ffroliva/gflow-cli/issues/795); see the resolved quota entry below). Automated callers now receive `retryable: false` so retry loops
 stop instead of burning a doomed attempt each time.
 
 **What gflow does today for the rest of the matrix:** recognises the migrated
@@ -869,42 +870,21 @@ A block that survives dismissal now aborts pre-submit with exit 23 (probe `overl
 
 ---
 
-### No in-CLI quota visibility — resolved on labs, still open on the migrated host
+### No in-CLI quota visibility — resolved on the migrated host
 
-- **Status:** Resolved 2026-09-05 for `labs.google` accounts · **Open** on accounts Google has migrated to `flow.google.com` · **Tracked:** [#795](https://github.com/ffroliva/gflow-cli/issues/795)
+- **Status:** Resolved 2026-10-23 · **Tracked:** [#795](https://github.com/ffroliva/gflow-cli/issues/795)
 
-Use `gflow credits user` for the selected profile or `gflow credits list` for all saved
-profiles. Both commands query Flow's current read-only credits endpoint with the saved browser
-session; `--json` provides a stable automation contract. The equivalent MCP surface is
-`gflow_get_credits`. The reported balance funds Veo video generation; image generation consumes
-separate per-model daily quotas.
+`gflow credits user`, `gflow credits list`, and MCP `gflow_get_credits` read the balance from
+the migrated app's own `nzlxg` response during a normal `flow.google.com` page load. The read is
+passive, spends no credits, and keeps the existing JSON fields; tier fields not supplied by the
+app remain `null`. Each profile is opened in its browser sequentially. `--refresh` remains an
+opt-in renewal only after a signed-out/auth-expired diagnosis. The credits browser context
+disables raw HAR capture because it can persist authenticated response data. Generation behavior is
+unaffected.
 
-**On accounts served from `flow.google.com` there is still no in-CLI quota visibility.** The
-credits endpoint is reached with a token minted by `labs.google`, and the move takes that
-away in **two stages**, so `gflow credits user` / `list` and `gflow_get_credits` fail in one
-of two ways:
-
-- labs answers `200` with no `access_token` — it never mints one → *"the labs.google session
-  returned no access token"*.
-- labs still mints one and **aisandbox-pa rejects it** → *"credits endpoint returned 401"*.
-  An account can move into either with no other visible change.
-
-Since v0.74.0 both name the real cause. Through 0.73.1 the first was reported as "aisandbox-pa
-authentication failed … SAPISID cookie missing, expired, or unreadable", and through 0.73.2
-the second still was — which sent migrated users into a re-login loop that cannot terminate:
-aisandbox-pa had either not been contacted or had answered, and SAPISID was present and fine.
-On a profile with no browser-strategy marker that advice is worse than useless, since a failed
-*first* login rolls the marker back ([#791](https://github.com/ffroliva/gflow-cli/issues/791)).
-
-v0.74.0 corrected the two `gflow credits` sites; the same wording survived on **every other
-aisandbox route** — `createScene`, `commitWorkflow`, `createEntity`, `projectInitialData`,
-`upsampleImage` and the rest — because they inherited the class default instead of passing a
-hint. Fixed in v0.79.0 ([#803](https://github.com/ffroliva/gflow-cli/issues/803)): each of the
-three remaining raise sites now states what was actually rejected, the 401 site names the route
-that refused, and the class default no longer asserts a SAPISID failure at all.
-
-Reading a balance on the migrated host is **not** implemented
-([#795](https://github.com/ffroliva/gflow-cli/issues/795), open). Generation is unaffected.
+The former labs token route returned HTTP 410 or no token on migrated accounts. It is no longer
+used by the CLI/MCP credits service. Historical diagnosis and auth-remediation details remain in
+the commit history; #795's migrated balance-read gap is resolved here.
 
 ---
 

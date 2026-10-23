@@ -106,7 +106,7 @@ def test_credits_requires_an_explicit_subcommand() -> None:
     result = CliRunner().invoke(main, ["credits"])
 
     assert result.exit_code == 2
-    assert "Show current Google Flow credit balances." in result.output
+    assert "Read current Google Flow balances in the selected profile browser." in result.output
     assert "list" in result.output
     assert "user" in result.output
 

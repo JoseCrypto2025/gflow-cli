@@ -54,7 +54,7 @@ uv tool run --from gflow-cli playwright install chromium     # one-time, ~150 MB
 # 2 · Authenticate (one-time, opens a real Chrome window)
 gflow auth login --browser chrome
 
-# Check the current balance (or use `credits list` for every saved profile)
+# Read the current balance from Flow (or use `credits list` to open every saved profile)
 gflow credits user
 
 # 3 · Generate

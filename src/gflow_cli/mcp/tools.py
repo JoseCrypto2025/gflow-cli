@@ -1279,8 +1279,9 @@ async def gflow_list_tools() -> dict[str, Any]:
 @server.tool(
     name="gflow_get_credits",
     description=(
-        "Read the current Google Flow credit balance for one saved profile or all profiles. "
-        "Spends no credits. Set all_profiles=true when choosing an "
+        "Read the current Google Flow credit balance from the app's normal page load for one "
+        "saved profile or all profiles. Opens the selected profile browser and spends no credits. "
+        "Set all_profiles=true when choosing an "
         "account for generation; partial profile failures remain visible in the result. "
         "Set refresh=true to renew an expired session (rewrites that profile's saved "
         "cookies) in a headless browser and ask again "
@@ -1294,7 +1295,7 @@ async def gflow_get_credits(
     all_profiles: bool = False,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Inspect current Flow credits through the shared CLI service."""
+    """Inspect current Flow credits through the shared browser-backed CLI service."""
 
     if all_profiles:
         return await inspect_all_credit_profiles(refresh=refresh)

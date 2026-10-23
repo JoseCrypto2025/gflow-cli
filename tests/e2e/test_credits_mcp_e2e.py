@@ -1,6 +1,6 @@
 """Live proof that the MCP credits twin works against real Flow.
 
-`tests/e2e/test_credits_e2e.py` proves the CLI-side HTTP fast path. This proves the
+`tests/e2e/test_credits_on_flow_bdd.py` proves the CLI-side browser read. This proves the
 *other* surface: `gflow_get_credits`, the tool an agent actually calls. The two share
 `services/credits.py`, so the delta under test here is the MCP adapter — profile
 resolution and validation, the `all_profiles` branch, and the shape of the dict that
@@ -50,8 +50,8 @@ async def test_mcp_get_credits_returns_a_real_balance_for_one_profile(
     assert result.get("status") == "ok", f"MCP credits call failed: {result}"
     assert result["authenticated"] is True
     assert result["profile"] == profile
-    # The balance is a real reading, not a coerced default: CreditsInfo.from_response
-    # fails closed rather than turning a malformed value into zero.
+    # The balance is a real reading, not a coerced default: the nzlxg decoder fails
+    # closed rather than turning a malformed value into zero.
     assert isinstance(result["credits"], int)
     assert result["credits"] >= 0
     # The contract an agent codes against — a missing key is a silent breakage for it.
@@ -102,45 +102,3 @@ async def test_mcp_get_credits_rejects_an_unknown_profile_without_raising(
 
     assert isinstance(result, dict)
     assert result.get("status") != "ok"
-
-
-async def test_mcp_credits_never_sends_a_live_profile_to_re_login(
-    e2e_profile_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#795 on the MCP surface — the twin of the CLI test in `test_credits_e2e.py`.
-
-    The twin is a separate door, and the adapter is the part that was never the
-    shared service: `_guarded` turns the raised `GFlowError` into the envelope an
-    agent reads, so this asserts the honest remediation actually SURVIVES that
-    translation rather than assuming it does. An agent cannot read a `--help` it
-    was never given; if the envelope said "re-run `gflow auth login`" it would do
-    exactly that, and on a migrated account that rolls the profile marker back.
-
-    Cohort-agnostic like its CLI twin: a served balance is equally correct.
-    """
-    from gflow_cli.auth import cookies
-    from gflow_cli.mcp import tools
-    from gflow_cli.services import credits as credits_service
-
-    def reject_browser(*args: object, **kwargs: object) -> None:
-        pytest.fail("credits launched a browser to re-derive an answer it already had")
-
-    # Both doors, as in the CLI twin: the service-level fallback, and the cookie
-    # reader's own PermissionError-gated Playwright fallback inside the fast path.
-    monkeypatch.setattr(credits_service, "FlowApiClient", reject_browser)
-    monkeypatch.setattr(cookies, "_get_chrome_cookies_playwright", reject_browser)
-
-    profile = e2e_profile_dir.name.removeprefix("profile_")
-    result: dict[str, Any] = await tools.gflow_get_credits(profile=profile)
-
-    if result.get("status") == "ok":
-        assert result["authenticated"] is True
-        assert result["credits"] >= 0
-        pytest.skip("labs cohort — the #795 honest-failure branch was not exercised")
-
-    hint = str(result.get("error", {}).get("remediation_hint", ""))
-    assert hint, f"the MCP envelope dropped the remediation entirely: {result}"
-    assert "SAPISID" not in hint, f"blames SAPISID for a credential that is fine: {hint}"
-    assert "auth login" not in hint, f"prescribes a re-login that cannot help: {hint}"
-    assert "flow.google.com" in hint, f"does not name the cohort: {hint}"

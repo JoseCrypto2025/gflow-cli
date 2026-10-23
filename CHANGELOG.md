@@ -69,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`gflow credits` reads the migrated app's balance response.** The CLI and MCP passively
+  observe Flow's `nzlxg` reply during a normal browser page load; the retired labs token route
+  is no longer used by the credits service. The existing result fields remain, with unknown
+  tier fields set to `null`. The credits browser context disables raw HAR capture to avoid
+  persisting authenticated response data.
+
 - **Phase G tolerates late or optional confirmation and reconciles the same unknown D2 attempt.**
   The submit path observes for a bounded window instead of failing after a mandatory 30-second
   gate wait. A SHA-guarded recovery records one exact late quote, preserves the prior conservative

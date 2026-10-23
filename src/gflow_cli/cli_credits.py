@@ -68,7 +68,7 @@ _REFRESH_HELP = (
 
 @click.group()
 def credits() -> None:
-    """Show current Google Flow credit balances."""
+    """Read current Google Flow balances in the selected profile browser."""
 
 
 @credits.command("user")
@@ -76,7 +76,7 @@ def credits() -> None:
 @click.option("--refresh", is_flag=True, help=_REFRESH_HELP)
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON output.")
 def user(profile: str | None, refresh: bool, as_json: bool) -> None:
-    """Show the credit balance for one profile."""
+    """Read one profile's balance from Flow's normal app page load."""
 
     selected = _resolve_profile(profile)
     _make_provider_dir(selected)
@@ -89,7 +89,7 @@ def user(profile: str | None, refresh: bool, as_json: bool) -> None:
 @click.option("--refresh", is_flag=True, help=_REFRESH_HELP)
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON output.")
 def list_command(refresh: bool, as_json: bool) -> None:
-    """Show credit balances for all saved profiles."""
+    """Read balances for saved profiles, opening each profile browser in turn."""
 
     run_with_handlers(
         lambda: _show_all(as_json, refresh), cli_command="credits list", as_json=as_json

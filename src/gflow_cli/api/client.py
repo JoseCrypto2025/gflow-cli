@@ -381,6 +381,7 @@ class FlowApiClient:
         *,
         headless: bool = False,
         settings: Settings | None = None,
+        har_capture: bool = True,
         transport: FlowTransportStrategy | str | None = None,
         out_dir: Path | None = None,
     ) -> None:
@@ -395,6 +396,7 @@ class FlowApiClient:
         # construction time, which is fine for production but lets tests
         # opt out by supplying a fully built settings object.
         self.settings = settings if settings is not None else Settings()
+        self._har_capture_enabled = har_capture
         # Transport lifecycle ownership (spec § 4.3):
         # - pre-initialized instance → caller owns (no setup/teardown invoked)
         # - str/None → client owns (resolves via make_transport, calls setup/teardown)
@@ -534,7 +536,7 @@ class FlowApiClient:
                 *window_position_args(self.settings.browser_window_position),
             ],
         }
-        if self.settings.har_path is not None:
+        if self._har_capture_enabled and self.settings.har_path is not None:
             self.settings.har_path.parent.mkdir(parents=True, exist_ok=True)
             kwargs["record_har_path"] = str(self.settings.har_path)
             logger.warning(
@@ -1902,23 +1904,14 @@ class FlowApiClient:
         return refused
 
     async def get_credits(self) -> CreditsInfo:
-        """Return the authenticated profile's current Flow credit balance."""
+        """Return the balance Flow's migrated app reports on a normal page load."""
+        from gflow_cli.api.transports import migrated_composer  # noqa: PLC0415
 
-        data = await self._get_json(routes.CREDITS, route_name="credits")
-        if not isinstance(data, dict):
-            raise WireFormatError(
-                detail="unexpected credits response shape: expected an object",
-                instance=_make_instance(),
-                route="credits",
-            )
+        page = await self._checkout_page()
         try:
-            return CreditsInfo.from_response(cast("JsonObject", data))
-        except ValueError as exc:
-            raise WireFormatError(
-                detail=str(exc),
-                instance=_make_instance(),
-                route="credits",
-            ) from exc
+            return await migrated_composer.read_credits(page)
+        finally:
+            self._checkin_page(page)
 
     async def rename_project(self, project_id: str, new_title: str) -> JsonObject:
         """Rename an existing Flow project.

@@ -123,31 +123,24 @@ See [AUTHENTICATION § Commands](AUTHENTICATION.md#commands).
 
 ## `gflow credits`
 
-Read the current Google Flow balance through an existing authenticated profile. This is a
-read-only request: it does not generate media or spend credits. The displayed balance funds Veo
-video generation; image generation uses separate per-model daily quotas.
-
-> **Unavailable on an account whose labs session issues no token.** The balance comes from a
-> `labs.google` endpoint. On some accounts the labs session answers `200` with no access token,
-> so the command fails with "the labs.google session returned no access token". The session is
-> fine, and re-authenticating will not help; generation still works. Which host Flow serves does
-> not predict this: on 2026-10-14, 7 of 10 profiles served `flow.google.com` read a balance after
-> `--refresh`. Open, tracked in [#795](https://github.com/ffroliva/gflow-cli/issues/795).
+Read the current Google Flow balance from the selected authenticated profile's normal
+`flow.google.com` app page load. This is a passive, read-only request: it does not submit or
+generate media and spends no credits. It opens the selected profile browser; `credits list`
+opens saved profiles sequentially. The balance funds Veo video generation; image generation
+uses separate per-model daily quotas.
 
 ```text
 gflow credits user [--profile NAME] [--refresh] [--json]
 gflow credits list [--refresh] [--json]
 ```
 
-`--refresh` renews an expired session instead of reporting it. When the fast path says the
-session has expired, gflow opens that profile in a headless browser, loads Flow so Google and Flow
-rotate the saved cookies (the same renewal as [`gflow auth renew`](AUTHENTICATION.md#gflow-auth-renew)),
-then asks for the balance again. That costs one Chrome launch per expired profile and no credits.
-Without `--refresh`, nothing launches. A session Google has revoked cannot be renewed, so the row
-keeps its original diagnosis. A profile another gflow process is using is recorded as
-`ProfileLockedError` and the list carries on. `--refresh` cannot help an account whose labs
-session issues no token at all (#795, above), and it does not clear Flow's public `/about` page
-(see [KNOWN_ISSUES](../KNOWN_ISSUES.md)). Both keep their original diagnosis.
+`--refresh` renews a signed-out/auth-expired session instead of reporting it. gflow opens that
+profile in a headless browser, loads Flow so Google and Flow can rotate the saved cookies (the
+same renewal as [`gflow auth renew`](AUTHENTICATION.md#gflow-auth-renew)), then reads the balance
+again. This costs one additional Chrome launch per expired profile and no credits. A session
+Google has revoked cannot be renewed, so the row keeps its original diagnosis. A profile another
+gflow process is using is recorded as `ProfileLockedError` and the list carries on. A missing
+balance RPC is reported as a Flow app/read failure and does not trigger re-login or renewal.
 
 `credits user` applies the normal profile precedence chain. `credits list` inspects every saved
 profile sequentially and returns successful balances even when another profile is expired or
@@ -155,12 +148,9 @@ unavailable. Its JSON envelope contains `profiles`, `total_credits`, and `count`
 includes `authenticated`, `credits`, `subscription_credits`, `user_paygate_tier`, `service_tier`,
 and `sku`. Failed profiles have `authenticated: false`, a safe error name, and a null balance.
 
-The command first reads the saved Chrome cookies and uses ordinary HTTP requests (the equivalent
-of a `curl` session request followed by the credits request). The cookie-bearing client is closed
-before a separate, Bearer-only client contacts the credits host, so `labs.google` cookies never
-cross that host boundary. A browser opens only when cookie decryption or the HTTP path cannot
-complete. The short-lived OAuth token remains in memory and is never printed or stored; no copied
-bearer token or browser API key is accepted.
+The command observes the `nzlxg` balance response that Flow itself loads. It does not replay the
+private RPC or persist response bodies. The credits service disables raw HAR capture for its
+browser context because HAR can save authenticated response data.
 
 ## `gflow image upload`
 

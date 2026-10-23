@@ -45,7 +45,7 @@ from uuid import uuid4
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from gflow_cli.api.dto import GeneratedImage, ProjectInfo
+from gflow_cli.api.dto import CreditsInfo, GeneratedImage, ProjectInfo
 from gflow_cli.api.image import Aspect as ImageAspect
 from gflow_cli.api.image import ImageRef
 from gflow_cli.api.image import Model as ImageModel
@@ -79,6 +79,7 @@ from gflow_cli.errors import (
     ConfigurationError,
     ContentPolicyError,
     FlowAgentUiError,
+    FlowAppError,
     FlowHostMigratedError,
     InsufficientCreditsError,
     MediaUploadRejectedError,
@@ -3620,28 +3621,70 @@ async def _wait_anchor(
 
 
 async def _rpc_reply(
-    page: Page, rpcid: str, action: Callable[[], Awaitable[None]], *, timeout_s: float
+    page: Page,
+    rpcid: str,
+    action: Callable[[], Awaitable[None]],
+    *,
+    timeout_s: float,
+    reject_rpc_errors: bool = False,
+    total_timeout_s: float | None = None,
 ) -> Any:
     """Run ``action`` and return the payload of the first ``rpcid`` frame the page gets."""
     reply: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    unreadable_bodies = 0
 
     async def on_response(response: Any) -> None:
+        nonlocal unreadable_bodies
         if reply.done() or "batchexecute" not in str(getattr(response, "url", "")):
             return
         try:
             text = await response.text()
         except Exception:  # noqa: BLE001 - an aborted body is not our frame
+            unreadable_bodies += 1
             return
+        if reject_rpc_errors:
+            for error in rpc_errors(text):
+                if error.rpcid == rpcid:
+                    status = f" with status {error.code}" if error.code is not None else ""
+                    reply.set_exception(
+                        WireFormatError(
+                            detail=f"Flow refused {rpcid}{status}.",
+                            route=f"batchexecute:{rpcid}",
+                            remediation_hint=(
+                                "Flow did not provide this read-only response. Check the "
+                                "Flow app and report the RPC refusal; no action was submitted."
+                            ),
+                        )
+                    )
+                    return
         for rid, payload in parse_frames(text):
             if rid == rpcid and not reply.done():
                 reply.set_result(payload)
 
     page.on("response", on_response)
     try:
-        await action()
         try:
-            return await asyncio.wait_for(reply, timeout=timeout_s)
+            if total_timeout_s is None:
+                await action()
+                return await asyncio.wait_for(reply, timeout=timeout_s)
+
+            async def action_and_reply() -> Any:
+                await action()
+                return await reply
+
+            return await asyncio.wait_for(action_and_reply(), timeout=total_timeout_s)
         except TimeoutError as e:
+            if unreadable_bodies:
+                raise WireFormatError(
+                    detail=(
+                        f"Flow sent {unreadable_bodies} unreadable batchexecute response body(ies)."
+                    ),
+                    route=f"batchexecute:{rpcid}",
+                    remediation_hint=(
+                        "The Flow response could not be read safely. Retry once; if it "
+                        "persists, report the RPC name without attaching response data."
+                    ),
+                ) from e
             raise TransportTimeoutError(
                 detail=(
                     f"flow.google.com did not answer {rpcid} within {timeout_s:.0f}s "
@@ -3650,6 +3693,59 @@ async def _rpc_reply(
             ) from e
     finally:
         page.remove_listener("response", on_response)
+
+
+#: The app loads this read-only balance RPC during a normal Flow page load.
+CREDITS_RPC = "nzlxg"
+
+
+async def read_credits(page: Page, *, timeout_s: float = 30.0) -> CreditsInfo:
+    """Observe Flow's own balance response during a normal page load; never click."""
+
+    deadline = asyncio.get_running_loop().time() + timeout_s
+
+    async def load() -> None:
+        remaining_s = max(0.001, deadline - asyncio.get_running_loop().time())
+        await page.goto(
+            MIGRATED_ROOT_URL,
+            wait_until="domcontentloaded",
+            timeout=max(1, int(remaining_s * 1000)),
+        )
+
+    try:
+        payload = await _rpc_reply(
+            page,
+            CREDITS_RPC,
+            load,
+            timeout_s=timeout_s,
+            reject_rpc_errors=True,
+            total_timeout_s=timeout_s,
+        )
+    except (TransportTimeoutError, TimeoutError, PlaywrightTimeoutError) as exc:
+        await raise_if_known_landing(page, requested=MIGRATED_ROOT_URL, at="migrated.credits")
+        raise FlowAppError(
+            detail=(
+                f"flow.google.com loaded ({safe_page_url(page.url)}) but did not provide "
+                f"its credit balance ({CREDITS_RPC}) within {timeout_s:.0f}s."
+            ),
+            route=f"batchexecute:{CREDITS_RPC}",
+            retryable=False,
+            remediation_hint=(
+                "The Flow app did not provide its balance during the read-only page load. "
+                "Check the balance in Flow and report the RPC name if the issue persists."
+            ),
+        ) from exc
+    try:
+        return CreditsInfo.from_nzlxg(payload)
+    except ValueError as exc:
+        raise WireFormatError(
+            detail="unexpected nzlxg reply shape: [0] must be a non-negative integer",
+            route=f"batchexecute:{CREDITS_RPC}",
+            remediation_hint=(
+                "Flow changed the shape of its balance reply. Report the RPC name only; "
+                "do not attach response data."
+            ),
+        ) from exc
 
 
 async def create_project(page: Page, title: str, *, timeout_s: float = 30.0) -> ProjectInfo:

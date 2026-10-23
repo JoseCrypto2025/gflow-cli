@@ -270,7 +270,7 @@ weeks therefore drifts towards an expired session even though nothing about the 
 `auth renew` opens the profile in a hidden browser and loads Flow. It then loads
 `labs.google/fx/` and waits up to 20 s for the labs app to sign in again on its own: a stale labs
 session reports `ACCESS_TOKEN_REFRESH_NEEDED`, and the page renews it through Google without a
-prompt. This step matters because `gflow credits` reads its token from that labs session, and the
+prompt. This step matters because the legacy API transport reads its token from that labs session, and the
 Flow visit alone never refreshes it. The browser saves whatever cookies were rotated, and the
 result is verified exactly like `gflow auth status`. It spends no credits.
 

@@ -47,13 +47,27 @@ GenerationCheckpointObserver = Callable[[GenerationCheckpoint], None]
 
 @dataclass(frozen=True)
 class CreditsInfo:
-    """Current Flow balance and account tier returned by ``GET /v1/credits``."""
+    """Current Flow balance and optional account details.
+
+    The migrated Flow app's balance reply does not identify its account tier, so
+    the existing optional fields remain ``None`` for that source.
+    """
 
     credits: int
     subscription_credits: int | None = None
     user_paygate_tier: str | None = None
     service_tier: str | None = None
     sku: str | None = None
+
+    @classmethod
+    def from_nzlxg(cls, payload: object) -> CreditsInfo:
+        """Parse the balance at index zero without coercing malformed data."""
+        items = cast("list[object]", payload) if isinstance(payload, list) else []
+        value = items[0] if items else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            msg = "unexpected nzlxg reply shape: [0] must be a non-negative integer"
+            raise ValueError(msg)
+        return cls(credits=value)
 
     @classmethod
     def from_response(cls, data: dict[str, Any]) -> CreditsInfo:

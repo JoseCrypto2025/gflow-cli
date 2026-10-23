@@ -9,12 +9,10 @@ import structlog
 
 from gflow_cli import profile_store
 from gflow_cli.api.client import FlowApiClient
-from gflow_cli.api.credits import fetch_credits_http
 from gflow_cli.api.dto import CreditsInfo
 from gflow_cli.auth.renew import renew_profile
 from gflow_cli.config import get_settings
 from gflow_cli.errors import (
-    AisandboxAuthError,
     AuthExpiredError,
     GFlowError,
     ProfileEngineDowngradeError,
@@ -49,67 +47,18 @@ def _success(meta: profile_store.ProfileMeta, info: CreditsInfo) -> dict[str, An
     }
 
 
-def _log_fallback(meta: profile_store.ProfileMeta, exc: Exception) -> None:
-    # Log only the class and profile label. Exception messages can include
-    # upstream response material and are intentionally excluded.
-    error_metadata: dict[str, object] = {}
-    if isinstance(exc, GFlowError):
-        error_metadata = {"status_code": exc.status, "route": exc.route}
-    log.info(
-        "credits.http_fallback_to_browser",
-        profile=meta.name,
-        error_type=type(exc).__name__,
-        **error_metadata,
-    )
-
-
 async def _fetch_once(meta: profile_store.ProfileMeta) -> dict[str, Any]:
-    # #795. The browser fallback is for TRANSPORT failures. When it also catches a
-    # verdict the server already gave, it re-derives that verdict with less information
-    # and throws the better diagnosis away: it fails inside the SHARED aisandbox retry
-    # helper (`api/client.py::_run_with_aisandbox_retry`), which is route-blind and so
-    # carries the class-default "SAPISID missing, re-run `gflow auth login`" — advice
-    # that cannot work on a migrated account and can roll its strategy marker back.
-    verdict: AisandboxAuthError | None = None
-    try:
-        return _success(meta, await fetch_credits_http(meta.profile_dir))
-    except SecurityError:
-        raise
-    except AisandboxAuthError as exc:
-        if exc.route == "credits":
-            # aisandbox-pa ANSWERED. The browser cannot overturn that: it asks the same
-            # labs session endpoint for the same Bearer (`client.py::_fetch_access_token`)
-            # and sends it to the same route. Measured on a migrated profile — it spent
-            # ~7 s launching Chrome to collect the identical 401.
-            raise
-        # The other site — labs answering 200 with no token — is NOT proven unreachable
-        # by the browser, and must not be assumed so: httpx sends labs.google cookies
-        # only (`auth/cookies.py`, flow_only=True), while the browser carries the full
-        # jar and bootstraps a real navigation, which can renew a NextAuth session httpx
-        # cannot. Keep the fallback; just don't let the route-blind default overwrite
-        # this verdict if the browser fails too.
-        verdict = exc
-        _log_fallback(meta, exc)
-    except Exception as exc:  # noqa: BLE001 — browser fallback is the recovery boundary
-        _log_fallback(meta, exc)
-
-    try:
-        async with FlowApiClient(
-            profile_dir=meta.profile_dir,
-            headless=get_settings().headless,
-        ) as client:
-            return _success(meta, await client.get_credits())
-    except AisandboxAuthError:
-        if verdict is None:
-            raise
-        raise verdict from None
+    async with FlowApiClient(
+        profile_dir=meta.profile_dir,
+        headless=get_settings().headless,
+        har_capture=False,
+    ) as client:
+        return _success(meta, await client.get_credits())
 
 
 async def _fetch(meta: profile_store.ProfileMeta, *, refresh: bool = False) -> dict[str, Any]:
-    # `refresh` is not the browser fallback #795 retired. That one re-asked aisandbox-pa
-    # with the same Bearer; this one loads Flow headlessly so Google and NextAuth rotate
-    # the cookies on disk (`auth/renew.py`), and the retried fast path reads a NEW
-    # session. Opt-in, because it costs a Chrome launch per expired profile.
+    # `refresh` remains opt-in: it visits Flow headlessly to renew an expired session,
+    # then reads the balance from the app's own response again.
     try:
         return await _fetch_once(meta)
     except AuthExpiredError as exc:
@@ -122,14 +71,13 @@ async def _fetch(meta: profile_store.ProfileMeta, *, refresh: bool = False) -> d
     except (ProfileLockedError, ProfileEngineDowngradeError):
         raise  # typed and actionable on their own: "in use", "newer browser"
     except Exception as exc:  # noqa: BLE001 — a renewal that never ran changes nothing
-        # The browser could not start (the user's own Chrome holds the profile, the
-        # channel is missing). The fast path's diagnosis is still the accurate one.
+        # Renewal could not start or finish. Preserve the first read's auth diagnosis.
         log.info("credits.refresh_failed", profile=meta.name, error_type=type(exc).__name__)
         raise expired from exc
-    # `labs_unverified` still gets the re-ask: it is one self-checking HTTP call, and the
-    # Flow visit may have rotated what the fast path needs even when labs said nothing.
+    # A labs-unverified renewal still gets one read: the Flow visit may have rotated the
+    # session even when the legacy labs check could not verify it.
     if not result.renewed and result.result != "labs_unverified":
-        # Revoked, or held at Flow's /about page: the fast path's diagnosis stands.
+        # Revoked, or held at Flow's /about page: the first read's diagnosis stands.
         log.info(
             "credits.refresh_failed",
             profile=meta.name,
