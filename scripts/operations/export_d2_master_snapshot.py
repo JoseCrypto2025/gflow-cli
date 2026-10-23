@@ -54,8 +54,9 @@ def _normalize_snapshot_rows(
 ) -> tuple[GoogleSheetsSnapshot, int]:
     """Remove checkbox-only phantom rows while failing closed on real orphan data."""
     rules = _load_snapshot_row_rules(schema_dir)
-    if set(snapshot.tables) != set(rules):
-        raise GoogleSheetsReadError("snapshot table set does not match schema")
+    unknown_tables = set(snapshot.tables) - set(rules)
+    if unknown_tables:
+        raise GoogleSheetsReadError("snapshot contains table without schema")
 
     normalized_tables: dict[str, list[dict[str, object]]] = {}
     removed = 0
@@ -84,6 +85,9 @@ def _normalize_snapshot_rows(
                 )
             removed += 1
         normalized_tables[table_name] = kept_rows
+
+    if removed == 0:
+        return snapshot, 0
 
     return (
         GoogleSheetsSnapshot(
