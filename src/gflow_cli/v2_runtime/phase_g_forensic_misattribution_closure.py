@@ -22,7 +22,7 @@ from .phase_g_forensic_common import (
     verified_ledger_attempt,
 )
 
-_SCHEMA_VERSION = "D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1"
+_SCHEMA_VERSION = "D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2"
 _REASON_RE = re.compile(r"^[A-Za-z0-9 .,:;()/_-]{1,240}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REQUIRED_TRUE = (
@@ -94,7 +94,7 @@ def validate_forensic_misattribution_evidence(
         evidence.get("PROVIDER_ACCOUNT_ID") != "PVA_0001"
         or evidence.get("PROVIDER_PROJECT_ID") != "34e60953-e534-46e9-ac65-993893e61065"
         or evidence.get("CURRENT_SUBMISSION_STATE") != "GENERATION_SUCCEEDED"
-        or evidence.get("CURRENT_TERMINAL_STATE") != "NONE"
+        or evidence.get("CURRENT_TERMINAL_STATE") not in ("NONE", "GENERATION_SUCCEEDED")
         or evidence.get("GENERATE_ACTION_COUNT") != 1
         or isinstance(evidence.get("GENERATE_ACTION_COUNT"), bool)
         or evidence.get("APPROVAL_ACTION_COUNT") != 0
@@ -246,8 +246,14 @@ def forensic_misattribution_closure_preview(
         raise PhaseGError(
             "PHASE_G_FORENSIC_STATE_MISMATCH", "expected current state is GENERATION_SUCCEEDED"
         )
-    if attempt.get("terminal_state") is not None:
-        raise PhaseGError("PHASE_G_ATTEMPT_TERMINAL", "attempt must have no terminal state")
+    terminal_state = attempt.get("terminal_state")
+    if terminal_state not in (None, "GENERATION_SUCCEEDED") or evidence.get(
+        "CURRENT_TERMINAL_STATE"
+    ) != ("NONE" if terminal_state is None else terminal_state):
+        raise PhaseGError(
+            "PHASE_G_ATTEMPT_TERMINAL",
+            "attempt must have an evidence-bound nonterminal generation marker",
+        )
     if sum(row.get("d2_run_id") == "D2_2aebc5af59bd423b" for row in rows) != 1:
         raise PhaseGError(
             "PHASE_G_RETRY_PREDECESSOR_MISMATCH", "retry predecessor must exist exactly once"

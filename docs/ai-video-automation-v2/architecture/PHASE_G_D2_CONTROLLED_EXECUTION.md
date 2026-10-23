@@ -175,7 +175,7 @@ same run ID, and never releases D6.
 
 ### Versioned forensic closure for historical provider-ID misattribution
 
-The separate [`D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1` contract](../operations/D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1.md)
+The separate [`D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2` contract](../operations/D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2.md)
 handles one exact retry recorded as `GENERATION_SUCCEEDED` when its provider
 IDs are independently found in an earlier same-project attempt and complete
 structured enumeration proves no new retry output. The SHA-guarded operator

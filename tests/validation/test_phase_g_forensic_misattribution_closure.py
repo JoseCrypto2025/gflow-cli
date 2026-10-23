@@ -10,6 +10,7 @@ from test_phase_g import request_for
 
 from gflow_cli.v2_runtime.agent_recovery import AgentSettingsRecoveryJournal
 from gflow_cli.v2_runtime.phase_g import (
+    _TERMINAL_STATES,
     D2DailyCreditLedger,
     D2RetryAuthorization,
     FlowSubmissionBaseline,
@@ -33,7 +34,9 @@ _PROJECT_ID = "34e60953-e534-46e9-ac65-993893e61065"
 _COMMIT = "a" * 40
 
 
-def _attempt_fixture(tmp_path: Path) -> tuple[D2DailyCreditLedger, Path]:
+def _attempt_fixture(
+    tmp_path: Path, *, terminal_state: str | None = None
+) -> tuple[D2DailyCreditLedger, Path]:
     root = tmp_path / "runtime"
     request = request_for(tmp_path)
     ledger = D2DailyCreditLedger(root)
@@ -67,7 +70,7 @@ def _attempt_fixture(tmp_path: Path) -> tuple[D2DailyCreditLedger, Path]:
     ledger.record_state(
         _RUN_ID,
         submission_state="GENERATION_SUCCEEDED",
-        terminal_state=None,
+        terminal_state=terminal_state,
         provider_execution_id=_EXECUTION_ID,
         provider_media_id=_MEDIA_ID,
         provider_media_ids=[_MEDIA_ID],
@@ -105,7 +108,7 @@ def _set_accounting_dates(payload: dict[str, object], *run_ids: str) -> dict[str
 def _evidence(ledger: D2DailyCreditLedger, *, ledger_sha: str | None = None) -> dict[str, object]:
     retry = next(row for row in ledger.attempts() if row["d2_run_id"] == _RUN_ID)
     return {
-        "SCHEMA_VERSION": "D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1",
+        "SCHEMA_VERSION": "D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2",
         "D2_RUN_ID": _RUN_ID,
         "CANONICAL_LEDGER_SHA256": ledger_sha
         or hashlib.sha256(ledger.path.read_bytes()).hexdigest(),
@@ -113,7 +116,7 @@ def _evidence(ledger: D2DailyCreditLedger, *, ledger_sha: str | None = None) -> 
         "PROVIDER_ACCOUNT_ID": "PVA_0001",
         "PROVIDER_PROJECT_ID": _PROJECT_ID,
         "CURRENT_SUBMISSION_STATE": "GENERATION_SUCCEEDED",
-        "CURRENT_TERMINAL_STATE": "NONE",
+        "CURRENT_TERMINAL_STATE": retry["terminal_state"] or "NONE",
         "GENERATE_ACTION_COUNT": 1,
         "APPROVAL_ACTION_COUNT": 0,
         "ACCOUNTED_CREDIT_COST_EXPECTED": "40",
@@ -208,6 +211,54 @@ def test_misattribution_closure_preview_and_apply_preserve_history(tmp_path: Pat
     assert ledger.attempts()[0] == before[_PREDECESSOR]
 
 
+def test_generation_succeeded_terminal_marker_is_evidence_bound_and_closable(
+    tmp_path: Path,
+) -> None:
+    ledger, _ = _attempt_fixture(tmp_path, terminal_state="GENERATION_SUCCEEDED")
+    row = next(row for row in ledger.attempts() if row["d2_run_id"] == _RUN_ID)
+    assert row["submission_state"] == "GENERATION_SUCCEEDED"
+    assert row["terminal_state"] == "GENERATION_SUCCEEDED"
+    evidence = _evidence(ledger)
+    assert evidence["CURRENT_TERMINAL_STATE"] == "GENERATION_SUCCEEDED"
+    assert _preview(ledger, evidence)["attempt"]["terminal_state"] == "GENERATION_SUCCEEDED"
+    closed = ledger.close_misattributed_generation_forensic(
+        _RUN_ID,
+        expected_ledger_sha256=str(evidence["CANONICAL_LEDGER_SHA256"]),
+        evidence_sha256=forensic_misattribution_evidence_digest(evidence),
+        implementation_commit=_COMMIT,
+        evidence=evidence,
+    )
+    assert closed["submission_state"] == "FORENSICALLY_CLOSED_UNKNOWN"
+
+
+def test_none_terminal_marker_remains_closable_with_v2_evidence(tmp_path: Path) -> None:
+    ledger, _ = _attempt_fixture(tmp_path, terminal_state=None)
+    evidence = _evidence(ledger)
+    assert evidence["CURRENT_TERMINAL_STATE"] == "NONE"
+    assert _preview(ledger, evidence)["attempt"]["terminal_state"] is None
+
+
+@pytest.mark.parametrize("terminal_state", sorted(_TERMINAL_STATES))
+def test_misattribution_closure_rejects_every_true_terminal_state(
+    tmp_path: Path, terminal_state: str
+) -> None:
+    ledger, _ = _attempt_fixture(tmp_path)
+    ledger._mutate(lambda payload: _set_terminal_state(payload, _RUN_ID, terminal_state))
+    evidence = _evidence(ledger)
+    with pytest.raises(PhaseGError):
+        _preview(ledger, evidence)
+
+
+def _set_terminal_state(
+    payload: dict[str, object], run_id: str, terminal_state: str
+) -> dict[str, object]:
+    attempts = payload["attempts"]
+    assert isinstance(attempts, list)
+    row = next(item for item in attempts if item["d2_run_id"] == run_id)
+    row["terminal_state"] = terminal_state
+    return {"d2_run_id": run_id}
+
+
 def test_operator_rejects_wrong_ledger_sha(tmp_path: Path) -> None:
     ledger, _ = _attempt_fixture(tmp_path)
     evidence = _evidence(ledger, ledger_sha="0" * 64)
@@ -255,7 +306,6 @@ def test_operator_rejects_state_other_than_generation_succeeded(tmp_path: Path) 
         lambda item: item.update(CANDIDATE_NEW_MEDIA_COUNT=1),
         lambda item: item.update(REMOTE_VERIFIED=True),
         lambda item: item.update(GENERATE_ACTION_COUNT=2),
-        lambda item: item.update(CURRENT_TERMINAL_STATE="GENERATION_SUCCEEDED"),
     ],
 )
 def test_evidence_rejects_new_output_remote_verification_or_wrong_attempt_shape(
@@ -266,6 +316,53 @@ def test_evidence_rejects_new_output_remote_verification_or_wrong_attempt_shape(
     mutation(evidence)
     with pytest.raises(PhaseGError):
         validate_forensic_misattribution_evidence(evidence)
+
+
+def test_evidence_terminal_marker_must_match_current_ledger(tmp_path: Path) -> None:
+    ledger, _ = _attempt_fixture(tmp_path)
+    evidence = _evidence(ledger)
+    evidence["CURRENT_TERMINAL_STATE"] = "GENERATION_SUCCEEDED"
+    with pytest.raises(PhaseGError):
+        _preview(ledger, evidence)
+
+
+def test_missing_provider_and_credit_outcomes_mean_unknown(tmp_path: Path) -> None:
+    ledger, _ = _attempt_fixture(tmp_path)
+    ledger._mutate(lambda payload: _remove_provider_credit_outcomes(payload, _RUN_ID))
+    row = next(row for row in ledger.attempts() if row["d2_run_id"] == _RUN_ID)
+    assert "provider_outcome" not in row
+    assert "credit_outcome" not in row
+    assert _preview(ledger, _evidence(ledger))["attempt"]["submission_state"] == (
+        "GENERATION_SUCCEEDED"
+    )
+
+
+def _remove_provider_credit_outcomes(payload: dict[str, object], run_id: str) -> dict[str, object]:
+    attempts = payload["attempts"]
+    assert isinstance(attempts, list)
+    row = next(item for item in attempts if item["d2_run_id"] == run_id)
+    row.pop("provider_outcome", None)
+    row.pop("credit_outcome", None)
+    return {"d2_run_id": run_id}
+
+
+def test_non_unknown_billing_outcome_blocks_closure(tmp_path: Path) -> None:
+    ledger, _ = _attempt_fixture(tmp_path)
+    ledger._mutate(
+        lambda payload: _set_attempt_field(payload, _RUN_ID, "provider_billing_outcome", "CHARGED")
+    )
+    with pytest.raises(PhaseGError):
+        _preview(ledger, _evidence(ledger))
+
+
+def _set_attempt_field(
+    payload: dict[str, object], run_id: str, key: str, value: object
+) -> dict[str, object]:
+    attempts = payload["attempts"]
+    assert isinstance(attempts, list)
+    row = next(item for item in attempts if item["d2_run_id"] == run_id)
+    row[key] = value
+    return {"d2_run_id": run_id}
 
 
 def test_operator_rejects_d2_succeeded(tmp_path: Path) -> None:

@@ -1459,10 +1459,9 @@ class D2DailyCreditLedger:
             if len(matches) != 1:
                 raise PhaseGError("PHASE_G_ATTEMPT_NOT_UNIQUE", "D2 run ID must exist exactly once")
             attempt = matches[0]
-            if (
-                attempt.get("submission_state") != "GENERATION_SUCCEEDED"
-                or attempt.get("terminal_state") is not None
-            ):
+            if attempt.get("submission_state") != "GENERATION_SUCCEEDED" or attempt.get(
+                "terminal_state"
+            ) not in (None, "GENERATION_SUCCEEDED"):
                 raise PhaseGError(
                     "PHASE_G_FORENSIC_STATE_MISMATCH",
                     "misattribution closure requires nonterminal GENERATION_SUCCEEDED",
@@ -1476,7 +1475,7 @@ class D2DailyCreditLedger:
                 credit_outcome="UNKNOWN",
                 attribution_invalidated=True,
                 artifact_attribution_valid=False,
-                forensic_closure_contract_version="D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1",
+                forensic_closure_contract_version="D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2",
                 forensic_classification="NO_NEW_RETRY_OUTPUT_PROVEN",
                 forensic_closed_at=summary["FORENSIC_COMPLETED_AT"],
                 forensic_reason=summary["FORENSIC_REASON"],
@@ -1495,6 +1494,7 @@ class D2DailyCreditLedger:
         attempt: Mapping[str, object],
         evidence: Mapping[str, object],
     ) -> None:
+        terminal_state = attempt.get("terminal_state")
         if (
             attempt.get("provider_account_id") != "PVA_0001"
             or attempt.get("provider_project_id") != "34e60953-e534-46e9-ac65-993893e61065"
@@ -1504,6 +1504,18 @@ class D2DailyCreditLedger:
             raise PhaseGError(
                 "PHASE_G_FORENSIC_IDENTITY_MISMATCH",
                 "attempt is not the exact TEST account/project",
+            )
+        if (
+            attempt.get("submission_state") != "GENERATION_SUCCEEDED"
+            or terminal_state not in (None, "GENERATION_SUCCEEDED")
+            or terminal_state in _TERMINAL_STATES
+            or evidence.get("CURRENT_SUBMISSION_STATE") != "GENERATION_SUCCEEDED"
+            or evidence.get("CURRENT_TERMINAL_STATE")
+            != ("NONE" if terminal_state is None else terminal_state)
+        ):
+            raise PhaseGError(
+                "PHASE_G_FORENSIC_STATE_MISMATCH",
+                "evidence must bind the current nonterminal generation marker",
             )
         approval_count = attempt.get("approval_action_count", 0)
         generate_count = attempt.get("generate_action_count")
@@ -2330,7 +2342,7 @@ class D2DailyCreditLedger:
                 or retry.get("attribution_invalidated") is not True
                 or retry.get("artifact_attribution_valid") is not False
                 or retry.get("forensic_closure_contract_version")
-                != "D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1"
+                != "D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2"
                 or retry.get("forensic_classification") != "NO_NEW_RETRY_OUTPUT_PROVEN"
             ):
                 continue

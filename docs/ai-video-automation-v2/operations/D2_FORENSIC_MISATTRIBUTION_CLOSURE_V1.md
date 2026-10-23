@@ -1,5 +1,10 @@
 # D2 Forensic Misattribution Closure V1
 
+This frozen V1 evidence contract required `terminal_state = null`. The current
+operator accepts only the versioned V2 contract; V1 evidence is not reinterpreted
+or accepted by that operator. See
+[`D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2.md`](D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2.md).
+
 This narrow operator closes a `GENERATION_SUCCEEDED` retry only when the
 persisted provider identities are proven to belong to an earlier same-project
 D2 attempt and a complete structured read-only enumeration found no new retry

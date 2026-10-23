@@ -31,7 +31,7 @@ attempt, except where a separate forensic-closure contract already permits a
 distinct run. The narrow misattribution-closure exception can consume only the
 exact predecessor named by its closed, digest-verified retry descendant; it
 does not authorize a second retry. See
-[`D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1.md`](D2_FORENSIC_MISATTRIBUTION_CLOSURE_V1.md).
+[`D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2.md`](D2_FORENSIC_MISATTRIBUTION_CLOSURE_V2.md).
 The retry authorization is consumed atomically with creation of
 the new `PREPARED` row under the ledger lock. The new row stores the contract
 version, predecessor ID, expected state, and consumption timestamp. The prior
