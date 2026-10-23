@@ -32,6 +32,9 @@ from gflow_cli.v2_runtime.phase_g_run import (
 _EMAIL = "singleava508@gmail.com"
 _PROJECT_ID = "34e60953-e534-46e9-ac65-993893e61065"
 _RPCID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+_STATE_STABILITY_TIMEOUT_S = 15.0
+_STATE_STABILITY_INTERVAL_MS = 500
+_STATE_STABILITY_SAMPLES = 3
 
 
 def _sanitized_rpcids(url: str) -> list[str]:
@@ -51,6 +54,26 @@ def _state_dict(value: object) -> dict[str, Any]:
             "AGENT_CANARY_STATE_UNREADABLE", "Flow state snapshot is unreadable"
         )
     return value
+
+
+async def _wait_for_stable_video_state(page: Any) -> dict[str, Any]:
+    """Wait for Flow's project state to hydrate and repeat consistently."""
+    deadline = asyncio.get_running_loop().time() + _STATE_STABILITY_TIMEOUT_S
+    previous: dict[str, Any] | None = None
+    repeated = 0
+    while asyncio.get_running_loop().time() < deadline:
+        current = _state_dict(await page.evaluate(_VIDEO_STATE_JS))
+        if current == previous:
+            repeated += 1
+        else:
+            previous = current
+            repeated = 1
+        if repeated >= _STATE_STABILITY_SAMPLES:
+            return current
+        await page.wait_for_timeout(_STATE_STABILITY_INTERVAL_MS)
+    raise FlowPresubmitError(
+        "AGENT_CANARY_STATE_UNSTABLE", "TEST project state did not stabilize after hydration"
+    )
 
 
 async def run_canary(snapshot: Path, runtime_root: Path, temp_root: Path) -> dict[str, object]:
@@ -79,12 +102,13 @@ async def run_canary(snapshot: Path, runtime_root: Path, temp_root: Path) -> dic
     activated = False
     try:
         await port.bind_request(request)
+        page = port._require_page()
+        await _wait_for_stable_video_state(page)
         baseline = await port.capture_submission_baseline()
         if baseline.pending_count != 0:
             raise FlowPresubmitError(
                 "AGENT_CANARY_PENDING_BASELINE", "TEST project has pending generation"
             )
-        page = port._require_page()
         if await page.locator(_LIVE_GATE).count() != 0:
             raise FlowPresubmitError(
                 "AGENT_CANARY_LIVE_GATE_PRESENT", "TEST project has a live credit gate"
@@ -125,13 +149,8 @@ async def run_canary(snapshot: Path, runtime_root: Path, temp_root: Path) -> dic
         await context.unroute("**/*", intercept)
         await page.reload(wait_until="domcontentloaded")
         await page.locator("flow-project-page").wait_for(state="visible", timeout=15_000)
-        snapshots = []
-        for _ in range(3):
-            snapshots.append(_state_dict(await page.evaluate(_VIDEO_STATE_JS)))
-            if len(snapshots) < 3:
-                await page.wait_for_timeout(500)
-        after = snapshots[-1]
-        stable = snapshots[0] == snapshots[1] == snapshots[2]
+        after = await _wait_for_stable_video_state(page)
+        stable = True
         baseline_media = set(baseline.media_ids)
         after_media = set(port._valid_ids(after.get("media_ids")))
         baseline_tiles = set(baseline.finished_tile_key_hashes)

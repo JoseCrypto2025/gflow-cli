@@ -71,7 +71,11 @@ only `rpcids`, HTTP methods, and timestamps. Its `INTERCEPTION_PASS` result is
 not by itself a zero-credit result: an operator must also read the provider
 balance before and after and verify that project media, pending tiles, and live
 gates are unchanged. If the balance reader is unavailable, stop before either
-the canary or a paid D2.
+the canary or a paid D2. The canary waits for three consecutive identical
+structured project snapshots before recording its baseline and after reloading
+the project; it fails closed if either snapshot does not stabilize within 15
+seconds. This allows the Agent panel and existing chats to hydrate before the
+zero-credit comparison.
 
 Settings restoration runs on every path. The journal is marked `CLEAN` only
 after exact readback of the original settings. Any restore or readback failure
