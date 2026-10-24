@@ -103,6 +103,11 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
     "sse-starlette>=2.0.0",
+    # Production V2 media validation imports PyAV in the Scene orchestrator,
+    # including the NO_AUDIO path, so it belongs in the deployable runtime.
+    "av>=12",
+    # Production TTS and merge processing imports NumPy at module load.
+    "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
@@ -112,11 +117,6 @@ dev = [
     "pytest-xdist>=3.6",
     "ruff==0.17.0",
     "pyright>=1.1.0",
-    # video-chain: the last-frame extractor (media.py) decodes with PyAV, and its
-    # tests build synthetic mp4 fixtures with numpy. Declared here so the dev/CI
-    # env actually runs tests/test_media.py instead of importorskip-skipping it.
-    "av>=12",
-    "numpy>=1.24",
 ]
 # Cloud storage extras — install only one at a time.
 # aiobotocore and boto3 pin conflicting botocore versions; avoid mixing [s3]

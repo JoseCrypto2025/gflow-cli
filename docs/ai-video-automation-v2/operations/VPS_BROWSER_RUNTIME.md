@@ -7,8 +7,11 @@ operator. It defaults to a read-only preflight and requires an exact clean
 `automation-v2` commit. It packages only `src/`, `schemas/`, the production F5
 operator, the runtime doctor, `pyproject.toml`, and `uv.lock` from Git; it never
 copies `.git`, tests, docs, ignored files, credentials, or a source virtualenv.
-It preserves the existing runtime virtualenv and keeps browser state, OAuth,
-runtime state, logs, and temporary files at their separate documented paths.
+It copies the existing runtime virtualenv into the staged tree and synchronizes
+the locked production dependencies there before promotion. Source builds are
+disabled during this root-run step; missing platform wheels fail the staged
+deployment before promotion. Browser state, OAuth, runtime state, logs, and
+temporary files remain at their separate documented paths.
 
 Run on the VPS as root from the approved source checkout:
 
@@ -21,8 +24,9 @@ python3 /opt/gflow-v2-src/scripts/operations/deploy_v2_runtime.py \
 
 The first command is a no-write preflight. Apply creates a full timestamped
 rollback copy under `/opt/gflow-v2-backups/`, stages the allowlisted archive,
-preserves the existing `.venv`, promotes atomically, verifies per-file hashes
-against `deployment-manifest.json`, and runs the runtime doctor as `gflow`.
+copies and synchronizes the existing `.venv`, promotes atomically, verifies
+per-file hashes against `deployment-manifest.json`, and runs the runtime doctor
+as `gflow`.
 If promotion or those runtime checks fail, the previous application directory
 is restored automatically and the failed candidate is retained for diagnosis.
 The rollback copy also has a full-tree hash manifest. Restore only by naming

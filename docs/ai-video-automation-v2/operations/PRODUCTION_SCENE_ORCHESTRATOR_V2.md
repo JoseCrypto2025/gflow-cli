@@ -16,9 +16,10 @@ one-output setting are checked against fresh live Master data. Phase F5 runs
 before a production job is claimed. After F5, the operator reads the full
 snapshot again and holds if any canonical Sheet data changed.
 
-Without `--execute`, the command performs only the live Sheets read and Phase E
-checks and prints `READY_FOR_F5_AND_EXECUTION`; it does not open Flow or write
-transaction rows. With `--execute`, it runs non-submitting F5 and then the
+Without `--execute`, the command performs the live Sheets read, Phase E checks,
+and a read-only Flow balance inspection through the `gflow-prod` profile, then
+prints `READY_FOR_F5_AND_EXECUTION`; it does not run F5 or write transaction
+rows. With `--execute`, it runs non-submitting F5 and then the
 canonical one-shot lifecycle. The Phase G request is bound to the claimed
 Scene Job's deterministic D2 ID. Re-entry on an unresolved Scene Job uses the
 same Phase G request for recovery; caller-supplied media is not accepted.

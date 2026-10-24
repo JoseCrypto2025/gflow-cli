@@ -13,6 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
+from gflow_cli.services.credits import inspect_profile
 from gflow_cli.v2_runtime.config import load_runtime_settings
 from gflow_cli.v2_runtime.google_drive_storage import GoogleDriveStorageAdapter
 from gflow_cli.v2_runtime.google_sheets import (
@@ -45,7 +46,6 @@ from gflow_cli.v2_runtime.production_orchestrator import (
 )
 from gflow_cli.v2_runtime.timestamps import format_utc_timestamp, parse_utc_timestamp
 from gflow_cli.v2_runtime.workspace import JobWorkspace, create_workspace, validate_workspace
-from gflow_cli.services.credits import inspect_profile
 
 _SCENE_ID_RE = re.compile(r"^SCN_[0-9]{6}$")
 _PROFILE_ID_RE = re.compile(r"^GPR_[0-9]{4}$")
@@ -199,9 +199,7 @@ def run_once(
         or str(UUID(project_id)) != project_id.lower()
         or not _EMAIL_RE.fullmatch(expected_email)
     ):
-        raise ProductionSceneOperatorError(
-            "explicit production identity is required"
-        )
+        raise ProductionSceneOperatorError("explicit production identity is required")
 
     settings = load_runtime_settings()
     if settings.environment != "production" or settings.storage_provider != "google-drive":

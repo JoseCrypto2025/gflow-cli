@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import tarfile
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -77,6 +78,47 @@ def test_archive_plan_rejects_symbolic_links() -> None:
         deploy.inspect_archive(data, "a" * 40)
 
 
+def test_runtime_dependency_sync_uses_the_staged_venv_and_locked_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage = tmp_path / "stage"
+    staged_python = stage / ".venv" / "bin" / "python"
+    staged_python.parent.mkdir(parents=True)
+    staged_python.write_text("staged interpreter", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        deploy.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+    monkeypatch.setattr(deploy, "_run", lambda command, cwd=None: commands.append(command) or "")
+
+    deploy._sync_runtime_dependencies(stage)
+
+    assert commands == [
+        [
+            "/usr/bin/uv",
+            "sync",
+            "--frozen",
+            "--no-dev",
+            "--no-build",
+            "--no-install-project",
+            "--project",
+            str(stage),
+            "--python",
+            str(staged_python),
+        ]
+    ]
+
+
+def test_production_media_import_dependencies_are_not_dev_only() -> None:
+    project_file = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    project = tomllib.loads(project_file.read_text(encoding="utf-8"))
+    dependencies = project["project"]["dependencies"]
+
+    assert any(dependency.startswith("av>=") for dependency in dependencies)
+    assert any(dependency.startswith("numpy>=") for dependency in dependencies)
+
+
 def test_manifest_verification_detects_post_deploy_file_change(tmp_path) -> None:
     expected = hashlib.sha256(b"expected").hexdigest()
     (tmp_path / "src").mkdir()
@@ -121,6 +163,7 @@ def test_promotion_restores_runtime_if_rollback_backup_is_not_verified(
     monkeypatch.setattr(deploy, "BACKUP_ROOT", backups)
     monkeypatch.setattr(deploy.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.setattr(deploy, "_check_no_runtime_processes", lambda: None)
+    monkeypatch.setattr(deploy, "_sync_runtime_dependencies", lambda stage: None)
     real_mkdtemp = deploy.tempfile.mkdtemp
     monkeypatch.setattr(
         deploy.tempfile,

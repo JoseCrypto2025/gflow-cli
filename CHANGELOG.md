@@ -82,6 +82,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **VPS deployment synchronizes locked production dependencies in staging.** The
+  copied runtime virtualenv is updated before promotion, and the runtime doctor
+  imports the production Scene orchestrator so missing media dependencies fail
+  before the existing runtime is replaced.
+
 - **`gflow credits` reads the migrated app's balance response.** The CLI and MCP passively
   observe Flow's `nzlxg` reply during a normal browser page load; the retired labs token route
   is no longer used by the credits service. The existing result fields remain, with unknown

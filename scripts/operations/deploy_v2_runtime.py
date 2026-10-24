@@ -277,6 +277,29 @@ def _check_no_runtime_processes() -> None:
             raise DeploymentError("an application process is using the runtime tree")
 
 
+def _sync_runtime_dependencies(stage: Path) -> None:
+    """Install locked production dependencies into the staged copy of the runtime venv."""
+    uv = shutil.which("uv")
+    staged_python = stage / ".venv" / "bin" / "python"
+    if uv is None or not staged_python.is_file():
+        raise DeploymentError("uv or the staged runtime Python is unavailable")
+    _run(
+        [
+            uv,
+            "sync",
+            "--frozen",
+            "--no-dev",
+            "--no-build",
+            "--no-install-project",
+            "--project",
+            str(stage),
+            "--python",
+            str(staged_python),
+        ],
+        cwd=stage,
+    )
+
+
 @contextmanager
 def _deployment_lock() -> Any:
     """Serialize apply/rollback operations without touching application state."""
@@ -491,6 +514,7 @@ def _run_runtime_checks(commit: str) -> str:
             "import pwd",
             "from pathlib import Path",
             "from gflow_cli.v2_runtime import phase_e, phase_g, phase_g_run",
+            "from gflow_cli.v2_runtime import production_orchestrator",
             "from scripts.operations import vps_flow_presubmit",
             "service_uid = pwd.getpwnam('gflow').pw_uid",
             "credential = Path('/etc/gflow-v2/google-authorized-user.json')",
@@ -538,6 +562,7 @@ def _promote(
     try:
         _extract_archive(data, plan, stage, commit)
         shutil.copytree(venv, stage / ".venv", symlinks=True, copy_function=shutil.copy2)
+        _sync_runtime_dependencies(stage)
         if not BACKUP_ROOT.exists():
             BACKUP_ROOT.mkdir(mode=0o750)
         if BACKUP_ROOT.is_symlink() or not BACKUP_ROOT.is_dir():

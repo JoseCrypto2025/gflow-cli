@@ -814,6 +814,7 @@ name = "gflow-cli"
 version = "0.85.0"
 source = { editable = "." }
 dependencies = [
+    { name = "av" },
     { name = "browser-cookie3" },
     { name = "click" },
     { name = "colorama", marker = "sys_platform == 'win32'" },
@@ -821,6 +822,8 @@ dependencies = [
     { name = "google-auth", extra = ["requests"] },
     { name = "httpx" },
     { name = "mcp" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "platformdirs" },
     { name = "playwright" },
     { name = "pydantic-settings" },
@@ -837,9 +840,6 @@ chain = [
     { name = "pillow" },
 ]
 dev = [
-    { name = "av" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -894,8 +894,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "av", specifier = ">=12" },
     { name = "av", marker = "extra == 'chain'", specifier = ">=12" },
-    { name = "av", marker = "extra == 'dev'", specifier = ">=12" },
     { name = "browser-cookie3", specifier = ">=0.20.1" },
     { name = "click", specifier = ">=8.1.0" },
     { name = "colorama", marker = "sys_platform == 'win32'", specifier = ">=0.4.6" },
@@ -904,7 +904,7 @@ requires-dist = [
     { name = "google-auth", extras = ["requests"], specifier = ">=2.56.2" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "mcp", specifier = ">=2.0.0,<3" },
-    { name = "numpy", marker = "extra == 'dev'", specifier = ">=1.24" },
+    { name = "numpy", specifier = ">=1.24" },
     { name = "patchright", marker = "extra == 'patchright'", specifier = "==1.61.2" },
     { name = "pillow", marker = "extra == 'chain'", specifier = ">=12.3.0" },
     { name = "platformdirs", specifier = ">=4.0.0" },
