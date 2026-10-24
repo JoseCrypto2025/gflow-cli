@@ -149,6 +149,9 @@ def test_workspace_layout_and_cleanup_safety(tmp_path: Path) -> None:
     assert cleanup_workspace(
         tmp_path / "temp", "JOB_1", "SUCCESS", old, remote_assets_verified=True
     )
+    assert cleanup_workspace(
+        tmp_path / "temp", "JOB_1", "SUCCESS", old, remote_assets_verified=True
+    )
     failed = create_workspace(tmp_path / "temp", "JOB_2")
     assert not cleanup_workspace(tmp_path / "temp", "JOB_2", "FAILED", datetime.now(UTC))
     assert cleanup_workspace(tmp_path / "temp", "JOB_2", "FAILED", old)

@@ -78,7 +78,9 @@ def test_mcp_run_serves_jsonrpc_on_stdout() -> None:
         # Keep stdin open and poll until every expected reply (ids 1-3) lands or
         # we hit the deadline — closing stdin too early races the server's EOF
         # shutdown against its last response.
-        deadline = time.monotonic() + 15
+        # A cold Windows import of the full CLI can exceed the Linux CI
+        # startup time while still serving the protocol correctly.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if {1, 2, 3} <= parsed_by_id().keys():
                 break

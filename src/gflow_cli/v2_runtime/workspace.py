@@ -47,6 +47,37 @@ def create_workspace(temp_root: Path, job_id: str) -> JobWorkspace:
     return JobWorkspace(job_id, root, directories)
 
 
+def validate_workspace(temp_root: Path, workspace: JobWorkspace) -> dict[str, Path]:
+    """Prove a workspace is the exact nonsymlink job directory under temp_root."""
+    if temp_root.is_symlink() or not temp_root.is_absolute():
+        raise UnsafePathError("temporary root must be an absolute, nonsymlink path")
+    if workspace.root.is_symlink() or not workspace.root.is_absolute():
+        raise UnsafePathError("job workspace must be an absolute, nonsymlink path")
+    if set(workspace.directories) != set(LAYOUT):
+        raise UnsafePathError("job workspace layout is incomplete or unexpected")
+    try:
+        canonical_base = temp_root.resolve(strict=True)
+        canonical_root = workspace.root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise UnsafePathError("configured job workspace is unavailable") from exc
+    expected_root = canonical_base / workspace.job_id
+    if canonical_root != expected_root or canonical_root.parent != canonical_base:
+        raise UnsafePathError("job workspace is outside the configured temporary root")
+    resolved: dict[str, Path] = {}
+    for name in LAYOUT:
+        directory = workspace.directories[name]
+        if directory.is_symlink() or not directory.is_absolute():
+            raise UnsafePathError("job workspace directory is unsafe")
+        try:
+            canonical_directory = directory.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise UnsafePathError("job workspace directory is unavailable") from exc
+        if canonical_directory != canonical_root / name or not canonical_directory.is_dir():
+            raise UnsafePathError("job workspace directory escaped the configured layout")
+        resolved[name] = canonical_directory
+    return resolved
+
+
 def cleanup_workspace(
     temp_root: Path,
     job_id: str,
@@ -70,7 +101,9 @@ def cleanup_workspace(
         return False
     canonical_base, target = _safe_root(temp_root, job_id)
     if not target.exists():
-        return False
+        # Cleanup is idempotent after a previous deletion succeeded but its
+        # caller lost the acknowledgement before persisting CLEANED.
+        return True
     resolved_target = target.resolve(strict=True)
     if resolved_target.parent != canonical_base or target.is_symlink():
         raise UnsafePathError("refusing cleanup outside the configured temp root")

@@ -25,6 +25,7 @@ from .timestamps import format_utc_timestamp
 Row = Mapping[str, object]
 TableRows = dict[str, list[Row]]
 APPROVED_SPREADSHEET_ID = "1wtoIBfeHNdGYK6cyhDfKPG6W3TnnfL4QDvCAtJBX27Q"
+APPROVED_JOB_ARTIFACTS_FOLDER_ID = "1IXhplXVv4ukNhb2EWnAqV2nL2e1V1x0L"
 SOURCE_LIVE_GOOGLE_SHEETS = "LIVE_GOOGLE_SHEETS"
 GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 _SECRET_FIELD_RE = re.compile(

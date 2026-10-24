@@ -108,6 +108,18 @@
       "validation_rule": "When populated, 64 hexadecimal characters."
     },
     {
+      "field_name": "Synthesis_Config_SHA256",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Hash of the resolved voice, provider, model, locale, and synthesis settings.",
+      "example": null,
+      "validation_rule": "When populated, 64 hexadecimal characters."
+    },
+    {
       "field_name": "Job_Status",
       "data_type": "STRING",
       "required": true,

@@ -43,6 +43,30 @@ _JOB_STATUSES = frozenset(
         "CANCELLED",
     }
 )
+_PRODUCTION_STATUSES = frozenset(
+    {
+        "REQUESTED",
+        "VALIDATING",
+        "READY",
+        "QUEUED",
+        "RUNNING",
+        "HOLD",
+        "FAILED",
+        "COMPLETED",
+        "CANCELLED",
+    }
+)
+_PRODUCTION_TRANSITIONS: dict[str, frozenset[str]] = {
+    "REQUESTED": frozenset({"VALIDATING", "HOLD", "FAILED", "CANCELLED"}),
+    "VALIDATING": frozenset({"READY", "HOLD", "FAILED", "CANCELLED"}),
+    "READY": frozenset({"QUEUED", "HOLD", "FAILED", "CANCELLED"}),
+    "QUEUED": frozenset({"RUNNING", "HOLD", "FAILED", "CANCELLED"}),
+    "RUNNING": frozenset({"HOLD", "FAILED", "COMPLETED", "CANCELLED"}),
+    "HOLD": frozenset(),
+    "FAILED": frozenset(),
+    "COMPLETED": frozenset(),
+    "CANCELLED": frozenset(),
+}
 _TRANSITIONS: dict[str, frozenset[str]] = {
     "PENDING": frozenset({"VALIDATING", "HOLD", "FAILED", "CANCELLED"}),
     "VALIDATING": frozenset({"QUEUED", "RUNNING", "HOLD", "FAILED", "CANCELLED"}),
@@ -73,6 +97,14 @@ def is_valid_scene_job_status(status: str) -> bool:
 
 def is_valid_scene_job_transition(current: str, following: str) -> bool:
     return current in _TRANSITIONS and following in _TRANSITIONS[current]
+
+
+def is_valid_production_job_status(status: str) -> bool:
+    return status in _PRODUCTION_STATUSES
+
+
+def is_valid_production_job_transition(current: str, following: str) -> bool:
+    return following in _PRODUCTION_TRANSITIONS.get(current, frozenset())
 
 
 def validate_remote_evidence(
@@ -200,6 +232,8 @@ class SceneJob:
     local_deleted_at: str | None = None
     created_at: str = ""
     remote_verified_at: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
 
     def as_row(self) -> dict[str, object]:
         """Serialize exactly the checked-in SCENE_JOBS columns."""
@@ -222,8 +256,8 @@ class SceneJob:
             else "",
             "Remote_Verified": self.remote_verified,
             "Local_Cleanup_Status": self.local_cleanup_status,
-            "Error_Code": "",
-            "Error_Message": "",
+            "Error_Code": self.error_code or "",
+            "Error_Message": self.error_message or "",
             "Queued_At": "",
             "Started_At": "",
             "Generation_Completed_At": "",
@@ -255,6 +289,30 @@ class ProductionJobStore(Protocol):
     """Atomic transaction operations required by the coordinator."""
 
     def claim(self, request: ProductionRequest, requested_at: str) -> JobClaim: ...
+
+    def transition_production(
+        self,
+        production_job_id: str,
+        expected_status: str,
+        next_status: str,
+        occurred_at: str,
+        reason_code: str | None = None,
+    ) -> ProductionJob: ...
+
+    def complete_production(
+        self,
+        production_job_id: str,
+        final_output: Mapping[str, object],
+        occurred_at: str,
+    ) -> ProductionJob: ...
+
+    def mark_local_cleaned(self, scene_job_id: str, occurred_at: str) -> SceneJob: ...
+
+    def record_cleanup_failure(
+        self, scene_job_id: str, reason_code: str, occurred_at: str
+    ) -> SceneJob: ...
+
+    def complete_scene(self, scene_job_id: str, occurred_at: str) -> SceneJob: ...
 
     def transition_scene(
         self,
@@ -294,6 +352,67 @@ class InMemoryProductionJobStore:
         self._scene_jobs: dict[str, SceneJob] = {}
         self._attempt_keys: dict[tuple[str, str, int], str] = {}
         self._events: list[JobEvent] = []
+
+    def transition_production(
+        self,
+        production_job_id: str,
+        expected_status: str,
+        next_status: str,
+        occurred_at: str,
+        reason_code: str | None = None,
+    ) -> ProductionJob:
+        with self._lock:
+            current = self._production.get(production_job_id)
+            if current is None or current.job_status != expected_status:
+                raise JobConflictError("Production Job state changed before transition")
+            if next_status == "COMPLETED":
+                raise InvalidJobTransitionError(
+                    "Production Job completion requires persisted FINAL_OUTPUT evidence"
+                )
+            allowed = _PRODUCTION_TRANSITIONS[current.job_status]
+            if next_status not in _PRODUCTION_STATUSES or next_status not in allowed:
+                raise InvalidJobTransitionError("Production Job transition is not allowed")
+            if next_status == "HOLD" and not reason_code:
+                raise InvalidJobTransitionError("HOLD requires a reason code")
+            if next_status == "FAILED" and not reason_code:
+                raise InvalidJobTransitionError("FAILED requires an error code")
+            updated = replace(current, job_status=next_status)
+            self._production[production_job_id] = updated
+            self._events.append(
+                JobEvent(
+                    production_job_id,
+                    current.job_status,
+                    next_status,
+                    occurred_at,
+                    reason_code,
+                )
+            )
+            return updated
+
+    def complete_production(
+        self,
+        production_job_id: str,
+        final_output: Mapping[str, object],
+        occurred_at: str,
+    ) -> ProductionJob:
+        with self._lock:
+            current = self._production.get(production_job_id)
+            if current is None or current.job_status != "RUNNING":
+                raise JobConflictError("Production Job must be RUNNING before completion")
+            jobs = [
+                job
+                for job in self._scene_jobs.values()
+                if job.production_job_id == production_job_id
+            ]
+            if not jobs or any(job.job_status != "COMPLETED" for job in jobs):
+                raise InvalidJobTransitionError("all Scene Jobs must be complete first")
+            validate_final_output_evidence(production_job_id, final_output)
+            updated = replace(current, job_status="COMPLETED")
+            self._production[production_job_id] = updated
+            self._events.append(
+                JobEvent(production_job_id, current.job_status, "COMPLETED", occurred_at)
+            )
+            return updated
 
     def claim(self, request: ProductionRequest, requested_at: str) -> JobClaim:
         with self._lock:
@@ -490,6 +609,8 @@ class InMemoryProductionJobStore:
                 job,
                 local_cleanup_status="CLEANED",
                 local_deleted_at=occurred_at,
+                error_code=None,
+                error_message=None,
                 updated_at=occurred_at,
             )
             self._scene_jobs[scene_job_id] = updated
@@ -500,6 +621,42 @@ class InMemoryProductionJobStore:
                     job.job_status,
                     occurred_at,
                     "LOCAL_CLEANUP_COMPLETE",
+                )
+            )
+            return updated
+
+    def record_cleanup_failure(
+        self, scene_job_id: str, reason_code: str, occurred_at: str
+    ) -> SceneJob:
+        if not reason_code.strip():
+            raise ValueError("cleanup failure requires a stable reason code")
+        with self._lock:
+            job = self._scene_jobs.get(scene_job_id)
+            if (
+                job is None
+                or job.job_status != "REMOTE_VERIFYING"
+                or not job.remote_verified
+                or not job.remote_sha256
+                or job.remote_sha256 != job.output_sha256
+            ):
+                raise InvalidJobTransitionError(
+                    "cleanup failure can be recorded only after remote verification"
+                )
+            updated = replace(
+                job,
+                local_cleanup_status="CLEANUP_FAILED",
+                error_code=reason_code,
+                error_message=reason_code,
+                updated_at=occurred_at,
+            )
+            self._scene_jobs[scene_job_id] = updated
+            self._events.append(
+                JobEvent(
+                    scene_job_id,
+                    job.job_status,
+                    job.job_status,
+                    occurred_at,
+                    reason_code,
                 )
             )
             return updated
@@ -615,3 +772,45 @@ def validate_production_job_row(row: Mapping[str, object]) -> None:
         raise ValueError("Job_Status is invalid")
     if not row.get("Request_Idempotency_Key") or not row.get("Requested_At"):
         raise ValueError("idempotency key and Requested_At are required")
+    status = row.get("Job_Status")
+    if status == "HOLD" and not row.get("Hold_Reason_Code"):
+        raise ValueError("HOLD requires Hold_Reason_Code")
+    if status == "FAILED" and not row.get("Error_Code"):
+        raise ValueError("FAILED requires Error_Code")
+    if status in {"RUNNING", "COMPLETED"} and not row.get("Started_At"):
+        raise ValueError("RUNNING and COMPLETED require Started_At")
+    if status in {"COMPLETED", "FAILED", "CANCELLED"} and not row.get("Completed_At"):
+        raise ValueError("COMPLETED, FAILED, and CANCELLED require Completed_At")
+
+
+def validate_final_output_evidence(production_job_id: str, row: Mapping[str, object]) -> None:
+    """Require the persisted, fully validated primary video before job completion."""
+    if (
+        row.get("Production_Job_ID") != production_job_id
+        or row.get("Output_Type") != "FINAL_VIDEO"
+        or row.get("Output_Status") != "READY"
+        or row.get("Validation_Status") != "PASS"
+        or row.get("Remote_Verified") is not True
+        or not row.get("Final_Output_ID")
+        or not row.get("Remote_File_ID")
+        or not _SHA256_RE.fullmatch(str(row.get("Output_SHA256", "")))
+    ):
+        raise InvalidJobTransitionError(
+            "Production Job completion requires a persisted, validated FINAL_VIDEO"
+        )
+    size = row.get("Output_Size_Bytes")
+    duration = row.get("Duration_Sec")
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, (int, float, str))
+        or int(size) <= 0
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float, str))
+        or not math.isfinite(float(duration))
+        or float(duration) <= 0
+    ):
+        raise InvalidJobTransitionError("FINAL_VIDEO size and duration evidence are invalid")
+    remote_uri = row.get("Remote_Output_URI")
+    parsed_uri = urlparse(str(remote_uri or ""))
+    if parsed_uri.scheme != "https" or not parsed_uri.netloc:
+        raise InvalidJobTransitionError("FINAL_VIDEO must have a persistent remote URI")

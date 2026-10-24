@@ -11,6 +11,12 @@ import pytest
 from scripts.operations import bootstrap_google_workspace_auth as bootstrap
 
 
+def test_bootstrap_uses_runtime_approved_output_folder_constant() -> None:
+    from gflow_cli.v2_runtime.google_sheets import APPROVED_JOB_ARTIFACTS_FOLDER_ID
+
+    assert bootstrap.OUTPUT_FOLDER_ID == APPROVED_JOB_ARTIFACTS_FOLDER_ID
+
+
 def _oauth_property_name() -> str:
     return "".join(map(chr, (99, 108, 105, 101, 110, 116, 95, 115, 101, 99, 114, 101, 116)))
 

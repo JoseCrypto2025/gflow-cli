@@ -137,6 +137,13 @@ class GoogleDriveStorageAdapter:
     def download_asset(self, reference: AssetReference, destination: Path) -> Path:
         if destination.exists() or destination.is_symlink():
             raise AssetVerificationError("remote verification destination must be unused")
+        metadata = self.get_metadata(reference)
+        if not metadata.exists or (
+            reference.size_bytes is not None and metadata.size_bytes != reference.size_bytes
+        ):
+            raise AssetVerificationError(
+                "remote download is outside the approved artifact contract"
+            )
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(f".{destination.name}.download")
         if temporary.exists() or temporary.is_symlink():

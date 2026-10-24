@@ -639,7 +639,10 @@ async def recover_and_validate_existing(
     request: PhaseGExecutionRequest, *, expected_email: str
 ) -> PhaseGD2Run:
     """Recover and validate the exact media ID already recorded for this run."""
-    ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root)
+    ledger_root = request.presubmit_request.runtime_state_root
+    if request.execution_context is not None and request.execution_context.environment == "PROD":
+        ledger_root = ledger_root / "production"
+    ledger = D2DailyCreditLedger(ledger_root)
     attempt = next(
         (row for row in ledger.attempts() if row.get("d2_run_id") == request.d2_run_id),
         None,

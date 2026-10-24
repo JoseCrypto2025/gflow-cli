@@ -36,6 +36,7 @@ def _required_entries() -> list[tuple[str, bytes, str]]:
         "src/gflow_cli/v2_runtime/google_sheets.py",
         "schemas/master/PROVIDER_ACCOUNT_MASTER.schema.json",
         "scripts/operations/vps_flow_presubmit.py",
+        "scripts/operations/run_production_scene.py",
         "scripts/validation/v2_runtime_doctor.py",
         "pyproject.toml",
         "uv.lock",

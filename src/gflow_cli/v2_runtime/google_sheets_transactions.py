@@ -31,7 +31,11 @@ from .google_sheets import (
 _ALLOWED_KEYS = {
     "PRODUCTION_JOBS": "Production_Job_ID",
     "SCENE_JOBS": "Scene_Job_ID",
+    "TTS_JOBS": "TTS_Job_ID",
+    "FINAL_OUTPUT": "Final_Output_ID",
 }
+_READ_ONLY_KEYS = {"SCENE_DIALOGUE_LINES": "Dialogue_Line_ID"}
+_READABLE_KEYS = {**_ALLOWED_KEYS, **_READ_ONLY_KEYS}
 _MAX_ROWS = 1001
 _MAX_COLUMNS = 52
 
@@ -79,6 +83,8 @@ class GoogleSheetsTransactionApiTransport:
         return cast(Sequence[Sequence[object]], rows)
 
     def update_values(self, tab: str, a1_range: str, values: Sequence[Sequence[object]]) -> None:
+        if tab not in _ALLOWED_KEYS:
+            raise SheetsTransactionError("only V2 job transaction tabs are writable")
         self._validate_range(tab, a1_range)
         self._write("PUT", self._values_url(tab, a1_range), {"values": values})
 
@@ -129,7 +135,7 @@ class GoogleSheetsTransactionApiTransport:
                 a1_range,
             )
         )
-        if tab not in _ALLOWED_KEYS or not bounded:
+        if tab not in _READABLE_KEYS or not bounded:
             raise SheetsTransactionError("Sheet range is outside bounded V2 job operations")
 
     @staticmethod
@@ -157,8 +163,8 @@ class OptimisticGoogleSheetsJobStore:
             self._headers = load_schema_headers(schema_dir)
         except GoogleSheetsReadError as exc:
             raise SheetsTransactionError("V2 transaction schemas are unavailable") from exc
-        if not set(_ALLOWED_KEYS).issubset(self._headers):
-            raise SheetsTransactionError("V2 Production/Scene Job schemas are missing")
+        if not set(_READABLE_KEYS).issubset(self._headers):
+            raise SheetsTransactionError("V2 transaction schemas are missing")
         self._transport = transport
         self.writer_lock_path = writer_lock_root / ".v2-sheets-writer.lock"
         self.thread_lock = threading.RLock()
@@ -186,6 +192,68 @@ class OptimisticGoogleSheetsJobStore:
             if len(matched) != 1 or self._digest(matched[0], headers) != self._digest(row, headers):
                 raise SheetsTransactionError("append readback is missing, duplicated, or different")
             return dict(matched[0])
+
+    def append_if_unique(
+        self,
+        tab: str,
+        row: dict[str, object],
+        *,
+        unique_constraints: tuple[tuple[str, ...], ...],
+        identity_fields: tuple[str, ...],
+    ) -> dict[str, object]:
+        """Append a row under schema unique keys and reconcile uncertain writes."""
+        key = self._key(tab)
+        self._validate_row(tab, row)
+        headers = self._headers[tab]
+        constraints = (tuple((key,)), *unique_constraints)
+        if (
+            not identity_fields
+            or any(
+                not fields or any(field not in headers for field in fields)
+                for fields in constraints
+            )
+            or any(field not in headers for field in identity_fields)
+        ):
+            raise SheetsTransactionError("unique-key fields do not match the local schema")
+        with _SheetWriterLock(self):
+            actual_headers, rows = self._read_table(tab)
+            matching_rows: dict[str, dict[str, object]] = {}
+            for existing in rows:
+                if any(
+                    all(existing.get(field) == row.get(field) for field in fields)
+                    for fields in constraints
+                ):
+                    matching_rows[self._digest(existing, actual_headers)] = existing
+            if len(matching_rows) > 1:
+                raise SheetsTransactionError(
+                    "multiple rows match the unique request key; HOLD required"
+                )
+            if matching_rows:
+                existing = next(iter(matching_rows.values()))
+                if any(existing.get(field) != row.get(field) for field in identity_fields):
+                    raise SheetsTransactionError(
+                        "unique request key is bound to different input data"
+                    )
+                return dict(existing)
+            try:
+                self._transport.append_values(tab, [self._as_values(row, actual_headers)])
+            except SheetsTransactionError:
+                # The append may have committed even though its acknowledgement was lost.
+                pass
+            _new_headers, new_rows = self._read_table(tab)
+            matches = [
+                existing
+                for existing in new_rows
+                if any(
+                    all(existing.get(field) == row.get(field) for field in fields)
+                    for fields in constraints
+                )
+            ]
+            if len(matches) != 1 or any(
+                matches[0].get(field) != row.get(field) for field in identity_fields
+            ):
+                raise SheetsTransactionError("unique append readback is ambiguous or different")
+            return dict(matches[0])
 
     def update_expected(
         self,
@@ -227,10 +295,15 @@ class OptimisticGoogleSheetsJobStore:
     def row_digest(self, tab: str, row: dict[str, object]) -> str:
         return self._digest(row, self._headers[tab])
 
+    def schema_headers(self, tab: str) -> tuple[str, ...]:
+        if tab not in _READABLE_KEYS or tab not in self._headers:
+            raise SheetsTransactionError("V2 data tab is not available")
+        return self._headers[tab]
+
     def read_rows(self, tab: str) -> tuple[dict[str, object], ...]:
         """Read a schema-checked snapshot of one existing V2 job tab."""
-        if tab not in _ALLOWED_KEYS:
-            raise SheetsTransactionError("only existing V2 job tabs may be read")
+        if tab not in _READABLE_KEYS:
+            raise SheetsTransactionError("only approved V2 data tabs may be read")
         _headers, rows = self._read_table(tab)
         return tuple(dict(row) for row in rows)
 

@@ -36,11 +36,11 @@ EPISODE_MASTER, SCRIPT_MASTER, and SCENES are transaction tables. SCENE_CHARACTE
 
 ## Phase C: runtime foundation
 
-The `v2_runtime` package defines environment configuration, per-job temp workspaces, logical asset references, verification, disk admission checks, catalog-based profile validation, and adapter boundaries. It does not start a worker or listener, authenticate to Drive, call a provider, or generate media. See [runtime foundation](architecture/V2_RUNTIME_FOUNDATION.md), [gap report](architecture/GFLOW_V2_ARCHITECTURE_GAP_REPORT.md), and [legacy compatibility contract](architecture/LEGACY_API_COMPATIBILITY.md).
+The initial `v2_runtime` package defined environment configuration, per-job temp workspaces, logical asset references, verification, disk admission checks, catalog-based profile validation, and adapter boundaries. Later production execution adapters are documented below. See [runtime foundation](architecture/V2_RUNTIME_FOUNDATION.md), [gap report](architecture/GFLOW_V2_ARCHITECTURE_GAP_REPORT.md), and [legacy compatibility contract](architecture/LEGACY_API_COMPATIBILITY.md).
 
 ## Production Execution Data V1
 
-Five transaction schemas define immutable scene prompt versions, production runs, scene and TTS attempts, and versioned final artifacts. See `database/PRODUCTION_EXECUTION_DATA_DICTIONARY.md` for the operational contract. New tabs remain header-only; provider adapters, prompt execution, posting, and analytics are out of scope.
+Five transaction schemas define immutable scene prompt versions, production runs, scene and TTS attempts, and versioned final artifacts. The TTS schema includes separate hashes for exact input text and resolved synthesis configuration so retries cannot reuse output after voice-setting drift. See `database/PRODUCTION_EXECUTION_DATA_DICTIONARY.md` for the operational contract. Posting and analytics remain out of scope.
 
 ## Phase E: Prompt Builder and Preflight
 
@@ -79,3 +79,38 @@ The live port requires an expected TEST account identity and fails closed on
 non-English UI locales until translated control behavior is verified. A
 one-shot, credit-consuming regression is available at
 `tests/e2e/test_phase_g_d2_live.py` and remains opt-in.
+
+## TTS and media finalization V2
+
+`src/gflow_cli/v2_runtime/segmented_tts.py` calls the existing authenticated
+segmented-v2 service on loopback. `TTS_API_KEY` is injected through the runtime
+environment and is never written to Sheets or logged. `/health` is public for
+health monitoring, while the synthesis POST requires `x-api-key`. The response
+must identify a completed provider job and an audio file contained under the
+configured `TTS_OUTPUT_ROOT`; the service and caller therefore run on the same
+host or share that approved output path. Uncertain submits remain on HOLD and
+are not retried automatically. A completed `TTS_JOBS` row is reused only when
+its input-text and synthesis-configuration hashes, persistent Drive identity,
+hash, size, duration, remote verification, and
+cleanup evidence are complete.
+
+Provider audio is probed and fully decoded, converted once to mono 48 kHz PCM,
+then uploaded to the approved Drive folder and verified by a separate download
+and SHA-256 comparison. The internal FFmpeg merger keeps the video timeline
+authoritative, pads shorter audio, rejects longer narration with
+`TTS_DURATION_MISMATCH`, prefers video stream copy, and uses a controlled H.264
+fallback. Final audio is AAC at 48 kHz mono and 192 kbit/s. Both output streams
+are fully decoded and hashed. `FINAL_OUTPUT` records the assembly manifest hash
+and merge strategy. The V2 merger does not use `-shortest`; it does not
+call the historical `/audio/enhance` service, avoiding another lossy audio
+transform until a separately validated need exists.
+
+For a scene whose persisted `Dialogue_Mode` is `NONE`, NO_AUDIO finalization
+requires no linked dialogue rows and a fully decoded source MP4 with no audio
+stream. It creates no `TTS_JOBS` row and records a remotely verified `FINAL_VIDEO`
+in the existing `FINAL_OUTPUT` schema. The input video is retained locally.
+Speech is never inferred from prompt text. These adapters do not add schema
+fields or change the Flow generation CLI/MCP surface.
+
+The current one-scene production NO_AUDIO operator and its exact gate are
+documented in [Production Scene Orchestrator V2](operations/PRODUCTION_SCENE_ORCHESTRATOR_V2.md).

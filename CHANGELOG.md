@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TTS and media finalization V2.** Adds an authenticated segmented-TTS
+  adapter, exact-schema `TTS_JOBS` persistence and completed-artifact reuse,
+  full audio probing and canonicalization, video-timeline-safe FFmpeg merging,
+  and verified NO_AUDIO `FINAL_VIDEO` persistence through existing schemas.
+  Longer speech fails with `TTS_DURATION_MISMATCH`; no unconditional
+  `-shortest` truncation is used.
+
 - **Bounded TEST-only D2 credit session.** Adds a versioned, exact-account and
   project authorization for up to 40 new provider credits while preserving the
   ordinary 50-credit daily policy and all historical ledger rows. Unknown

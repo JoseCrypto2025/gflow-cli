@@ -22,12 +22,13 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 import httpx
 
 from gflow_cli.v2_runtime.google_sheets import (
+    APPROVED_JOB_ARTIFACTS_FOLDER_ID,
     APPROVED_SPREADSHEET_ID,
     GOOGLE_DRIVE_FILE_SCOPE,
     google_api_get_with_retry,
 )
 
-OUTPUT_FOLDER_ID = "1IXhplXVv4ukNhb2EWnAqV2nL2e1V1x0L"
+OUTPUT_FOLDER_ID = APPROVED_JOB_ARTIFACTS_FOLDER_ID
 OUTPUT_FOLDER_NAME = "Job_Artifacts"
 TARGET_PATH = "/etc/gflow-v2/google-authorized-user.json"
 EXPECTED_SHEET_TITLE = "AI_VIDEO_AUTOMATION_MASTER_V2"

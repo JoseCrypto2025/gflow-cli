@@ -486,6 +486,13 @@ def test_v3_distinct_next_day_attempt_stays_under_normal_daily_guard(
         "D2_test-run-0002",
         FlowSubmissionBaseline(_PROJECT, frozenset(), frozenset(), 0, frozenset(), "0:"),
     )
+
+    class AccountingDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def]
+            return cls(2026, 10, 23, 12, tzinfo=tz or UTC)
+
+    monkeypatch.setattr(phase_g_module, "datetime", AccountingDateTime)
     with pytest.raises(PhaseGError) as same_day:
         ledger.mark_generate_action("D2_test-run-0002")
     assert same_day.value.code == "DAILY_FREE_CREDIT_BUDGET_EXHAUSTED"

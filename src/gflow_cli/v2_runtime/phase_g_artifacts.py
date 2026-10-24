@@ -97,31 +97,27 @@ def validate_video(
                     "Phase G artifact must contain exactly one video stream"
                 )
             video = video_streams[0]
-            width = height = 0
-            decoded = 0
-            last_pts: int | None = None
-            for frame in container.decode(video=0):
-                decoded += 1
-                if decoded == 1:
-                    width, height = frame.width, frame.height
-                last_pts = frame.pts
-            if decoded == 0:
-                raise AssetVerificationError("Phase G video has no decodable frames")
-            if width <= 0 or height <= 0:
-                raise AssetVerificationError("Phase G video dimensions are invalid")
             duration: float | None = None
             if video.duration is not None and video.time_base is not None:
                 duration = float(video.duration * video.time_base)
             elif container.duration is not None:
                 duration = float(container.duration / av.time_base)
-            if duration is None and video.average_rate is not None and last_pts is not None:
-                duration = float((last_pts + 1) / video.average_rate)
             if duration is None or duration <= 0:
                 raise AssetVerificationError("Phase G video duration is unavailable")
             if abs(duration - expected_duration_sec) > duration_tolerance_sec:
                 raise AssetVerificationError(
                     f"Phase G video duration {duration:.3f}s is outside the approved tolerance"
                 )
+            width = height = 0
+            decoded = 0
+            for frame in container.decode(video=0):
+                decoded += 1
+                if decoded == 1:
+                    width, height = frame.width, frame.height
+            if decoded == 0:
+                raise AssetVerificationError("Phase G video has no decodable frames")
+            if width <= 0 or height <= 0:
+                raise AssetVerificationError("Phase G video dimensions are invalid")
             expected_aspect = _parse_aspect(expected_aspect_ratio)
             actual_aspect = width / height
             if abs(actual_aspect - expected_aspect) / expected_aspect > 0.01:

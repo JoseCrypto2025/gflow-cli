@@ -111,6 +111,7 @@ Unique: Production_Job_ID + Dialogue_Line_ID + Attempt_No
 | `Provider_Account_ID` | STRING | No | PROVIDER_ACCOUNT_MASTER.Provider_Account_ID | — | Resolved account snapshot. |
 | `Model_ID` | STRING | No | MODEL_MASTER.Model_ID | — | Resolved audio-capable model. |
 | `Input_Text_SHA256` | STRING | No | — | — | Input Text SHA256 When populated, 64 hexadecimal characters. |
+| `Synthesis_Config_SHA256` | STRING | No | — | — | SHA-256 of resolved voice, provider, model, locale, target duration, rate, pitch, and volume; prevents an attempt from being reused after synthesis configuration drift. |
 | `Job_Status` | STRING | Yes | — | PENDING, VALIDATING, QUEUED, RUNNING, UPLOADING, REMOTE_VERIFYING, COMPLETED, HOLD, FAILED, CANCELLED | Job Status |
 | `Provider_Execution_ID` | STRING | No | — | — | Provider Execution ID |
 | `Remote_Audio_URI` | URL | No | — | — | Persistent URI, not an ephemeral provider URL. |
@@ -178,4 +179,4 @@ written to the live sheet by the compiler. See
 ../architecture/PROMPT_BUILDER_ARCHITECTURE.md and
 ../architecture/PREFLIGHT_CONTRACT.md for the compile/readiness contract.
 
-Job tables do not duplicate series/episode/scene/provider/model/prompt-template descriptions and contain no persistent local paths. Posting is separate; analytics is later. This checkpoint creates no provider adapters, Prompt Builder, generation calls, audio, or video.
+Job tables do not duplicate series/episode/scene/provider/model/prompt-template descriptions and contain no persistent local paths. Posting is separate; analytics is later. Exact dialogue text is represented by `Input_Text_SHA256`; the resolved synthesis settings are represented by `Synthesis_Config_SHA256`; secrets are never stored. A completed TTS row can be reused only when both hashes and its persistent URI/file ID, audio hash/size/duration, `Remote_Verified`, and `Local_Cleanup_Status=CLEANED` evidence are complete. NO_AUDIO uses no TTS row; it records a `FINAL_VIDEO` only after the scene has `Dialogue_Mode=NONE`, no linked dialogue, a full video decode with no audio stream, and Drive readback/hash verification. See [V2 Runtime Foundation](../architecture/V2_RUNTIME_FOUNDATION.md).

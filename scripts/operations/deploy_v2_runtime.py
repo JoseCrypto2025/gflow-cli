@@ -37,6 +37,7 @@ ARCHIVE_PATHS = (
     "src",
     "schemas",
     "scripts/operations/vps_flow_presubmit.py",
+    "scripts/operations/run_production_scene.py",
     "scripts/validation/v2_runtime_doctor.py",
     "pyproject.toml",
     "uv.lock",
@@ -115,6 +116,7 @@ def inspect_archive(data: bytes, expected_sha: str) -> ArchivePlan:
         "uv.lock",
         "schemas/master/PROVIDER_ACCOUNT_MASTER.schema.json",
         "scripts/operations/vps_flow_presubmit.py",
+        "scripts/operations/run_production_scene.py",
         "scripts/validation/v2_runtime_doctor.py",
     }
     if not required.issubset(file_hashes):

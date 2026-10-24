@@ -1,20 +1,20 @@
 # V2 Runtime Foundation
 
-This phase establishes library contracts under `src/gflow_cli/v2_runtime`; it does not start a worker, API listener, background task, provider browser, or service.
+The original foundation phase established library contracts under `src/gflow_cli/v2_runtime`; it did not start a worker, API listener, background task, provider browser, or service. The production execution adapters below are a later layer and are invoked explicitly by the production runtime.
 
 ## Configuration
 
-The canonical variables are `RUNTIME_ENV` (`development`, `staging`, or `production`), `STORAGE_PROVIDER`, `TEMP_ROOT`, `LOG_ROOT`, `MIN_FREE_DISK_GB`, `KEEP_FAILED_JOB_HOURS`, and `SUCCESS_TEMP_RETENTION_MINUTES`; `RUNTIME_STATE_ROOT` and `LOG_LEVEL` are also supported. Production requires explicit state/temp/log roots and a storage provider. Paths are absolute POSIX paths; Windows developer paths and filesystem root are rejected. `.env.example` contains placeholders only. Auth is resolved by a future secret-store integration and is not parsed or stored here.
+The canonical variables are `RUNTIME_ENV` (`development`, `staging`, or `production`), `STORAGE_PROVIDER`, `TEMP_ROOT`, `LOG_ROOT`, `MIN_FREE_DISK_GB`, `KEEP_FAILED_JOB_HOURS`, and `SUCCESS_TEMP_RETENTION_MINUTES`; `RUNTIME_STATE_ROOT` and `LOG_LEVEL` are also supported. Production requires explicit state/temp/log roots and a storage provider. Paths are absolute POSIX paths; Windows developer paths and filesystem root are rejected. `.env.example` contains placeholders only. The initial foundation did not parse credentials; the later production adapters use externally provisioned Google Workspace credentials and inject provider keys through the runtime environment.
 
 ## Job lifecycle contract
 
-The future orchestration lifecycle is:
+The original generic foundation sketch was:
 
 `QUEUED -> VALIDATING -> READY -> RUNNING -> VERIFYING -> UPLOADING -> SUCCESS`
 
-Terminal alternatives are `FAILED`, `CANCELLED`, and `HELD`. Failures carry stable `error_code` and message values. Transitions and durable job rows remain the responsibility of the future worker/queue integration; this package does not claim job state persistence.
+That generic sketch predates the current transaction-backed production lifecycle. Current `PRODUCTION_JOBS`, `SCENE_JOBS`, `TTS_JOBS`, and `FINAL_OUTPUT` transitions are implemented by the production stores and orchestrator described below; their persisted vocabularies are defined by the checked-in schemas.
 
-Future job records may need `input_asset_ids`, `temporary_workspace`, `output_asset_id`, `remote_output_uri`, `remote_verified`, `output_sha256`, `local_cleanup_status`, `storage_provider`, `storage_error`, `download_started_at`, `upload_started_at`, `remote_verified_at`, and `local_deleted_at`. These are design notes only; no PRODUCTION_JOBS or SCENE_JOBS canonical schema is created here.
+The earlier design notes proposed additional job metadata. The current transaction schemas supersede that sketch; do not add duplicate fields without reviewing those schemas first.
 
 Each workspace is contained at `<TEMP_ROOT>/<validated-job-id>/` with `input/`, `generated/`, `audio/`, `ffmpeg/`, `validated/`, and `logs/`. Cleanup refuses path traversal, symlink targets, and root targets. RUNNING, unknown, or unverified successful jobs are retained. Expired FAILED/CANCELLED jobs use a longer retention window than verified SUCCESS jobs. Cleanup never scans outside the configured root.
 
@@ -41,7 +41,7 @@ Deployment is intended to flow from local development to Git commit, GitHub, the
 
 ## Storage and asset references
 
-`AssetReference` stores a logical storage provider, stable asset ID/key, optional remote ID, checksum, MIME type, and size. The storage protocol covers resolve/download/upload/remote verify. The current Drive class is a no-I/O placeholder and raises `PROVIDER_ADAPTER_UNAVAILABLE`; no OAuth or API call occurs. Completion must require a verified remote object before a future job is marked successful.
+`AssetReference` stores a logical storage provider, stable asset ID/key, optional remote ID, checksum, MIME type, and size. The storage protocol covers resolve/download/upload/remote verify. The production `GoogleDriveStorageAdapter` uses externally provided Workspace credentials for those operations; job completion follows remote metadata and readback verification.
 
 ## Provider resolution
 
@@ -55,4 +55,35 @@ Legacy request planning preserves the requested duration and returns `requires_s
 
 ## Operational boundary
 
-Production secrets belong in an external credential manager. Logs should carry job ID, timestamps, state transition, provider/profile IDs, error code, free/total bytes, threshold, and asset verification outcome, while excluding credentials, cookies, and full auth headers. Production n8n, VPS files/services, and paid providers are not touched in this phase.
+Production secrets belong in an external credential manager. Logs should carry job ID, timestamps, state transition, provider/profile IDs, error code, free/total bytes, threshold, and asset verification outcome, while excluding credentials, cookies, and full auth headers. Production n8n and unrelated providers are outside this runtime boundary.
+
+## TTS and media finalization V2
+
+The segmented TTS adapter targets the existing loopback service at
+`127.0.0.1:8011`. Its health endpoint is public; the synthesis endpoint is
+protected by `x-api-key` and receives `TTS_API_KEY` from the process environment.
+The adapter requires the returned audio path to resolve inside the configured
+absolute `TTS_OUTPUT_ROOT`, validates the complete audio stream, and never
+retries a request with an uncertain outcome. It copies provider output into a
+per-attempt local workspace and canonicalizes it once as mono 48 kHz PCM WAV.
+
+TTS identity uses the existing `TTS_JOBS` key
+`Production_Job_ID + Dialogue_Line_ID + Attempt_No`. Completed rows return their
+persisted remote artifact without another synthesis call. Unknown or incomplete
+rows block submission. Audio is uploaded through the approved Drive adapter,
+re-downloaded, and SHA-256 verified before local files are deleted and the row
+is marked completed.
+
+The media merger treats validated video duration as authoritative. Shorter audio
+is padded with silence; longer audio fails before FFmpeg runs. The preferred
+path copies video and encodes mono 48 kHz AAC at 192 kbit/s with faststart; an
+H.264 re-encode is the bounded fallback. Output validation probes and fully
+decodes video and audio and records `VIDEO_COPY` or `VIDEO_REENCODE` in the
+returned result, assembly manifest hash, and final-output validation message.
+`-shortest` is intentionally absent to prevent speech truncation.
+
+NO_AUDIO is a separate finalization path guarded by persisted scene metadata:
+`Dialogue_Mode=NONE`, no `SCENE_DIALOGUE_LINES` rows for the scene, and no audio
+stream in the validated source. It writes a `FINAL_VIDEO` row to the existing
+`FINAL_OUTPUT` schema after Drive re-download/hash verification and creates no
+fake TTS job. The source video remains available locally. NO_AUDIO requires no dedicated schema field or synthetic TTS row.

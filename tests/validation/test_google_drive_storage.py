@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from gflow_cli.v2_runtime.assets import AssetReference
 from gflow_cli.v2_runtime.errors import AdapterUnavailableError, AssetVerificationError
 from gflow_cli.v2_runtime.google_drive_storage import GoogleDriveStorageAdapter
 from gflow_cli.v2_runtime.phase_g_artifacts import persist_and_verify
@@ -140,3 +141,41 @@ def test_upload_rejects_changed_folder_capability(tmp_path: Path) -> None:
     )
     with pytest.raises(AdapterUnavailableError, match="not writable"):
         adapter.upload_asset(source, "job-1")
+
+
+def test_download_rejects_file_outside_approved_folder_before_media_read() -> None:
+    media_requested = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal media_requested
+        if request.url.path.endswith("/files/foreign-file"):
+            if request.url.params.get("alt") == "media":
+                media_requested = True
+                return httpx.Response(200, content=b"foreign")
+            return httpx.Response(
+                200,
+                json={
+                    "id": "foreign-file",
+                    "name": "foreign.wav",
+                    "mimeType": "audio/wav",
+                    "size": "7",
+                    "parents": ["unapproved-folder"],
+                },
+            )
+        return httpx.Response(404)
+
+    adapter = GoogleDriveStorageAdapter(
+        Token(),
+        approved_folder_id="approved-folder",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    reference = AssetReference(
+        "GOOGLE_DRIVE",
+        "foreign-file",
+        "tts-job:TTS_000001",
+        remote_file_id="foreign-file",
+        size_bytes=7,
+    )
+    with pytest.raises(AssetVerificationError, match="outside the approved folder"):
+        adapter.download_asset(reference, Path("unused.wav"))
+    assert media_requested is False

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import cast
 
@@ -16,8 +16,11 @@ from .production_jobs import (
     ProductionJob,
     ProductionRequest,
     SceneJob,
+    is_valid_production_job_status,
+    is_valid_production_job_transition,
     is_valid_scene_job_status,
     is_valid_scene_job_transition,
+    validate_final_output_evidence,
     validate_production_job_row,
     validate_remote_evidence,
     validate_scene_job_row,
@@ -144,6 +147,106 @@ class GoogleSheetsProductionJobStore:
 
             return JobClaim(production, tuple(claimed), replayed)
 
+    def transition_production(
+        self,
+        production_job_id: str,
+        expected_status: str,
+        next_status: str,
+        occurred_at: str,
+        reason_code: str | None = None,
+    ) -> ProductionJob:
+        if next_status == "COMPLETED":
+            raise JobConflictError(
+                "Production Job completion requires persisted FINAL_OUTPUT evidence"
+            )
+        if not is_valid_production_job_status(next_status):
+            raise JobConflictError("Production Job status is invalid")
+        if next_status == "HOLD" and not reason_code:
+            raise JobConflictError("HOLD requires a reason code")
+        if next_status == "FAILED" and not reason_code:
+            raise JobConflictError("FAILED requires an error code")
+        with self._lock:
+            current_row = self._get_production_row(production_job_id)
+            current = self._production_from_row(current_row)
+            if current.job_status != expected_status:
+                raise JobConflictError("Production Job state changed before transition")
+            if not is_valid_production_job_transition(current.job_status, next_status):
+                raise JobConflictError("Production Job transition is not allowed")
+            replacement = {
+                **current_row,
+                "Job_Status": next_status,
+                "Updated_At": occurred_at,
+            }
+            if next_status in {"VALIDATING", "RUNNING"} and not current_row.get("Started_At"):
+                replacement["Started_At"] = occurred_at
+            if next_status in {"FAILED", "CANCELLED"}:
+                replacement["Completed_At"] = occurred_at
+            replacement["Hold_Reason_Code"] = reason_code if next_status == "HOLD" else ""
+            replacement["Error_Code"] = reason_code if next_status == "FAILED" else ""
+            replacement["Error_Message"] = reason_code if next_status == "FAILED" else ""
+            validate_production_job_row(replacement)
+            saved = self._replace_production(
+                current_row, replacement, production_job_id, expected_status, next_status
+            )
+            self._events.append(
+                JobEvent(production_job_id, expected_status, next_status, occurred_at, reason_code)
+            )
+            return self._production_from_row(saved)
+
+    def complete_production(
+        self,
+        production_job_id: str,
+        final_output: Mapping[str, object],
+        occurred_at: str,
+    ) -> ProductionJob:
+        with self._lock:
+            current_row = self._get_production_row(production_job_id)
+            current = self._production_from_row(current_row)
+            if current.job_status != "RUNNING":
+                raise JobConflictError("Production Job must be RUNNING before completion")
+            jobs = [
+                self._scene_from_row(row)
+                for row in self._rows.read_rows("SCENE_JOBS")
+                if row.get("Production_Job_ID") == production_job_id
+            ]
+            if not jobs or any(job.job_status != "COMPLETED" for job in jobs):
+                raise JobConflictError("all Scene Jobs must be complete first")
+            validate_final_output_evidence(production_job_id, final_output)
+            saved_output = [
+                row
+                for row in self._rows.read_rows("FINAL_OUTPUT")
+                if row.get("Final_Output_ID") == final_output.get("Final_Output_ID")
+                and row.get("Production_Job_ID") == production_job_id
+            ]
+            if len(saved_output) != 1 or any(
+                saved_output[0].get(field) != final_output.get(field)
+                for field in (
+                    "Final_Output_ID",
+                    "Output_Type",
+                    "Output_Status",
+                    "Validation_Status",
+                    "Remote_Verified",
+                    "Remote_File_ID",
+                    "Remote_Output_URI",
+                    "Output_SHA256",
+                    "Output_Size_Bytes",
+                    "Duration_Sec",
+                )
+            ):
+                raise JobConflictError("FINAL_OUTPUT readback does not match completion evidence")
+            replacement = {
+                **current_row,
+                "Job_Status": "COMPLETED",
+                "Completed_At": occurred_at,
+                "Updated_At": occurred_at,
+            }
+            validate_production_job_row(replacement)
+            saved = self._replace_production(
+                current_row, replacement, production_job_id, "RUNNING", "COMPLETED"
+            )
+            self._events.append(JobEvent(production_job_id, "RUNNING", "COMPLETED", occurred_at))
+            return self._production_from_row(saved)
+
     def transition_scene(
         self,
         scene_job_id: str,
@@ -267,6 +370,8 @@ class GoogleSheetsProductionJobStore:
                 **row,
                 "Local_Cleanup_Status": "CLEANED",
                 "Local_Deleted_At": occurred_at,
+                "Error_Code": "",
+                "Error_Message": "",
                 "Updated_At": occurred_at,
             }
             saved = self._replace_scene(
@@ -279,6 +384,58 @@ class GoogleSheetsProductionJobStore:
                     job.job_status,
                     occurred_at,
                     "LOCAL_CLEANUP_COMPLETE",
+                )
+            )
+            return self._scene_from_row(saved)
+
+    def record_cleanup_failure(
+        self, scene_job_id: str, reason_code: str, occurred_at: str
+    ) -> SceneJob:
+        if not reason_code.strip():
+            raise ValueError("cleanup failure requires a stable reason code")
+        with self._lock:
+            current = self._get_scene_row(scene_job_id)
+            job = self._scene_from_row(current)
+            if (
+                job.job_status != "REMOTE_VERIFYING"
+                or not job.remote_verified
+                or not job.remote_sha256
+                or job.remote_sha256 != job.output_sha256
+            ):
+                raise JobConflictError(
+                    "cleanup failure can be recorded only after remote verification"
+                )
+            replacement = {
+                **current,
+                "Local_Cleanup_Status": "CLEANUP_FAILED",
+                "Error_Code": reason_code,
+                "Error_Message": reason_code,
+                "Updated_At": occurred_at,
+            }
+            try:
+                saved = self._rows.update_expected(
+                    "SCENE_JOBS",
+                    key_value=scene_job_id,
+                    expected_digest=self._rows.row_digest("SCENE_JOBS", current),
+                    replacement=replacement,
+                )
+            except SheetsTransactionError as exc:
+                observed = self._get_scene_row(scene_job_id)
+                if self._rows.row_digest("SCENE_JOBS", observed) == self._rows.row_digest(
+                    "SCENE_JOBS", replacement
+                ):
+                    saved = observed
+                else:
+                    raise SheetsTransactionError(
+                        "cleanup failure write acknowledgement is unresolved; retry is blocked"
+                    ) from exc
+            self._events.append(
+                JobEvent(
+                    scene_job_id,
+                    job.job_status,
+                    job.job_status,
+                    occurred_at,
+                    reason_code,
                 )
             )
             return self._scene_from_row(saved)
@@ -381,6 +538,61 @@ class GoogleSheetsProductionJobStore:
                 "Scene Job update acknowledgement is unresolved; HOLD required"
             ) from exc
 
+    def _replace_production(
+        self,
+        current: dict[str, object],
+        replacement: dict[str, object],
+        production_job_id: str,
+        expected_status: str,
+        next_status: str,
+    ) -> dict[str, object]:
+        try:
+            return self._rows.update_expected(
+                "PRODUCTION_JOBS",
+                key_value=production_job_id,
+                expected_digest=self._rows.row_digest("PRODUCTION_JOBS", current),
+                replacement=replacement,
+            )
+        except SheetsTransactionError as exc:
+            observed = self._get_production_row(production_job_id)
+            if self._rows.row_digest("PRODUCTION_JOBS", observed) == self._rows.row_digest(
+                "PRODUCTION_JOBS", replacement
+            ):
+                return observed
+            if observed.get("Job_Status") != expected_status:
+                raise SheetsTransactionError(
+                    "Production Job write outcome conflicts with expected state; HOLD required"
+                ) from exc
+            if next_status != "HOLD":
+                held = {
+                    **observed,
+                    "Job_Status": "HOLD",
+                    "Hold_Reason_Code": "SHEETS_ACK_UNRESOLVED",
+                    "Updated_At": str(replacement.get("Updated_At", "")),
+                }
+                try:
+                    self._rows.update_expected(
+                        "PRODUCTION_JOBS",
+                        key_value=production_job_id,
+                        expected_digest=self._rows.row_digest("PRODUCTION_JOBS", observed),
+                        replacement=held,
+                    )
+                except SheetsTransactionError:
+                    pass
+            raise SheetsTransactionError(
+                "Production Job update acknowledgement is unresolved; HOLD required"
+            ) from exc
+
+    def _get_production_row(self, production_job_id: str) -> dict[str, object]:
+        matches = [
+            dict(row)
+            for row in self._rows.read_rows("PRODUCTION_JOBS")
+            if row.get("Production_Job_ID") == production_job_id
+        ]
+        if len(matches) != 1:
+            raise SheetsTransactionError("Production Job is missing or duplicated; HOLD required")
+        return matches[0]
+
     def _write_hold(
         self,
         scene_job_id: str,
@@ -477,6 +689,8 @@ class GoogleSheetsProductionJobStore:
                 local_deleted_at=str(row.get("Local_Deleted_At") or "") or None,
                 created_at=str(row.get("Created_At") or ""),
                 remote_verified_at=str(row.get("Remote_Verified_At") or "") or None,
+                error_code=str(row.get("Error_Code") or "") or None,
+                error_message=str(row.get("Error_Message") or "") or None,
             )
             validate_scene_job_row(row)
             return job

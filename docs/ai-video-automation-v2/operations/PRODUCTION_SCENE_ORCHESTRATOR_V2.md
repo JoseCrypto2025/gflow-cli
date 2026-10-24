@@ -1,0 +1,51 @@
+# Production Scene Orchestrator V2
+
+`scripts/operations/run_production_scene.py` is the one-scene production
+operator for a locked, approved **NO_AUDIO** Scene. It composes the current
+live Sheets snapshot, Phase E, Phase F5, the Sheets-backed Production/Scene
+Job stores, the bound Phase G adapter, verified Drive finalization, and local
+cleanup through `ProductionOrchestrator`.
+
+The operator requires explicit scene, profile, account, project, and expected
+Google email arguments. It reads the current Flow credit balance through the
+repository's read-only `gflow credits` service using the `gflow-prod` profile;
+caller-supplied balances are not accepted. It also requires the production
+runtime environment and an externally provisioned Google Workspace credential.
+The account, project, profile, current approved prompt, Scene audio intent, and
+one-output setting are checked against fresh live Master data. Phase F5 runs
+before a production job is claimed. After F5, the operator reads the full
+snapshot again and holds if any canonical Sheet data changed.
+
+Without `--execute`, the command performs only the live Sheets read and Phase E
+checks and prints `READY_FOR_F5_AND_EXECUTION`; it does not open Flow or write
+transaction rows. With `--execute`, it runs non-submitting F5 and then the
+canonical one-shot lifecycle. The Phase G request is bound to the claimed
+Scene Job's deterministic D2 ID. Re-entry on an unresolved Scene Job uses the
+same Phase G request for recovery; caller-supplied media is not accepted.
+Existing production or Scene Jobs for the same prompt prevent a second claim.
+
+Example invocation after the operator has independently verified current
+identity:
+
+```powershell
+python scripts/operations/run_production_scene.py `
+  --scene-id SCN_000001 `
+  --profile-id GPR_0002 `
+  --provider-account-id PVA_0002 `
+  --provider-project-id aafe9282-071f-4333-baa4-92b9f76a9c27 `
+  --expected-email singleava508@gmail.com `
+  --execute
+```
+
+The balance is read before F5 and refreshed after F5, before the attempt is
+claimed. A missing, unauthenticated, or mismatched profile balance holds the
+operator. The Phase G quote is still subject to the shared daily credit guard.
+The operator supports only
+the explicit `Dialogue_Mode=NONE` branch. It creates no TTS row and does not
+infer speech from visual prompt text. The speech-enabled TTS/Merge components
+remain library composition until an approved voice-resolution path is
+available; do not use this operator for speech-enabled scenes.
+
+The deployed archive allowlists this operator explicitly. It does not invoke
+n8n or the separate audio-enhancement endpoint; V2 merge runs locally through
+the validated FFmpeg pipeline.
