@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import sys
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
+import pytest
+
+from scripts.validation import v2_runtime_doctor as doctor
 from scripts.validation.v2_runtime_doctor import _application_sha, _check, _run
 
 
@@ -21,6 +25,17 @@ def test_run_bounds_collected_command_output() -> None:
 
     assert code == 0
     assert len(output) == 300
+
+
+def test_package_version_accepts_the_sha_verified_source_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_distribution(name: str) -> str:
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(doctor.importlib.metadata, "version", missing_distribution)
+
+    assert doctor._package_version() == "source tree"
 
 
 def test_application_sha_requires_a_well_formed_expected_value(tmp_path: Path) -> None:

@@ -29,6 +29,14 @@ def _check(name: str, ok: bool, detail: str) -> dict[str, Any]:
     return {"name": name, "status": "PASS" if ok else "FAIL", "detail": detail}
 
 
+def _package_version() -> str:
+    """Return installed metadata when available, or identify source-tree import mode."""
+    try:
+        return importlib.metadata.version("gflow-cli")
+    except importlib.metadata.PackageNotFoundError:
+        return "source tree"
+
+
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
 
@@ -76,7 +84,7 @@ def run_doctor() -> dict[str, Any]:
     try:
         import gflow_cli  # noqa: F401
 
-        package_version = importlib.metadata.version("gflow-cli")
+        package_version = _package_version()
         checks.append(_check("gflow_import", True, f"gflow-cli {package_version}"))
     except ImportError:
         checks.append(_check("gflow_import", False, "import failed"))
