@@ -101,7 +101,7 @@ def test_runtime_dependency_sync_uses_the_staged_venv_and_locked_project(
             "--frozen",
             "--no-dev",
             "--no-build",
-            "--no-install-project",
+            "--no-editable",
             "--project",
             str(stage),
             "--python",

@@ -290,7 +290,7 @@ def _sync_runtime_dependencies(stage: Path) -> None:
             "--frozen",
             "--no-dev",
             "--no-build",
-            "--no-install-project",
+            "--no-editable",
             "--project",
             str(stage),
             "--python",
