@@ -208,12 +208,21 @@ order:
 1. `AGENTS.md`.
 2. The applicable canonical execution contract.
 3. Current repository function and CLI signatures that implement the operation.
-4. The latest persisted execution evidence and operator report for the target attempt.
+4. The latest persisted execution evidence and the applicable operator report when that contract
+   defines one for the target attempt.
 
 Never guess function names, function arguments, CLI flags, state names, error codes, ledger fields,
 profile/project/path names, retry semantics, or recovery ordering. If the contract, current code, and
 persisted evidence disagree, **STOP**; do not improvise. If required evidence is missing or cannot
 be verified, stop before execution or recovery.
+
+For `D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1` only, a separate operator report is not applicable when
+the historical runtime had no report contract or writer. Read fresh canonical source snapshots,
+build the legacy evidence envelope, and require
+`envelope.recovery_prerequisite_satisfied` before calling the legacy reconciler. The envelope is a
+separate evidence artifact; it is not a reconstructed or renamed operator report. If its identity,
+provenance, source digest, or exact reservation checks fail, stop. This exception does not change
+modern PROD requirements or the frozen TEST recovery contract.
 
 When a canonical contract exists, execution prompts must be **PARAMETERS-ONLY / DELTA-ONLY**.
 Workflow logic belongs in the canonical contract and committed code; do not rewrite it in every

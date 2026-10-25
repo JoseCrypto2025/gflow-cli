@@ -15,6 +15,32 @@ returns a separate audit event. A caller may persist that event to
 `<runtime-state-root>/phase-g/prod-legacy-reconciliation-audit.json`; the D2 attempt row and shared
 credit row remain unchanged by classification.
 
+The supported operator is `scripts/operations/reconcile_legacy_prod_attempt.py`. It accepts only an
+exact `--d2-run-id`; observation time and software commit are read by the operator, and canonical
+Sheets data plus the production D2 and shared credit ledgers are loaded from configured runtime
+sources. It builds the legacy envelope itself and fails closed unless
+`recovery_prerequisite_satisfied` is true. Classification is read-only by default. The explicit
+`--persist-audit` option writes only the contract's separate legacy audit; it never releases credit.
+The operator does not open Flow, generate, approve, or create attempts. It reports
+`operator_report_for_legacy=NOT_APPLICABLE` for this legacy path without creating a historical
+report. Fresh live Sheets access requires `GFLOW_GOOGLE_WORKSPACE_CREDENTIALS` and the production
+runtime configuration.
+
+## Pre-recovery context
+
+For this historical PROD path, a separate operator report is `NOT_APPLICABLE` when the runtime that
+created the attempt had no PROD D2 report contract or writer. The required pre-recovery context is a
+freshly built legacy evidence envelope. The caller must require
+`envelope.recovery_prerequisite_satisfied == True` before invoking the reconciler; otherwise it must
+stop. That predicate requires the exact unique Production Job, Scene Job, D2 attempt, Scene, approved
+Prompt and hash, Generation Profile, Provider Account, PROD Flow project/environment, and credit
+reservation joins, with provenance and source snapshot hashes/times for each required identity.
+
+The envelope remains a distinct evidence artifact and does not represent or recreate a historical
+operator report. This exception applies only to this legacy PROD contract; modern PROD and the
+frozen TEST recovery rules are unchanged. Missing provider evidence still classifies as ambiguous,
+and does not authorize releasing a reservation.
+
 An exact positive refusal can be released only through
 `ProductionCreditGuard.release_legacy_proven_not_submitted(...)`, after the classification event is
 persisted. The guard rereads the exact D2 attempt, reruns the unchanged modern refusal predicate on
@@ -32,7 +58,7 @@ remains `UNKNOWN`.
 | `SCENE_PROMPT_VERSION` Google Sheet | `Scene_Prompt_ID` | Exact Scene, approved status, Generation Profile, and `Prompt_SHA256` |
 | `GENERATION_PROFILE_MASTER` | `Generation_Profile_ID` | PROD environment and exact Provider Account |
 | `PROVIDER_ACCOUNT_MASTER` | `Provider_Account_ID` | PROD environment and exact `Provider_Project_ID` |
-| D2 ledger | `<runtime-state-root>/phase-g/d2-credit-ledger.json` | Unique `d2_run_id`; direct scene, prompt, profile, account, project, and prompt hash |
+| PROD D2 ledger | `<runtime-state-root>/production/phase-g/d2-credit-ledger.json` | Unique `d2_run_id`; direct scene, prompt, profile, account, project, and prompt hash |
 | Shared credit ledger | `<runtime-state-root>/production-credit/shared-ledger.json` | Unique `attempt_id`; exact PROD, account, and project; optional persisted job IDs must agree |
 
 Every source snapshot carries its own source name, SHA-256, and observation time. The joins do not

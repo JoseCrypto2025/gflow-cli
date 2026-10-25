@@ -38,6 +38,7 @@ ARCHIVE_PATHS = (
     "schemas",
     "scripts/operations/vps_flow_presubmit.py",
     "scripts/operations/run_production_scene.py",
+    "scripts/operations/reconcile_legacy_prod_attempt.py",
     "scripts/validation/v2_runtime_doctor.py",
     "scripts/validation/validate_v2_data_architecture.py",
     "pyproject.toml",
@@ -118,6 +119,7 @@ def inspect_archive(data: bytes, expected_sha: str) -> ArchivePlan:
         "schemas/master/PROVIDER_ACCOUNT_MASTER.schema.json",
         "scripts/operations/vps_flow_presubmit.py",
         "scripts/operations/run_production_scene.py",
+        "scripts/operations/reconcile_legacy_prod_attempt.py",
         "scripts/validation/v2_runtime_doctor.py",
         "scripts/validation/validate_v2_data_architecture.py",
     }

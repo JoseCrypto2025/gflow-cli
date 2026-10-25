@@ -39,7 +39,9 @@ read-only [`D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1.md`](D2_PROD_LEGACY_ATTEMPT_RECOV
 envelope. It joins exact canonical identities, records per-field provenance in a separate audit,
 and leaves source rows untouched. Missing provider evidence remains ambiguous and reserved; a
 `RUNNING` row without exact execution proof is reported as needing HOLD, not changed during
-assessment.
+assessment. Use `scripts/operations/reconcile_legacy_prod_attempt.py --d2-run-id <exact-id>` for
+the supported legacy classification path. It loads fresh canonical sources and does not release a
+reservation; `--persist-audit` is an explicit separate-audit option.
 
 Example invocation after the operator has independently verified current
 identity:

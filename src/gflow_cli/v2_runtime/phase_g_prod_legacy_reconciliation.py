@@ -167,6 +167,11 @@ class LegacyProdAttemptEnvelope:
         encoded = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
+    @property
+    def recovery_prerequisite_satisfied(self) -> bool:
+        """Return whether this envelope is complete enough for legacy PROD recovery."""
+        return legacy_recovery_prerequisite_satisfied(self)
+
     def as_dict(self) -> dict[str, object]:
         return {
             "identity": asdict(self.identity) if self.identity is not None else None,
@@ -588,6 +593,100 @@ def build_legacy_prod_attempt_envelope(
         scene_job_status=scene_status or None,
         job_disposition=disposition,
     )
+
+
+def legacy_recovery_prerequisite_satisfied(envelope: LegacyProdAttemptEnvelope) -> bool:
+    """Validate the exact identity and provenance required before legacy PROD recovery.
+
+    A legacy evidence envelope is the pre-recovery context for this path. It is
+    intentionally distinct from an operator report, which this legacy runtime
+    did not define or persist.
+    """
+    identity = envelope.identity
+    if envelope.identity_status != "IDENTITY_VALIDATED" or identity is None or envelope.reasons:
+        return False
+
+    expected_fields = {
+        "production_job_id": (
+            identity.production_job_id,
+            ProdLegacyEvidenceClass.DERIVED_CANONICAL_JOIN,
+        ),
+        "scene_job_id": (
+            identity.scene_job_id,
+            ProdLegacyEvidenceClass.DERIVED_CANONICAL_JOIN,
+        ),
+        "attempt_id": (identity.d2_run_id, ProdLegacyEvidenceClass.PERSISTED_DIRECT),
+        "scene_id": (identity.scene_id, ProdLegacyEvidenceClass.PERSISTED_DIRECT),
+        "prompt_id": (
+            identity.scene_prompt_id,
+            ProdLegacyEvidenceClass.DERIVED_CANONICAL_JOIN,
+        ),
+        "prompt_sha256": (identity.prompt_sha256, ProdLegacyEvidenceClass.PERSISTED_DIRECT),
+        "generation_profile_id": (
+            identity.generation_profile_id,
+            ProdLegacyEvidenceClass.PERSISTED_DIRECT,
+        ),
+        "provider_account_id": (
+            identity.provider_account_id,
+            ProdLegacyEvidenceClass.PERSISTED_DIRECT,
+        ),
+        "flow_project_id": (
+            identity.provider_project_id,
+            ProdLegacyEvidenceClass.PERSISTED_DIRECT,
+        ),
+        "execution_environment": (
+            "PROD",
+            ProdLegacyEvidenceClass.DERIVED_CANONICAL_JOIN,
+        ),
+    }
+    for name, (expected_value, expected_provenance) in expected_fields.items():
+        try:
+            field = envelope.field(name)
+        except KeyError:
+            return False
+        if (
+            field.value != expected_value
+            or field.provenance_class is not expected_provenance
+            or not field.sources
+        ):
+            return False
+        if any(
+            not source.source.strip()
+            or not source.record_key.strip()
+            or not _SHA256_RE.fullmatch(source.snapshot_sha256)
+            for source in field.sources
+        ):
+            return False
+        try:
+            for source in field.sources:
+                _require_aware_timestamp(source.snapshot_observed_at, "source snapshot time")
+        except ValueError:
+            return False
+
+    for name in ("credit_reservation_state", "reserved_credits"):
+        try:
+            field = envelope.field(name)
+        except KeyError:
+            return False
+        if (
+            field.value in (None, "")
+            or field.provenance_class is not ProdLegacyEvidenceClass.PERSISTED_DIRECT
+            or not field.sources
+        ):
+            return False
+        if any(
+            not source.source.strip()
+            or not source.record_key.strip()
+            or not _SHA256_RE.fullmatch(source.snapshot_sha256)
+            for source in field.sources
+        ):
+            return False
+        try:
+            for source in field.sources:
+                _require_aware_timestamp(source.snapshot_observed_at, "source snapshot time")
+        except ValueError:
+            return False
+    return True
 
 
 def reconcile_legacy_prod_same_attempt(

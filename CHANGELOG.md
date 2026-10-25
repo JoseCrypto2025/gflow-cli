@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-contract attempts, a separate idempotent reconciliation audit, and an exact legacy reservation
   release guard that reuses the unchanged modern refusal proof. Missing Generate timestamps and
   provider evidence remain unavailable/ambiguous; existing Sheets and D2 rows are never backfilled.
+  The supported `reconcile_legacy_prod_attempt.py` operator loads fresh canonical sources, validates
+  the envelope before classification, and persists only the separate audit when explicitly asked.
 
 - **TTS and media finalization V2.** Adds an authenticated segmented-TTS
   adapter, exact-schema `TTS_JOBS` persistence and completed-artifact reuse,
