@@ -39,6 +39,14 @@ from .phase_g_artifacts import (
     validate_video,
 )
 from .phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
+from .phase_g_prod_reconciliation import (
+    ProdAttemptIdentity,
+    ProdReconciliationEvidence,
+    ProdReconciliationResult,
+    classify_prod_reconciliation,
+    evidence_audit_record,
+    prod_evidence_from_attempt,
+)
 from .production_execution import ProductionCreditGuard, ProductionExecutionContext
 from .timestamps import parse_utc_timestamp
 
@@ -50,6 +58,84 @@ _PROJECT_NAME = "AI Video Automation V2 - TEST"
 _AUTH_PROFILE = "GFLOW_V2_TEST_AUTH"
 _MODEL_DISPLAY_NAMES = {"MDL_0001": "Veo 3.1 - Lite"}
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", re.I)
+
+
+def reconcile_prod_same_attempt(
+    runtime_state_root: Path,
+    context: ProductionExecutionContext,
+    identity: ProdAttemptIdentity,
+    *,
+    credit_guard: ProductionCreditGuard,
+    evidence: ProdReconciliationEvidence | None = None,
+) -> ProdReconciliationResult:
+    """Reconcile one existing PROD attempt using persisted/observed facts only.
+
+    This function has no browser, Flow, Generate, approval, or attempt-creation path.
+    """
+    if (
+        context.environment != "PROD"
+        or context.attempt_id != identity.d2_run_id
+        or context.production_job_id != identity.production_job_id
+        or context.scene_job_id != identity.scene_job_id
+        or context.provider_account_id != identity.provider_account_id
+        or context.provider_project_id != identity.provider_project_id
+        or context.scene_id != identity.scene_id
+        or context.scene_prompt_id != identity.scene_prompt_id
+        or context.generation_profile_id != identity.generation_profile_id
+    ):
+        raise PhaseGError(
+            "PHASE_G_RECOVERY_IDENTITY_MISMATCH", "PROD context does not match attempt identity"
+        )
+    if not runtime_state_root.is_absolute() or runtime_state_root == Path(
+        runtime_state_root.anchor
+    ):
+        raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "runtime state root is invalid")
+    ledger = D2DailyCreditLedger(runtime_state_root)
+    matches = [row for row in ledger.attempts() if row.get("d2_run_id") == identity.d2_run_id]
+    if len(matches) != 1:
+        raise PhaseGError(
+            "PHASE_G_RECOVERY_IDENTITY_MISMATCH", "exactly one persisted D2 attempt is required"
+        )
+    attempt = matches[0]
+    if evidence is not None and evidence.identity != identity:
+        raise PhaseGError(
+            "PHASE_G_RECOVERY_IDENTITY_MISMATCH", "evidence does not match PROD attempt identity"
+        )
+    resolved_evidence = evidence or prod_evidence_from_attempt(identity, attempt)
+    if resolved_evidence is None:
+        observed_at = attempt.get("updated_at") or attempt.get("generate_action_at")
+        if not isinstance(observed_at, str):
+            raise PhaseGError(
+                "PHASE_G_RECOVERY_EVIDENCE_MISSING", "stable persisted observation time is missing"
+            )
+        resolved_evidence = ProdReconciliationEvidence(
+            identity=identity,
+            observed_at=observed_at,
+        )
+    result = classify_prod_reconciliation(identity, resolved_evidence, persisted_attempt=attempt)
+    if result is ProdReconciliationResult.PROVEN_NOT_SUBMITTED:
+        persisted_evidence = prod_evidence_from_attempt(identity, attempt)
+        if (
+            persisted_evidence is None
+            or classify_prod_reconciliation(identity, persisted_evidence, persisted_attempt=attempt)
+            is not ProdReconciliationResult.PROVEN_NOT_SUBMITTED
+        ):
+            result = ProdReconciliationResult.AMBIGUOUS_AFTER_RECONCILIATION
+        else:
+            resolved_evidence = persisted_evidence
+    audit = evidence_audit_record(result, resolved_evidence)
+    audit["contract_version"] = "D2_PROD_SAME_ATTEMPT_RECOVERY_V1"
+    ledger.record_prod_reconciliation(identity.d2_run_id, audit)
+    if result is ProdReconciliationResult.PROVEN_NOT_SUBMITTED:
+        credit_guard.release_proven_not_submitted(
+            identity.d2_run_id,
+            evidence_sha256=resolved_evidence.digest(),
+            production_job_id=identity.production_job_id,
+            scene_job_id=identity.scene_job_id,
+            provider_account_id=identity.provider_account_id,
+            provider_project_id=identity.provider_project_id,
+        )
+    return result
 
 
 @dataclass(frozen=True, slots=True)

@@ -1841,6 +1841,8 @@ def test_test_session_rejects_prod_execution_context(tmp_path: Path) -> None:
         "SPV_000002",
         request_id,
         CreditBudgetContext(provider_remaining_free=Decimal("40")),
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
     )
     request = PhaseGExecutionRequest.from_presubmit(
         base, request_id, execution_context=prod_context

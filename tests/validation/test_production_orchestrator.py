@@ -13,6 +13,11 @@ import pytest
 from gflow_cli.v2_runtime.assets import AssetReference
 from gflow_cli.v2_runtime.audio_intent import AudioIntent
 from gflow_cli.v2_runtime.phase_e import PreflightResult
+from gflow_cli.v2_runtime.phase_g import PhaseGExecutionRequest
+from gflow_cli.v2_runtime.production_execution import (
+    CreditBudgetContext,
+    ProductionExecutionContext,
+)
 from gflow_cli.v2_runtime.production_jobs import (
     InMemoryProductionJobStore,
     ProductionRequest,
@@ -199,7 +204,7 @@ def test_no_audio_orchestrator_completes_without_tts_and_reuses_final_output(
     assert result.audio_intent.value == "NO_AUDIO"
     assert result.tts_job_id == "NOT_REQUIRED"
     assert result.scene_job.job_status == "COMPLETED"
-    assert result.claim.production_job.job_status == "REQUESTED"
+    assert result.claim.production_job.job_status == "COMPLETED"
     assert jobs.production_jobs()[0].job_status == "COMPLETED"
     assert generator.calls == 1
     assert len(outputs.rows) == 1
@@ -246,27 +251,34 @@ def test_orchestrator_composes_the_pinned_phase_g_adapter(
     )
 
     def make_phase_g_request(scene_job, d2_run_id):
-        phase_g_request = SimpleNamespace(
+        phase_g_request = PhaseGExecutionRequest(
             scene_id="SCN_000001",
             scene_prompt_id=scene_job.scene_prompt_id,
             generation_profile_id="GPR_0001",
+            provider_id="PRV_0001",
             provider_account_id="PVA_0001",
             provider_project_id="project-1",
+            model_id="VEO_3",
+            generation_mode="TEXT_TO_VIDEO",
             compiled_prompt_text=preflight.compiled_prompt,
             compiled_negative_prompt=preflight.compiled_negative_prompt or "",
+            source_context_sha256="a" * 64,
             prompt_sha256="b" * 64,
             duration_sec=2.0,
             aspect_ratio="16:9",
             d2_run_id=d2_run_id,
             output_count=1,
-            execution_context=SimpleNamespace(
-                environment="PROD",
-                attempt_id=d2_run_id,
-                scene_id="SCN_000001",
-                scene_prompt_id=scene_job.scene_prompt_id,
-                generation_profile_id="GPR_0001",
-                provider_account_id="PVA_0001",
-                provider_project_id="project-1",
+            execution_context=ProductionExecutionContext(
+                "PROD",
+                "PRV_0001",
+                "PVA_0001",
+                "project-1",
+                "GFLOW_PROD_AUTH",
+                "SCN_000001",
+                "GPR_0001",
+                scene_job.scene_prompt_id,
+                d2_run_id,
+                CreditBudgetContext(),
             ),
             presubmit_request=SimpleNamespace(temp_root=workspace.directories["generated"]),
         )
@@ -332,6 +344,8 @@ def test_ambiguous_generation_is_not_repeated_on_replay(tmp_path: Path) -> None:
     original_generate = generator.generate_once
 
     def ambiguous(scene_job, result):
+        assert scene_job.job_status == "QUEUED"
+        assert jobs.production_jobs()[0].job_status == "QUEUED"
         generator.calls += 1
         raise RuntimeError("provider acknowledgement was lost")
 
@@ -360,6 +374,8 @@ def test_ambiguous_generation_is_not_repeated_on_replay(tmp_path: Path) -> None:
             jobs, outputs, MemoryDrive(tmp_path / "drive"), temp_root=temp_root
         ).run_scene_once(request, **args)
     assert generator.calls == 1
+    assert jobs.scene_jobs()[0].job_status == "HOLD"
+    assert jobs.production_jobs()[0].job_status == "HOLD"
 
 
 def test_orchestrator_rejects_workspace_not_bound_to_claimed_scene_job(

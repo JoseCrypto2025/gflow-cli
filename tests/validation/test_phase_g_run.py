@@ -127,6 +127,8 @@ def test_prod_request_builder_binds_context_to_live_master_identity(tmp_path: Pa
         "D6_test-run-0001",
         CreditBudgetContext(provider_remaining_free=50),
         prerequisite_d2_run_id="D2_test-run-0001",
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
     )
 
     request = build_phase_g_request(
@@ -156,6 +158,8 @@ def test_prod_request_builder_rejects_test_account_context(tmp_path: Path) -> No
         "SPV_000002",
         "D2_test-run-0002",
         CreditBudgetContext(provider_remaining_free=50),
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
     )
     with pytest.raises(PhaseGError):
         build_phase_g_request(

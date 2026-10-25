@@ -70,6 +70,8 @@ class ProductionExecutionContext:
     attempt_id: str
     credit_budget_context: CreditBudgetContext
     prerequisite_d2_run_id: str | None = None
+    production_job_id: str | None = None
+    scene_job_id: str | None = None
 
     def validate(self, resolved: dict[str, str]) -> None:
         if self.environment not in {"DEV", "TEST", "PROD"}:
@@ -86,6 +88,8 @@ class ProductionExecutionContext:
         }
         if any(not value for value in expected.values()) or not self.attempt_id:
             raise ProductionExecutionError("execution identity is incomplete")
+        if self.environment == "PROD" and (not self.production_job_id or not self.scene_job_id):
+            raise ProductionExecutionError("PROD execution must bind production and scene jobs")
         if resolved != expected:
             raise ProductionExecutionError(
                 "resolved provider identity differs from execution context"
@@ -126,6 +130,8 @@ class ProductionCreditGuard:
                     or existing.get("provider_account_id") != context.provider_account_id
                     or existing.get("provider_project_id") != context.provider_project_id
                     or existing.get("environment") != context.environment
+                    or existing.get("production_job_id") != context.production_job_id
+                    or existing.get("scene_job_id") != context.scene_job_id
                 ):
                     raise ProductionExecutionError(
                         "attempt ID is already bound to another identity"
@@ -156,6 +162,9 @@ class ProductionCreditGuard:
                 "reserved_credits": "0",
                 "created_at": format_utc_timestamp(moment),
             }
+            if context.environment == "PROD":
+                row["production_job_id"] = context.production_job_id
+                row["scene_job_id"] = context.scene_job_id
             records.append(row)
             return dict(row)
 
@@ -281,6 +290,113 @@ class ProductionCreditGuard:
                 raise ProductionExecutionError("only an unsubmitted attempt can be released")
             row["state"] = "FAILED_CONFIRMED"
             row["reserved_credits"] = "0"
+            return dict(row)
+
+        self._mutate(update)
+
+    def release_proven_not_submitted(
+        self,
+        attempt_id: str,
+        *,
+        evidence_sha256: object,
+        production_job_id: str,
+        scene_job_id: str,
+        provider_account_id: str,
+        provider_project_id: str,
+    ) -> None:
+        """Release this attempt's reservation only after exact refusal evidence is classified."""
+        if (
+            not isinstance(evidence_sha256, str)
+            or len(evidence_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in evidence_sha256)
+        ):
+            raise ProductionExecutionError("reconciliation evidence digest is invalid")
+        from .phase_g import D2DailyCreditLedger
+        from .phase_g_prod_reconciliation import (
+            ProdAttemptIdentity,
+            ProdReconciliationResult,
+            classify_prod_reconciliation,
+            prod_evidence_from_attempt,
+        )
+
+        matches = [
+            row
+            for row in D2DailyCreditLedger(self.root.parent).attempts()
+            if row.get("d2_run_id") == attempt_id
+        ]
+        if len(matches) != 1:
+            raise ProductionExecutionError("persisted D2 attempt is missing or ambiguous")
+        attempt = matches[0]
+        try:
+            identity = ProdAttemptIdentity(
+                production_job_id=production_job_id,
+                scene_job_id=scene_job_id,
+                d2_run_id=attempt_id,
+                provider_account_id=provider_account_id,
+                provider_project_id=provider_project_id,
+                scene_id=str(attempt.get("scene_id", "")),
+                scene_prompt_id=str(attempt.get("scene_prompt_id", "")),
+                generation_profile_id=str(attempt.get("generation_profile_id", "")),
+                prompt_sha256=str(attempt.get("prompt_sha256", "")),
+            )
+        except ValueError as exc:
+            raise ProductionExecutionError("persisted PROD attempt identity is invalid") from exc
+        evidence = prod_evidence_from_attempt(identity, attempt)
+        history_value = attempt.get("prod_reconciliation_history", [])
+        history_items = cast(list[object], history_value) if isinstance(history_value, list) else []
+        has_authoritative_audit = any(
+            isinstance(item, dict)
+            and cast(dict[str, object], item).get("evidence_sha256") == evidence_sha256
+            and cast(dict[str, object], item).get(
+                "result", ProdReconciliationResult.AMBIGUOUS_AFTER_RECONCILIATION.value
+            )
+            == ProdReconciliationResult.PROVEN_NOT_SUBMITTED.value
+            and cast(dict[str, object], item).get("contract_version")
+            == "D2_PROD_SAME_ATTEMPT_RECOVERY_V1"
+            for item in history_items
+        )
+        if (
+            evidence is None
+            or evidence.digest() != evidence_sha256
+            or classify_prod_reconciliation(identity, evidence, persisted_attempt=attempt)
+            is not ProdReconciliationResult.PROVEN_NOT_SUBMITTED
+            or not has_authoritative_audit
+        ):
+            raise ProductionExecutionError(
+                "persisted PROD identity or authoritative refusal evidence "
+                "does not authorize release"
+            )
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            row = self._find(payload, attempt_id)
+            if (
+                row.get("environment") != "PROD"
+                or row.get("production_job_id") != production_job_id
+                or row.get("scene_job_id") != scene_job_id
+                or row.get("provider_account_id") != provider_account_id
+                or row.get("provider_project_id") != provider_project_id
+            ):
+                raise ProductionExecutionError(
+                    "credit reservation identity does not match PROD attempt"
+                )
+            if row.get("reconciliation_release_evidence_sha256") == evidence_sha256:
+                return dict(row)
+            if row.get("state") in _TERMINAL - {"WAF_REJECTION"}:
+                raise ProductionExecutionError("terminal attempt cannot be released again")
+            if row.get("state") == "WAF_REJECTION" and row.get(
+                "reconciliation_release_evidence_sha256"
+            ):
+                raise ProductionExecutionError("WAF reservation was already reconciled")
+            if row.get("generate_click_count") != 1 or row.get("state") not in {
+                "SUBMISSION_UNRESOLVED",
+                "QUOTED_RESERVED",
+                "WAF_REJECTION",
+            }:
+                raise ProductionExecutionError("attempt is not eligible for reconciliation release")
+            row["reserved_credits"] = "0"
+            row["state"] = "WAF_REJECTION"
+            row["billing_outcome"] = "UNKNOWN"
+            row["reconciliation_release_evidence_sha256"] = evidence_sha256
             return dict(row)
 
         self._mutate(update)

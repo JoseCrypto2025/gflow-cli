@@ -324,6 +324,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._records: dict[tuple[str, str, str], _ObservedRecord] = {}
         self._response_tasks: set[asyncio.Task[None]] = set()
         self._waf_rejected = False
+        self._submit_refusal_code: str | None = None
         self._generate_clicked = False
         self._approved_gate_id: str | None = None
         self._page: Page | None = None
@@ -652,6 +653,7 @@ class GoogleFlowAgentOnlyGenerationPort:
             provider_submit_response_status=self._submit_response_status,
             provider_submit_generation_record_observed=(self._submit_generation_record_observed),
             provider_submit_refusal_detected=self._submit_refusal_detected,
+            provider_submit_refusal_code=self._submit_refusal_code,
         )
 
     def disarm_submit_request_observer(self) -> None:
@@ -1051,6 +1053,7 @@ class GoogleFlowAgentOnlyGenerationPort:
                 self._waf_rejected = True
                 if is_submit_response:
                     self._submit_refusal_detected = True
+                    self._submit_refusal_code = "PUBLIC_ERROR_UNUSUAL_ACTIVITY"
         request = self._request
         if request is None:
             return

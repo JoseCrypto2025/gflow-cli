@@ -119,6 +119,16 @@ terminal `UNEXPECTED_MULTI_OUTPUT` predecessor. An already generated media ID
 may be recovered and validated again under the same D2 run ID; this recovery
 path cannot click Generate.
 
+PROD uses the independent
+[`D2_PROD_SAME_ATTEMPT_RECOVERY_V1.md`](../operations/D2_PROD_SAME_ATTEMPT_RECOVERY_V1.md)
+contract. Its reconciler consumes persisted evidence only and binds the exact
+Production Job, Scene Job, D2 attempt, account, project, prompt, and generation
+profile. A correlated single-request `PUBLIC_ERROR_UNUSUAL_ACTIVITY` refusal
+may release only that attempt's reservation; every other uncertain result
+stays held. The Production and Scene Jobs remain `QUEUED` or `HOLD` until the
+Phase G adapter returns validated execution evidence, and reconciliation never
+submits or approves a generation.
+
 The separately versioned
 [`D2_TEST_SESSION_BUDGET_V1.md`](../operations/D2_TEST_SESSION_BUDGET_V1.md)
 defines one exact TEST-only session exception authorized for no more than 40

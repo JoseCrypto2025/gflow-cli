@@ -246,6 +246,7 @@ class PhaseGSubmitTransportEvidence:
     provider_submit_response_status: int | None = None
     provider_submit_generation_record_observed: bool | None = None
     provider_submit_refusal_detected: bool | None = None
+    provider_submit_refusal_code: str | None = None
     submission_surface: str = "CLASSIC_MIGRATED"
     agent_turn_dispatched: bool | None = None
 
@@ -1707,6 +1708,8 @@ class D2DailyCreditLedger:
                         "Bangkok-day accounting already reaches the D2 credit ceiling",
                     )
             attempt["generate_action_count"] = 1
+            if attempt.get("execution_environment") == "PROD":
+                attempt["generate_action_at"] = _utc_now()
             attempt["submission_state"] = "GENERATE_ACTION_RECORDED"
             attempt["updated_at"] = _utc_now()
             return dict(attempt)
@@ -1789,9 +1792,29 @@ class D2DailyCreditLedger:
             raise PhaseGError(
                 "PHASE_G_SUBMIT_EVIDENCE_INVALID", "response facts require an observed response"
             )
+        if evidence.provider_submit_refusal_code not in {
+            None,
+            "PUBLIC_ERROR_UNUSUAL_ACTIVITY",
+        }:
+            raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "refusal code is invalid")
+        if evidence.provider_submit_refusal_code is not None and (
+            evidence.provider_submit_response_observed is not True
+            or evidence.provider_submit_response_status != 403
+            or evidence.provider_submit_refusal_detected is not True
+        ):
+            raise PhaseGError(
+                "PHASE_G_SUBMIT_EVIDENCE_INVALID", "refusal code lacks correlated response facts"
+            )
 
         def update(payload: dict[str, object]) -> dict[str, object]:
             attempt = self._attempt(payload, d2_run_id)
+            if (
+                attempt.get("execution_environment") == "PROD"
+                and attempt.get("submission_state") in _TERMINAL_STATES
+            ):
+                raise PhaseGError(
+                    "PHASE_G_ATTEMPT_TERMINAL", "terminal D2 transport evidence cannot be changed"
+                )
             if _counter(attempt.get("generate_action_count")) != 1:
                 raise PhaseGError(
                     "PHASE_G_SUBMIT_EVIDENCE_INVALID",
@@ -1862,6 +1885,8 @@ class D2DailyCreditLedger:
                 ),
                 updated_at=_utc_now(),
             )
+            if attempt.get("execution_environment") == "PROD":
+                attempt["provider_submit_refusal_code"] = evidence.provider_submit_refusal_code
             return dict(attempt)
 
         return self._mutate(update)
@@ -2955,6 +2980,105 @@ class D2DailyCreditLedger:
             rows = cast(list[dict[str, object]], payload["attempts"])
             return tuple({key: value for key, value in row.items()} for row in rows)
 
+    def record_prod_reconciliation(
+        self, d2_run_id: str, audit_record: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Append one idempotent PROD reconciliation decision to the exact D2 row."""
+        if audit_record.get("contract_version") != "D2_PROD_SAME_ATTEMPT_RECOVERY_V1":
+            raise PhaseGError("PHASE_G_PROD_RECOVERY_INVALID", "PROD recovery version is invalid")
+        digest = audit_record.get("evidence_sha256")
+        result = audit_record.get("result")
+        if (
+            not isinstance(digest, str)
+            or not _SHA256_RE.fullmatch(digest)
+            or not isinstance(result, str)
+        ):
+            raise PhaseGError("PHASE_G_PROD_RECOVERY_INVALID", "PROD recovery audit is invalid")
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            attempt = self._attempt(payload, d2_run_id)
+            identity_fields = (
+                "production_job_id",
+                "scene_job_id",
+                "d2_run_id",
+                "provider_account_id",
+                "provider_project_id",
+                "scene_id",
+                "scene_prompt_id",
+                "generation_profile_id",
+                "prompt_sha256",
+            )
+            attempt_identity = {key: attempt.get(key) for key in identity_fields}
+            if (
+                attempt.get("execution_environment") != "PROD"
+                or audit_record.get("identity") != attempt_identity
+            ):
+                raise PhaseGError(
+                    "PHASE_G_RECOVERY_IDENTITY_MISMATCH", "audit does not bind to this PROD attempt"
+                )
+            history_value = attempt.setdefault("prod_reconciliation_history", [])
+            if not isinstance(history_value, list):
+                raise PhaseGError("PHASE_G_LEDGER_CORRUPT", "PROD recovery history is invalid")
+            history_items = cast(list[object], history_value)
+            if any(not isinstance(item, dict) for item in history_items):
+                raise PhaseGError("PHASE_G_LEDGER_CORRUPT", "PROD recovery history is invalid")
+            history = cast(list[dict[str, object]], history_items)
+            previous = next(
+                (item for item in history if item.get("evidence_sha256") == digest), None
+            )
+            if previous is not None:
+                if previous != dict(audit_record):
+                    raise PhaseGError(
+                        "PHASE_G_PROD_RECOVERY_CONFLICT", "same evidence has a conflicting audit"
+                    )
+                return dict(previous)
+            proof_results = {
+                "SUBMISSION_PROVEN_PENDING",
+                "SUBMISSION_PROVEN_EXECUTION_FOUND",
+                "LATE_CONFIRMATION_FOUND",
+                "OUTPUT_ALREADY_EXISTS",
+                "PROVEN_NOT_SUBMITTED",
+            }
+            for item in history:
+                prior_result = item.get("result")
+                if prior_result == "PROVEN_NOT_SUBMITTED" and result in proof_results - {
+                    "PROVEN_NOT_SUBMITTED"
+                }:
+                    raise PhaseGError(
+                        "PHASE_G_PROD_RECOVERY_CONFLICT",
+                        "positive submission evidence conflicts with a recorded refusal",
+                    )
+                if result == "PROVEN_NOT_SUBMITTED" and prior_result in proof_results - {
+                    "PROVEN_NOT_SUBMITTED"
+                }:
+                    raise PhaseGError(
+                        "PHASE_G_PROD_RECOVERY_CONFLICT",
+                        "provider refusal conflicts with previously proven submission",
+                    )
+                if prior_result == result == "SUBMISSION_PROVEN_EXECUTION_FOUND":
+                    prior_execution = item.get("provider_execution_id")
+                    next_execution = audit_record.get("provider_execution_id")
+                    if prior_execution and next_execution and prior_execution != next_execution:
+                        raise PhaseGError(
+                            "PHASE_G_PROD_RECOVERY_CONFLICT",
+                            "multiple execution identities conflict for one attempt",
+                        )
+                if prior_result == result == "OUTPUT_ALREADY_EXISTS":
+                    prior_media = item.get("provider_media_ids")
+                    next_media = audit_record.get("provider_media_ids")
+                    if prior_media and next_media and prior_media != next_media:
+                        raise PhaseGError(
+                            "PHASE_G_PROD_RECOVERY_CONFLICT",
+                            "multiple output identities conflict for one attempt",
+                        )
+            record = dict(audit_record)
+            history.append(record)
+            attempt["prod_reconciliation_result"] = result
+            attempt["prod_reconciliation_evidence_sha256"] = digest
+            return record
+
+        return self._mutate(update)
+
     def d6_prerequisite_snapshot(
         self,
     ) -> tuple[tuple[Mapping[str, object], ...], str] | None:
@@ -3405,6 +3529,15 @@ class D2DailyCreditLedger:
             "terminal_state": None,
             "updated_at": now,
         }
+        context = request.execution_context
+        if context is not None and context.environment == "PROD":
+            attempt.update(
+                execution_environment="PROD",
+                production_job_id=context.production_job_id,
+                scene_job_id=context.scene_job_id,
+                generate_action_at=None,
+                provider_submit_refusal_code=None,
+            )
         return attempt
 
     def _accounted(self, payload: Mapping[str, object], date: str) -> Decimal:

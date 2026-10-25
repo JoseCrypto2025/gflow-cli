@@ -27,6 +27,13 @@ request is bound to the claimed Scene Job's deterministic D2 ID. Re-entry on
 an unresolved Scene Job uses the same Phase G request for recovery;
 caller-supplied media is not accepted.
 Existing production or Scene Jobs for the same prompt prevent a second claim.
+Jobs remain `QUEUED` until the Phase G adapter returns validated provider
+execution and media identities. An exception before that proof moves both jobs
+to `HOLD` with `PROVIDER_RECONCILIATION_REQUIRED`; replay cannot Generate from
+HOLD and may only use the exact-media Phase G recovery path. PROD evidence
+reconciliation is governed by the separate
+[`D2_PROD_SAME_ATTEMPT_RECOVERY_V1.md`](D2_PROD_SAME_ATTEMPT_RECOVERY_V1.md)
+contract and never approves or resubmits generation.
 
 Example invocation after the operator has independently verified current
 identity:

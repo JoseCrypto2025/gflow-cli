@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -179,6 +179,10 @@ class ProductionOrchestrator:
             raise ProductionOrchestrationError(
                 "one generation port or one Phase G request factory and identity is required"
             )
+        if request.execution_environment == "PROD" and phase_g_request_factory is None:
+            raise ProductionOrchestrationError(
+                "PROD generation requires the bound Phase G evidence adapter"
+            )
 
         claim = self._coordinator.submit_request(request)
         if len(claim.scene_jobs) != 1 or claim.scene_jobs[0].scene_prompt_id != prompt_id:
@@ -230,6 +234,20 @@ class ProductionOrchestrator:
             d2_run_id = scene_phase_g_run_id(job)
             phase_g_request = phase_g_request_factory(job, d2_run_id)
             context = phase_g_request.execution_context
+            if context is not None and request.execution_environment == "PROD":
+                if context.production_job_id not in {
+                    None,
+                    claim.production_job.production_job_id,
+                } or context.scene_job_id not in {None, job.scene_job_id}:
+                    raise ProductionOrchestrationError(
+                        "PROD execution context names a different production or scene job"
+                    )
+                context = replace(
+                    context,
+                    production_job_id=claim.production_job.production_job_id,
+                    scene_job_id=job.scene_job_id,
+                )
+                phase_g_request = replace(phase_g_request, execution_context=context)
             generated_root = workspace.directories.get("generated")
             if (
                 phase_g_request.d2_run_id != d2_run_id
@@ -269,18 +287,21 @@ class ProductionOrchestrator:
         if generator is None:
             raise ProductionOrchestrationError("generation adapter was not constructed")
         if job.job_status == "PENDING":
-            self._start_production(claim, occurred_at)
+            claim = self._start_production(claim, occurred_at)
             job = self._jobs.transition_scene(
                 job.scene_job_id, "PENDING", "VALIDATING", occurred_at
             )
             job = self._jobs.transition_scene(job.scene_job_id, "VALIDATING", "QUEUED", occurred_at)
-            job = self._jobs.transition_scene(job.scene_job_id, "QUEUED", "RUNNING", occurred_at)
             try:
                 generated = generator.generate_once(job, preflight)
             except Exception:
-                # RUNNING is intentionally retained; the Phase G ledger must be reconciled
-                # before a retry can recover the exact Phase G attempt and resume finalization.
+                self._hold_before_execution_proof(claim, job, occurred_at)
                 raise
+            job = self._jobs.transition_scene(job.scene_job_id, "QUEUED", "RUNNING", occurred_at)
+            claim = replace(
+                claim,
+                production_job=self._start_running_production(claim.production_job, occurred_at),
+            )
         elif job.job_status in {"RUNNING", "UPLOADING"}:
             if phase_g_adapter is not None:
                 generated = phase_g_adapter.recover_existing(job, preflight)
@@ -289,6 +310,18 @@ class ProductionOrchestrator:
                     f"{job.job_status} Scene Job requires the bound Phase G recovery adapter; "
                     "Generate is blocked"
                 )
+        elif job.job_status == "HOLD":
+            if phase_g_adapter is None:
+                raise ProductionOrchestrationError(
+                    "HOLD Scene Job requires the bound Phase G recovery adapter; "
+                    "Generate is blocked"
+                )
+            generated = phase_g_adapter.recover_existing(job, preflight)
+            job = self._jobs.transition_scene(job.scene_job_id, "HOLD", "RUNNING", occurred_at)
+            claim = replace(
+                claim,
+                production_job=self._start_running_production(claim.production_job, occurred_at),
+            )
         else:
             raise ProductionOrchestrationError(
                 f"Scene Job state {job.job_status} requires explicit recovery evidence"
@@ -423,22 +456,61 @@ class ProductionOrchestrator:
         )
         if completed_production.job_status != "COMPLETED":
             raise ProductionOrchestrationError("Production Job completion readback failed")
+        claim = replace(claim, production_job=completed_production)
         return ProductionOrchestrationResult(claim, job, finalization, intent, tts_job_id)
 
-    def _start_production(self, claim: JobClaim, occurred_at: str) -> None:
+    def _start_production(self, claim: JobClaim, occurred_at: str) -> JobClaim:
         production = claim.production_job
         if production.job_status != "REQUESTED":
-            if production.job_status == "RUNNING":
-                return
+            if production.job_status == "QUEUED":
+                return claim
             raise JobConflictError("Production Job is unresolved and cannot start generation")
         for expected, following in (
             ("REQUESTED", "VALIDATING"),
             ("VALIDATING", "READY"),
             ("READY", "QUEUED"),
-            ("QUEUED", "RUNNING"),
         ):
             production = self._jobs.transition_production(
                 production.production_job_id, expected, following, occurred_at
+            )
+        return replace(claim, production_job=production)
+
+    def _start_running_production(
+        self, production: ProductionJob, occurred_at: str
+    ) -> ProductionJob:
+        if production.job_status == "QUEUED":
+            return self._jobs.transition_production(
+                production.production_job_id, "QUEUED", "RUNNING", occurred_at
+            )
+        elif production.job_status == "HOLD":
+            return self._jobs.transition_production(
+                production.production_job_id, "HOLD", "RUNNING", occurred_at
+            )
+        elif production.job_status != "RUNNING":
+            raise JobConflictError("Production Job cannot enter RUNNING without execution proof")
+        return production
+
+    def _hold_before_execution_proof(
+        self, claim: JobClaim, scene_job: SceneJob, occurred_at: str
+    ) -> None:
+        """Keep an unresolved provider attempt held without claiming execution."""
+        current = scene_job
+        if current.job_status == "QUEUED":
+            self._jobs.transition_scene(
+                current.scene_job_id,
+                "QUEUED",
+                "HOLD",
+                occurred_at,
+                "PROVIDER_RECONCILIATION_REQUIRED",
+            )
+        production = claim.production_job
+        if production.job_status == "QUEUED":
+            self._jobs.transition_production(
+                production.production_job_id,
+                "QUEUED",
+                "HOLD",
+                occurred_at,
+                "PROVIDER_RECONCILIATION_REQUIRED",
             )
 
     def _find_final_output(self, production_job_id: str) -> dict[str, object] | None:

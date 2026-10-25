@@ -222,6 +222,11 @@ prompt. Keep execution, debugging, code modification, and paid approval in separ
 Before any D2 same-attempt recovery execution, also read
 [`docs/ai-video-automation-v2/operations/D2_SAME_ATTEMPT_RECOVERY_V1.md`](docs/ai-video-automation-v2/operations/D2_SAME_ATTEMPT_RECOVERY_V1.md).
 
+Before any PROD same-attempt recovery execution, also read
+[`docs/ai-video-automation-v2/operations/D2_PROD_SAME_ATTEMPT_RECOVERY_V1.md`](docs/ai-video-automation-v2/operations/D2_PROD_SAME_ATTEMPT_RECOVERY_V1.md).
+This separate contract does not change the frozen TEST-only V1 behavior. Implementation,
+provider reconciliation, and any paid approval remain separate tasks.
+
 Before any D2 forensic closure, read the applicable versioned contract. V2
 chat-only closure is governed by
 [`docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md`](docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md);

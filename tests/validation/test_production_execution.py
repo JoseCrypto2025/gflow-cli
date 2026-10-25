@@ -28,6 +28,8 @@ def _context(
         "SPV_000006" if environment == "PROD" else "SPV_000004",
         attempt,
         CreditBudgetContext(provider_remaining_free=Decimal("50")),
+        production_job_id="PRD_000001" if environment == "PROD" else None,
+        scene_job_id="SJB_000001" if environment == "PROD" else None,
     )
 
 
@@ -85,6 +87,122 @@ def test_unknown_attempt_reserves_ceiling_and_blocks_next_environment(tmp_path: 
     prod = _context("PROD", "D6_prod_0002")
     with pytest.raises(ProductionExecutionError, match="unresolved"):
         guard.prepare(prod, now=fixed)
+
+
+def test_proven_not_submitted_release_is_identity_bound_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gflow_cli.v2_runtime import phase_g
+    from gflow_cli.v2_runtime.phase_g_prod_reconciliation import (
+        ProdAttemptIdentity,
+        ProdReconciliationEvidence,
+        ProdReconciliationResult,
+        evidence_audit_record,
+    )
+
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    context = _context("PROD", "D2_prod-release-0001")
+    guard.prepare(context, now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))
+    guard.record_generate_click(context.attempt_id)
+    guard.reserve_quote(
+        context.attempt_id,
+        video_count=1,
+        quoted_credits=Decimal("10"),
+        budget=context.credit_budget_context,
+    )
+    guard.resolve(context.attempt_id, "WAF_REJECTION")
+    identity = ProdAttemptIdentity(
+        "PRD_000001",
+        "SJB_000001",
+        context.attempt_id,
+        context.provider_account_id,
+        context.provider_project_id,
+        context.scene_id,
+        context.scene_prompt_id,
+        context.generation_profile_id,
+        "a" * 64,
+    )
+    evidence = ProdReconciliationEvidence(
+        identity,
+        "2026-10-18T12:01:00Z",
+        submission_state="WAF_REJECTED",
+        provider_submit_request_count=1,
+        provider_submit_dispatch_window_completed=True,
+        provider_submit_project_id=context.provider_project_id,
+        provider_submit_response_observed=True,
+        provider_submit_response_status=403,
+        provider_submit_generation_record_observed=False,
+        provider_submit_refusal_code="PUBLIC_ERROR_UNUSUAL_ACTIVITY",
+        provider_submit_request_failed=False,
+    )
+    audit = evidence_audit_record(ProdReconciliationResult.PROVEN_NOT_SUBMITTED, evidence)
+    audit["contract_version"] = "D2_PROD_SAME_ATTEMPT_RECOVERY_V1"
+    attempt = {
+        "execution_environment": "PROD",
+        "production_job_id": identity.production_job_id,
+        "scene_job_id": identity.scene_job_id,
+        "d2_run_id": identity.d2_run_id,
+        "provider_account_id": identity.provider_account_id,
+        "provider_project_id": identity.provider_project_id,
+        "scene_id": identity.scene_id,
+        "scene_prompt_id": identity.scene_prompt_id,
+        "generation_profile_id": identity.generation_profile_id,
+        "prompt_sha256": identity.prompt_sha256,
+        "generate_action_count": 1,
+        "generate_action_at": "2026-10-18T12:00:00Z",
+        "baseline_captured": True,
+        "baseline_execution_ids": [],
+        "baseline_media_ids": [],
+        "baseline_confirmation_ids": [],
+        "updated_at": evidence.observed_at,
+        "submission_state": evidence.submission_state,
+        "provider_submit_request_count": evidence.provider_submit_request_count,
+        "provider_submit_rpc_observed": True,
+        "provider_submit_rpc_id": "YhhmEf",
+        "provider_submit_http_method": "POST",
+        "provider_submit_observed_at": "2026-10-18T12:00:30Z",
+        "provider_submit_dispatch_window_completed": True,
+        "provider_submit_project_id": evidence.provider_submit_project_id,
+        "provider_submit_response_observed": True,
+        "provider_submit_response_status": 403,
+        "provider_submit_generation_record_observed": False,
+        "provider_submit_refusal_detected": True,
+        "provider_submit_refusal_code": evidence.provider_submit_refusal_code,
+        "provider_submit_request_failed": False,
+        "provider_execution_id": None,
+        "provider_media_ids": [],
+        "provider_media_id": None,
+        "observed_confirmation_id": None,
+        "prod_reconciliation_history": [audit],
+    }
+
+    class PersistedLedger:
+        def __init__(self, _root: Path) -> None:
+            pass
+
+        def attempts(self):
+            return (attempt,)
+
+    monkeypatch.setattr(phase_g, "D2DailyCreditLedger", PersistedLedger)
+    release = {
+        "evidence_sha256": evidence.digest(),
+        "production_job_id": identity.production_job_id,
+        "scene_job_id": identity.scene_job_id,
+        "provider_account_id": identity.provider_account_id,
+        "provider_project_id": identity.provider_project_id,
+    }
+    guard.release_proven_not_submitted(context.attempt_id, **release)
+    guard.release_proven_not_submitted(context.attempt_id, **release)
+    row = guard._read()["attempts"][0]  # noqa: SLF001 - validates persisted reservation state
+    assert row["state"] == "WAF_REJECTION"
+    assert row["reserved_credits"] == "0"
+    assert row["billing_outcome"] == "UNKNOWN"
+
+    with pytest.raises(ProductionExecutionError, match="identity"):
+        guard.release_proven_not_submitted(
+            context.attempt_id,
+            **{**release, "scene_job_id": "SJB_000002"},
+        )
 
 
 @pytest.mark.parametrize(

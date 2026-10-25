@@ -82,6 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PROD same-attempt reconciliation is identity-bound and fail-closed.** Adds the
+  separate `D2_PROD_SAME_ATTEMPT_RECOVERY_V1` runtime contract and internal reconciler;
+  only a persisted, exact correlated refusal can release that attempt's reservation.
+  Production and scene jobs remain queued or held until the Phase G adapter proves
+  execution. The frozen TEST recovery contract is unchanged.
+
 - **VPS deployment synchronizes locked production dependencies in staging.** The
   copied runtime virtualenv is updated before promotion, and the runtime doctor
   imports the production Scene orchestrator so missing media dependencies fail

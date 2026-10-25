@@ -62,7 +62,7 @@ _PRODUCTION_TRANSITIONS: dict[str, frozenset[str]] = {
     "READY": frozenset({"QUEUED", "HOLD", "FAILED", "CANCELLED"}),
     "QUEUED": frozenset({"RUNNING", "HOLD", "FAILED", "CANCELLED"}),
     "RUNNING": frozenset({"HOLD", "FAILED", "COMPLETED", "CANCELLED"}),
-    "HOLD": frozenset(),
+    "HOLD": frozenset({"RUNNING"}),
     "FAILED": frozenset(),
     "COMPLETED": frozenset(),
     "CANCELLED": frozenset(),
@@ -75,7 +75,7 @@ _TRANSITIONS: dict[str, frozenset[str]] = {
     "UPLOADING": frozenset({"REMOTE_VERIFYING", "HOLD", "FAILED"}),
     "REMOTE_VERIFYING": frozenset({"COMPLETED", "HOLD", "FAILED"}),
     "COMPLETED": frozenset(),
-    "HOLD": frozenset(),
+    "HOLD": frozenset({"RUNNING"}),
     "FAILED": frozenset(),
     "CANCELLED": frozenset(),
 }
