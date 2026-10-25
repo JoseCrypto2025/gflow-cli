@@ -85,6 +85,7 @@ class SegmentedTTSProvider:
         self._client = client or httpx.Client(
             timeout=config.timeout_sec,
             follow_redirects=False,
+            trust_env=False,
         )
         self._owns_client = client is None
 

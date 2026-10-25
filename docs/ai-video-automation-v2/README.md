@@ -88,7 +88,10 @@ environment and is never written to Sheets or logged. `/health` is public for
 health monitoring, while the synthesis POST requires `x-api-key`. The response
 must identify a completed provider job and an audio file contained under the
 configured `TTS_OUTPUT_ROOT`; the service and caller therefore run on the same
-host or share that approved output path. Uncertain submits remain on HOLD and
+host or share that approved output path. The provider-owned HTTP client ignores
+proxy environment variables so the loopback API key and dialogue are not sent
+through an ambient proxy. Injected HTTP clients are caller-owned and must use a
+trusted, proxy-safe transport. Uncertain submits remain on HOLD and
 are not retried automatically. A completed `TTS_JOBS` row is reused only when
 its input-text and synthesis-configuration hashes, persistent Drive identity,
 hash, size, duration, remote verification, and

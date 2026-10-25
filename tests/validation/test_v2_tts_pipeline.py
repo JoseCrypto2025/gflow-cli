@@ -404,7 +404,9 @@ def test_tts_synthesis_config_fingerprint_binds_provider_voice_and_controls() ->
     )
 
 
-def test_secret_and_dialogue_text_are_excluded_from_default_representations() -> None:
+def test_secret_and_dialogue_text_are_excluded_from_default_representations(
+    tmp_path: Path,
+) -> None:
     request = TTSJobRequest(
         "PRD_000001",
         "SDL_000001",
@@ -417,7 +419,7 @@ def test_secret_and_dialogue_text_are_excluded_from_default_representations() ->
         "MDL_TTS_0001",
         2.0,
     )
-    config = SegmentedTTSConfig("http://127.0.0.1:8011", "test-secret-key", Path("C:/tts-output"))
+    config = SegmentedTTSConfig("http://127.0.0.1:8011", "test-secret-key", tmp_path)
 
     assert "private dialogue phrase" not in repr(request)
     assert "test-secret-key" not in repr(config)
@@ -532,6 +534,18 @@ def test_segmented_provider_uses_key_and_validates_completed_artifact(tmp_path: 
     assert result.provider_execution_id == "SEG2_TTS_TTS_000001_abcdef1234"
     assert result.audio.duration_sec == pytest.approx(0.75, abs=0.05)
     assert result.audio_path.is_file()
+
+
+def test_segmented_provider_owned_client_ignores_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    provider = SegmentedTTSProvider(SegmentedTTSConfig("http://127.0.0.1:8011", "key", tmp_path))
+    try:
+        assert provider._client._trust_env is False
+    finally:
+        provider.close()
 
 
 def test_segmented_provider_fails_closed_on_ambiguous_submit(tmp_path: Path) -> None:
