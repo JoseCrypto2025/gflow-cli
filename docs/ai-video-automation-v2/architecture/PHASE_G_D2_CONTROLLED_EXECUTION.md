@@ -129,6 +129,16 @@ stays held. The Production and Scene Jobs remain `QUEUED` or `HOLD` until the
 Phase G adapter returns validated execution evidence, and reconciliation never
 submits or approves a generation.
 
+Pre-contract PROD rows use the separate
+[`D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1.md`](../operations/D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1.md)
+compatibility contract. Its pure entrypoint reconstructs missing job/environment linkage only in
+an in-memory envelope from unique canonical Sheets, prompt/profile/account, D2, and credit joins.
+Each value retains source hashes and observation times. It never fills missing historical Generate
+timestamps from update times or rewrites a source row. Missing event ordering remains ambiguous;
+ambiguous results keep the exact reservation unchanged. Jobs recorded `RUNNING` without execution
+proof are reported as `LEGACY_PREMATURE_RUNNING`; assessment itself does not write a Sheet `HOLD`.
+The separate audit file records classification and any later exact reservation-release event.
+
 The separately versioned
 [`D2_TEST_SESSION_BUDGET_V1.md`](../operations/D2_TEST_SESSION_BUDGET_V1.md)
 defines one exact TEST-only session exception authorized for no more than 40

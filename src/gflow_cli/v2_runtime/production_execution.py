@@ -401,6 +401,195 @@ class ProductionCreditGuard:
 
         self._mutate(update)
 
+    def release_legacy_proven_not_submitted(
+        self,
+        attempt_id: str,
+        *,
+        production_job_id: str,
+        scene_job_id: str,
+        provider_account_id: str,
+        provider_project_id: str,
+        classification_event_sha256: str,
+        released_at: str,
+        software_commit: str,
+    ) -> dict[str, object]:
+        """Release one legacy reservation only after a persisted, provenance-bound refusal proof."""
+        from .phase_g import D2DailyCreditLedger
+        from .phase_g_prod_legacy_reconciliation import (
+            ProdLegacyEvidenceClass,
+            find_legacy_prod_reconciliation_audit,
+            legacy_reservation_release_audit_event,
+            write_legacy_prod_reconciliation_audit,
+        )
+        from .phase_g_prod_reconciliation import (
+            ProdAttemptIdentity,
+            ProdReconciliationResult,
+            classify_prod_reconciliation,
+            prod_evidence_from_attempt,
+        )
+
+        try:
+            classification_event = find_legacy_prod_reconciliation_audit(
+                self.root.parent, classification_event_sha256
+            )
+        except ValueError as exc:
+            raise ProductionExecutionError("legacy reconciliation audit is invalid") from exc
+        if (
+            classification_event is None
+            or classification_event.get("contract_version") != "D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1"
+            or classification_event.get("result")
+            != ProdReconciliationResult.PROVEN_NOT_SUBMITTED.value
+            or classification_event.get("legacy_attempt_id") != attempt_id
+            or classification_event.get("event_type", "CLASSIFICATION") != "CLASSIFICATION"
+            or classification_event.get("mutation_performed") is not False
+            or classification_event.get("reservation_action") != "UNCHANGED"
+        ):
+            raise ProductionExecutionError(
+                "persisted legacy refusal classification is missing or invalid"
+            )
+
+        raw_fields = classification_event.get("evidence_provenance")
+        if not isinstance(raw_fields, dict):
+            raise ProductionExecutionError("legacy evidence provenance is missing")
+        provenance = cast(dict[str, object], raw_fields)
+
+        def evidence_value(name: str, expected_class: ProdLegacyEvidenceClass) -> object:
+            raw = provenance.get(name)
+            if not isinstance(raw, dict):
+                raise ProductionExecutionError("legacy identity provenance is incomplete")
+            field = cast(dict[str, object], raw)
+            if field.get("provenance_class") != expected_class.value:
+                raise ProductionExecutionError("legacy identity provenance class is invalid")
+            value = field.get("value")
+            if not field.get("sources"):
+                raise ProductionExecutionError("legacy identity source reference is missing")
+            return value
+
+        derived = ProdLegacyEvidenceClass.DERIVED_CANONICAL_JOIN
+        direct = ProdLegacyEvidenceClass.PERSISTED_DIRECT
+        try:
+            identity = ProdAttemptIdentity(
+                production_job_id=str(evidence_value("production_job_id", derived)),
+                scene_job_id=str(evidence_value("scene_job_id", derived)),
+                d2_run_id=str(evidence_value("attempt_id", direct)),
+                provider_account_id=str(evidence_value("provider_account_id", direct)),
+                provider_project_id=str(evidence_value("flow_project_id", direct)),
+                scene_id=str(evidence_value("scene_id", direct)),
+                scene_prompt_id=str(evidence_value("prompt_id", derived)),
+                generation_profile_id=str(evidence_value("generation_profile_id", direct)),
+                prompt_sha256=str(evidence_value("prompt_sha256", direct)),
+            )
+        except ValueError as exc:
+            raise ProductionExecutionError("legacy PROD identity is invalid") from exc
+        environment = evidence_value("execution_environment", derived)
+        action_at = evidence_value("generate_action_at", direct)
+        if (
+            identity.d2_run_id != attempt_id
+            or identity.production_job_id != production_job_id
+            or identity.scene_job_id != scene_job_id
+            or identity.provider_account_id != provider_account_id
+            or identity.provider_project_id != provider_project_id
+            or environment != "PROD"
+            or not isinstance(action_at, str)
+        ):
+            raise ProductionExecutionError("legacy refusal identity does not match reservation")
+
+        attempts = [
+            row
+            for row in D2DailyCreditLedger(self.root.parent).attempts()
+            if row.get("d2_run_id") == attempt_id
+        ]
+        if len(attempts) != 1:
+            raise ProductionExecutionError("persisted D2 attempt is missing or ambiguous")
+        persisted_attempt = dict(attempts[0])
+        if any(
+            persisted_attempt.get(field) != value
+            for field, value in (
+                ("scene_id", identity.scene_id),
+                ("scene_prompt_id", identity.scene_prompt_id),
+                ("generation_profile_id", identity.generation_profile_id),
+                ("provider_account_id", identity.provider_account_id),
+                ("provider_project_id", identity.provider_project_id),
+                ("prompt_sha256", identity.prompt_sha256),
+                ("generate_action_at", action_at),
+            )
+        ):
+            raise ProductionExecutionError("persisted D2 attempt differs from legacy audit")
+        normalized_attempt = {
+            **persisted_attempt,
+            "production_job_id": identity.production_job_id,
+            "scene_job_id": identity.scene_job_id,
+            "execution_environment": "PROD",
+        }
+        evidence = prod_evidence_from_attempt(identity, normalized_attempt)
+        if (
+            evidence is None
+            or classify_prod_reconciliation(
+                identity, evidence, persisted_attempt=normalized_attempt
+            )
+            is not ProdReconciliationResult.PROVEN_NOT_SUBMITTED
+        ):
+            raise ProductionExecutionError(
+                "legacy refusal does not pass the unchanged modern proof rule"
+            )
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            row = self._find(payload, attempt_id)
+            if (
+                row.get("environment") != "PROD"
+                or row.get("provider_account_id") != provider_account_id
+                or row.get("provider_project_id") != provider_project_id
+                or row.get("production_job_id") not in (None, "", production_job_id)
+                or row.get("scene_job_id") not in (None, "", scene_job_id)
+            ):
+                raise ProductionExecutionError(
+                    "credit reservation identity does not match legacy PROD attempt"
+                )
+            if row.get("reconciliation_release_evidence_sha256") == classification_event_sha256:
+                return dict(row)
+            try:
+                reserved_credits = Decimal(str(row.get("reserved_credits")))
+            except InvalidOperation as exc:
+                raise ProductionExecutionError("legacy reservation amount is invalid") from exc
+            if (
+                row.get("state") == "WAF_REJECTION"
+                or not reserved_credits.is_finite()
+                or reserved_credits <= 0
+            ):
+                raise ProductionExecutionError(
+                    "legacy reservation was already released differently"
+                )
+            if (
+                row.get("state")
+                not in {
+                    "UNKNOWN_SUBMISSION_STATE",
+                    "SUBMISSION_UNRESOLVED",
+                    "QUOTED_RESERVED",
+                }
+                or type(row.get("generate_click_count")) is not int
+                or row.get("generate_click_count") != 1
+                or row.get("billing_outcome") not in (None, "", "UNKNOWN")
+            ):
+                raise ProductionExecutionError("legacy reservation is not eligible for release")
+            row["reserved_credits"] = "0"
+            row["state"] = "WAF_REJECTION"
+            row["reconciliation_release_evidence_sha256"] = classification_event_sha256
+            return dict(row)
+
+        released = self._mutate(update)
+        release_event = legacy_reservation_release_audit_event(
+            classification_event,
+            released_at=released_at,
+            software_commit=software_commit,
+        )
+        try:
+            write_legacy_prod_reconciliation_audit(self.root.parent, release_event)
+        except ValueError as exc:
+            raise ProductionExecutionError(
+                "reservation was released but its legacy mutation audit needs retry"
+            ) from exc
+        return released
+
     def _find(self, payload: dict[str, object], attempt_id: str) -> dict[str, object]:
         for row in cast(list[dict[str, object]], payload["attempts"]):
             if row.get("attempt_id") == attempt_id:

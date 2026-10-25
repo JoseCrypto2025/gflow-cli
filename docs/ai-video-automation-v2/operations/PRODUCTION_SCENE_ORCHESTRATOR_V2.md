@@ -34,6 +34,12 @@ HOLD and may only use the exact-media Phase G recovery path. PROD evidence
 reconciliation is governed by the separate
 [`D2_PROD_SAME_ATTEMPT_RECOVERY_V1.md`](D2_PROD_SAME_ATTEMPT_RECOVERY_V1.md)
 contract and never approves or resubmits generation.
+Historical PROD attempts missing that contract's persisted job linkage use the separate,
+read-only [`D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1.md`](D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1.md)
+envelope. It joins exact canonical identities, records per-field provenance in a separate audit,
+and leaves source rows untouched. Missing provider evidence remains ambiguous and reserved; a
+`RUNNING` row without exact execution proof is reported as needing HOLD, not changed during
+assessment.
 
 Example invocation after the operator has independently verified current
 identity:

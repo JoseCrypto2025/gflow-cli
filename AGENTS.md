@@ -227,6 +227,11 @@ Before any PROD same-attempt recovery execution, also read
 This separate contract does not change the frozen TEST-only V1 behavior. Implementation,
 provider reconciliation, and any paid approval remain separate tasks.
 
+Before any legacy PROD D2 attempt assessment or recovery, also read
+[`docs/ai-video-automation-v2/operations/D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1.md`](docs/ai-video-automation-v2/operations/D2_PROD_LEGACY_ATTEMPT_RECOVERY_V1.md).
+This compatibility contract is separate from modern PROD and frozen TEST recovery; it never
+backfills historical D2 evidence.
+
 Before any D2 forensic closure, read the applicable versioned contract. V2
 chat-only closure is governed by
 [`docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md`](docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md);

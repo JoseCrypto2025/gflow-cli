@@ -117,6 +117,7 @@ def _port(gate_after_polls: int | None) -> GoogleFlowAgentOnlyGenerationPort:
     port._page = _Page(_Locator(gate_after_polls))  # type: ignore[assignment]
     port._response_tasks = set()
     port._waf_rejected = False
+    port._submit_refusal_code = None
     port._records = {}
     port._baseline_head_key = ""
     port._approved_gate_id = None

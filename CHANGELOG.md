@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Legacy PROD D2 recovery compatibility.** Adds a provenance-bound, read-only identity envelope for
+  pre-contract attempts, a separate idempotent reconciliation audit, and an exact legacy reservation
+  release guard that reuses the unchanged modern refusal proof. Missing Generate timestamps and
+  provider evidence remain unavailable/ambiguous; existing Sheets and D2 rows are never backfilled.
+
 - **TTS and media finalization V2.** Adds an authenticated segmented-TTS
   adapter, exact-schema `TTS_JOBS` persistence and completed-artifact reuse,
   full audio probing and canonicalization, video-timeline-safe FFmpeg merging,
