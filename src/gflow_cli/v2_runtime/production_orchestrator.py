@@ -188,6 +188,10 @@ class ProductionOrchestrator:
         if len(claim.scene_jobs) != 1 or claim.scene_jobs[0].scene_prompt_id != prompt_id:
             raise ProductionOrchestrationError("Production Job claim does not match one scene")
         job = claim.scene_jobs[0]
+        if job.job_status == "QUARANTINED" or claim.production_job.job_status == "QUARANTINED":
+            raise ProductionOrchestrationError(
+                "QUARANTINED job is not eligible for resume, recovery, or generation"
+            )
         if job.job_status == "COMPLETED":
             output = self._find_final_output(claim.production_job.production_job_id)
             if output is None:

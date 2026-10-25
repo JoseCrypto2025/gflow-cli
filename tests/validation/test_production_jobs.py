@@ -87,6 +87,45 @@ def test_held_attempt_cannot_be_retried_automatically() -> None:
         store.append_attempt(job.production_job_id, job.scene_prompt_id, "2026-10-18T00:00:02Z")
 
 
+def test_quarantined_attempt_is_terminal_and_cannot_be_retried() -> None:
+    store = InMemoryProductionJobStore()
+    claim = store.claim(_request(), "2026-10-18T00:00:00Z")
+    job = claim.scene_jobs[0]
+    store.transition_scene(job.scene_job_id, "PENDING", "VALIDATING", "2026-10-18T00:00:01Z")
+    store.transition_scene(job.scene_job_id, "VALIDATING", "RUNNING", "2026-10-18T00:00:02Z")
+    quarantined = store.transition_scene(
+        job.scene_job_id, "RUNNING", "QUARANTINED", "2026-10-18T00:00:03Z"
+    )
+
+    assert quarantined.job_status == "QUARANTINED"
+    with pytest.raises(InvalidJobTransitionError, match="not allowed"):
+        store.transition_scene(job.scene_job_id, "QUARANTINED", "RUNNING", "2026-10-18T00:00:04Z")
+    with pytest.raises(JobConflictError, match="FAILED or CANCELLED"):
+        store.append_attempt(job.production_job_id, job.scene_prompt_id, "2026-10-18T00:00:04Z")
+
+    production_id = claim.production_job.production_job_id
+    for expected, following in (
+        ("REQUESTED", "VALIDATING"),
+        ("VALIDATING", "READY"),
+        ("READY", "QUEUED"),
+        ("QUEUED", "RUNNING"),
+    ):
+        store.transition_production(production_id, expected, following, "2026-10-18T00:00:03Z")
+    store.transition_production(production_id, "RUNNING", "QUARANTINED", "2026-10-18T00:00:04Z")
+    with pytest.raises(InvalidJobTransitionError, match="not allowed"):
+        store.transition_production(production_id, "QUARANTINED", "RUNNING", "2026-10-18T00:00:05Z")
+
+
+def test_quarantined_status_is_in_transaction_schemas() -> None:
+    root = Path(__file__).parents[2]
+    for name in ("PRODUCTION_JOBS", "SCENE_JOBS"):
+        schema = json.loads(
+            (root / f"schemas/transaction/{name}.schema.json").read_text(encoding="utf-8")
+        )
+        status = next(field for field in schema["fields"] if field["field_name"] == "Job_Status")
+        assert "QUARANTINED" in status["allowed_values"]
+
+
 def test_explicit_new_attempt_is_append_only_and_replay_resolves_latest() -> None:
     store = InMemoryProductionJobStore()
     claim = store.claim(_request(), "2026-10-18T00:00:00Z")

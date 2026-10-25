@@ -114,6 +114,7 @@
         "READY",
         "QUEUED",
         "RUNNING",
+        "QUARANTINED",
         "HOLD",
         "FAILED",
         "COMPLETED",

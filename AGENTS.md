@@ -241,6 +241,11 @@ Before any legacy PROD D2 attempt assessment or recovery, also read
 This compatibility contract is separate from modern PROD and frozen TEST recovery; it never
 backfills historical D2 evidence.
 
+Before applying an ambiguous-evidence-exhausted legacy recovery policy, also read
+[`docs/ai-video-automation-v2/operations/AMBIGUOUS_LEGACY_RECOVERY_POLICY_V1.md`](docs/ai-video-automation-v2/operations/AMBIGUOUS_LEGACY_RECOVERY_POLICY_V1.md).
+This policy quarantines the exact legacy job pair while preserving its unknown 50-credit
+reservation; it does not authorize Generate or replacement-attempt creation.
+
 Before any D2 forensic closure, read the applicable versioned contract. V2
 chat-only closure is governed by
 [`docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md`](docs/ai-video-automation-v2/operations/D2_FORENSIC_CLOSURE_V2.md);

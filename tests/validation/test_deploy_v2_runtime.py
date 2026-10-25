@@ -39,6 +39,7 @@ def _required_entries() -> list[tuple[str, bytes, str]]:
         "scripts/operations/vps_flow_presubmit.py",
         "scripts/operations/run_production_scene.py",
         "scripts/operations/reconcile_legacy_prod_attempt.py",
+        "scripts/operations/apply_ambiguous_legacy_recovery_policy.py",
         "scripts/validation/v2_runtime_doctor.py",
         "scripts/validation/validate_v2_data_architecture.py",
         "pyproject.toml",
@@ -64,6 +65,7 @@ def test_archive_plan_hashes_only_allowlisted_runtime_files() -> None:
     assert plan.file_hashes["schemas/example.json"] == hashlib.sha256(b"{}").hexdigest()
     assert "scripts/validation/validate_v2_data_architecture.py" in plan.file_hashes
     assert "scripts/operations/reconcile_legacy_prod_attempt.py" in plan.file_hashes
+    assert "scripts/operations/apply_ambiguous_legacy_recovery_policy.py" in plan.file_hashes
 
 
 @pytest.mark.parametrize(

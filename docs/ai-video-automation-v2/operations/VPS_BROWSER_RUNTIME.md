@@ -5,7 +5,8 @@
 `scripts/operations/deploy_v2_runtime.py` is the application deployment
 operator. It defaults to a read-only preflight and requires an exact clean
 `automation-v2` commit. It packages only `src/`, `schemas/`, the production F5
-operator, the runtime doctor, `pyproject.toml`, and `uv.lock` from Git; it never
+operator, the legacy reconciliation and ambiguous-policy operators, the runtime doctor,
+`pyproject.toml`, and `uv.lock` from Git; it never
 copies `.git`, tests, docs, ignored files, credentials, or a source virtualenv.
 The allowlisted `validate_v2_data_architecture.py` is included because the
 live Google Sheets snapshot source imports it for full schema and semantic

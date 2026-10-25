@@ -71,6 +71,7 @@
         "VALIDATING",
         "QUEUED",
         "RUNNING",
+        "QUARANTINED",
         "UPLOADING",
         "REMOTE_VERIFYING",
         "COMPLETED",

@@ -378,6 +378,44 @@ def test_ambiguous_generation_is_not_repeated_on_replay(tmp_path: Path) -> None:
     assert jobs.production_jobs()[0].job_status == "HOLD"
 
 
+def test_quarantined_scene_stops_before_workspace_or_adapter_setup(tmp_path: Path) -> None:
+    scene, prompt, preflight = _evidence(tmp_path)
+    request = ProductionRequest("SCR_000001", "TEST", "request-quarantined", ("SPV_000001",))
+    jobs = InMemoryProductionJobStore()
+    claim = jobs.claim(request, "2026-10-25T00:00:00Z")
+    job = claim.scene_jobs[0]
+    jobs.transition_scene(job.scene_job_id, "PENDING", "VALIDATING", "2026-10-25T00:00:01Z")
+    jobs.transition_scene(job.scene_job_id, "VALIDATING", "RUNNING", "2026-10-25T00:00:02Z")
+    jobs.transition_scene(job.scene_job_id, "RUNNING", "QUARANTINED", "2026-10-25T00:00:03Z")
+    generator = SilentSceneGenerator()
+
+    with pytest.raises(ProductionOrchestrationError, match="QUARANTINED"):
+        ProductionOrchestrator(
+            jobs,
+            MemoryFinalOutputStore(),
+            MemoryDrive(tmp_path / "drive"),
+            temp_root=tmp_path / "tmp",
+        ).run_scene_once(
+            request,
+            scene=scene,
+            approved_prompt=prompt,
+            preflight=preflight,
+            dialogue_rows=(),
+            expected_duration_sec=2.0,
+            expected_aspect_ratio="16:9",
+            workspace=SimpleNamespace(job_id=job.scene_job_id),
+            workspace_created_at=datetime.now(UTC),
+            verification_temp_dir=tmp_path / "verify",
+            occurred_at="2026-10-25T00:00:04Z",
+            generator=generator,
+        )
+
+    assert generator.calls == 0
+    assert jobs.scene_jobs()[0].job_status == "QUARANTINED"
+    assert jobs.production_jobs()[0].job_status == "REQUESTED"
+    assert not (tmp_path / "tmp").exists()
+
+
 def test_orchestrator_rejects_workspace_not_bound_to_claimed_scene_job(
     tmp_path: Path,
 ) -> None:

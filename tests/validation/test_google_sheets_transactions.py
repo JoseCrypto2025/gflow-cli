@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -161,6 +162,51 @@ def test_update_requires_expected_digest_and_verifies_lost_ack(tmp_path: Path) -
             expected_digest=expected,
             replacement=row,
         )
+
+
+def test_quarantine_preserves_other_job_fields_and_resolves_lost_ack(tmp_path: Path) -> None:
+    transport = FakeSheets(_schema_dir())
+    rows = _store(tmp_path, transport)
+    jobs = GoogleSheetsProductionJobStore(rows)
+    claim = ProductionJobCoordinator(jobs).submit_request(
+        ProductionRequest("SCR_000001", "PROD", "quarantine-test", ("SPV_000006",)),
+        datetime(2026, 10, 18, tzinfo=UTC),
+    )
+    production_id = claim.production_job.production_job_id
+    scene_id = claim.scene_jobs[0].scene_job_id
+    for before, after in (
+        ("REQUESTED", "VALIDATING"),
+        ("VALIDATING", "READY"),
+        ("READY", "QUEUED"),
+        ("QUEUED", "RUNNING"),
+    ):
+        jobs.transition_production(production_id, before, after, "2026-10-18T00:01:00Z")
+    jobs.transition_scene(scene_id, "PENDING", "VALIDATING", "2026-10-18T00:01:00Z")
+    jobs.transition_scene(scene_id, "VALIDATING", "RUNNING", "2026-10-18T00:02:00Z")
+    production_before = jobs.read_production_job_row(production_id)
+    scene_before = jobs.read_scene_job_row(scene_id)
+    transport.fail_after_update = True
+
+    production_after = jobs.quarantine_production_job(
+        production_id, occurred_at="2026-10-18T00:03:00Z"
+    )
+    scene_after = jobs.quarantine_scene_job(scene_id, occurred_at="2026-10-18T00:03:00Z")
+
+    assert production_after["Job_Status"] == scene_after["Job_Status"] == "QUARANTINED"
+    assert {
+        key: value
+        for key, value in production_after.items()
+        if key not in {"Job_Status", "Updated_At"}
+    } == {
+        key: value
+        for key, value in production_before.items()
+        if key not in {"Job_Status", "Updated_At"}
+    }
+    assert {
+        key: value for key, value in scene_after.items() if key not in {"Job_Status", "Updated_At"}
+    } == {
+        key: value for key, value in scene_before.items() if key not in {"Job_Status", "Updated_At"}
+    }
 
 
 def test_store_rejects_other_sheets_and_wrong_ordered_fields(tmp_path: Path) -> None:

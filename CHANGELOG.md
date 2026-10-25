@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ambiguous legacy PROD quarantine policy.** Adds a terminal `QUARANTINED` state for both job
+  tables, blocks orchestrator resume/recovery/generation for that state, and provides a scoped
+  operator with a separate hash-chained intent/application audit. The policy preserves the
+  unknown 50-credit reservation, reports unresolved exposure, and records replacement lineage
+  eligibility without authorizing a replacement attempt.
+
 - **Legacy PROD D2 recovery compatibility.** Adds a provenance-bound, read-only identity envelope for
   pre-contract attempts, a separate idempotent reconciliation audit, and an exact legacy reservation
   release guard that reuses the unchanged modern refusal proof. Missing Generate timestamps and

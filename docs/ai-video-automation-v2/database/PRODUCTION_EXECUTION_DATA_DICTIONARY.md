@@ -48,7 +48,7 @@ Unique: Script_ID + Production_Run_No; Request_Idempotency_Key
 | `Request_Idempotency_Key` | STRING | Yes | — | — | Request Idempotency Key Globally unique. |
 | `Queue_Priority` | INTEGER | No | — | — | Queue Priority |
 | `Scene_Set_SHA256` | STRING | No | — | — | Scene Set SHA256 When populated, 64 hexadecimal characters. |
-| `Job_Status` | STRING | Yes | — | REQUESTED, VALIDATING, READY, QUEUED, RUNNING, HOLD, FAILED, COMPLETED, CANCELLED | Job Status |
+| `Job_Status` | STRING | Yes | — | REQUESTED, VALIDATING, READY, QUEUED, RUNNING, QUARANTINED, HOLD, FAILED, COMPLETED, CANCELLED | QUARANTINED is a terminal local stop for an exhausted ambiguous legacy attempt; it never proves provider failure or billing outcome. |
 | `Hold_Reason_Code` | STRING | No | — | — | Required for HOLD. |
 | `Error_Code` | STRING | No | — | — | Required for FAILED. |
 | `Error_Message` | STRING | No | — | — | Failure details; required for FAILED. |
@@ -72,7 +72,7 @@ Unique: Production_Job_ID + Scene_Prompt_ID + Attempt_No
 | `Production_Job_ID` | STRING | Yes | PRODUCTION_JOBS.Production_Job_ID | — | Production Job ID |
 | `Scene_Prompt_ID` | STRING | Yes | SCENE_PROMPT_VERSION.Scene_Prompt_ID | — | Scene Prompt ID |
 | `Attempt_No` | INTEGER | Yes | — | — | Attempt No Positive integer; unique per Production_Job_ID + Scene_Prompt_ID. |
-| `Job_Status` | STRING | Yes | — | PENDING, VALIDATING, QUEUED, RUNNING, UPLOADING, REMOTE_VERIFYING, COMPLETED, HOLD, FAILED, CANCELLED | Job Status |
+| `Job_Status` | STRING | Yes | — | PENDING, VALIDATING, QUEUED, RUNNING, QUARANTINED, UPLOADING, REMOTE_VERIFYING, COMPLETED, HOLD, FAILED, CANCELLED | QUARANTINED is terminal and blocks automatic resume/retry; provider fate remains independent. |
 | `Provider_Execution_ID` | STRING | No | — | — | Provider Execution ID |
 | `Temporary_Workspace` | STRING | No | — | — | Runtime-owned temporary path only; never persistent storage. |
 | `Remote_Output_URI` | URL | No | — | — | Persistent URI, not an ephemeral provider URL. |

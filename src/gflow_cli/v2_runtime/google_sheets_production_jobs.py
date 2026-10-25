@@ -53,6 +53,78 @@ class GoogleSheetsProductionJobStore:
         self._lock = threading.RLock()
         self._events: list[JobEvent] = []
 
+    def read_production_job_row(self, production_job_id: str) -> dict[str, object]:
+        """Read one exact row for the internal quarantine operator."""
+        with self._lock:
+            return dict(self._get_production_row(production_job_id))
+
+    def read_scene_job_row(self, scene_job_id: str) -> dict[str, object]:
+        """Read one exact row for the internal quarantine operator."""
+        with self._lock:
+            return dict(self._get_scene_row(scene_job_id))
+
+    def quarantine_production_job(
+        self, production_job_id: str, *, occurred_at: str
+    ) -> dict[str, object]:
+        """Mark a running row QUARANTINED without the generic HOLD fallback."""
+        with self._lock:
+            current = self._get_production_row(production_job_id)
+            if current.get("Job_Status") == "QUARANTINED":
+                return current
+            if current.get("Job_Status") != "RUNNING":
+                raise JobConflictError("Production Job is not in the exact expected RUNNING state")
+            replacement = {**current, "Job_Status": "QUARANTINED", "Updated_At": occurred_at}
+            validate_production_job_row(replacement)
+            try:
+                saved = self._rows.update_expected(
+                    "PRODUCTION_JOBS",
+                    key_value=production_job_id,
+                    expected_digest=self._rows.row_digest("PRODUCTION_JOBS", current),
+                    replacement=replacement,
+                )
+            except SheetsTransactionError as exc:
+                observed = self._get_production_row(production_job_id)
+                if self._rows.row_digest("PRODUCTION_JOBS", observed) == self._rows.row_digest(
+                    "PRODUCTION_JOBS", replacement
+                ):
+                    saved = observed
+                else:
+                    raise SheetsTransactionError(
+                        "Production Job quarantine write is unresolved; replay after fresh read"
+                    ) from exc
+            self._events.append(JobEvent(production_job_id, "RUNNING", "QUARANTINED", occurred_at))
+            return saved
+
+    def quarantine_scene_job(self, scene_job_id: str, *, occurred_at: str) -> dict[str, object]:
+        """Mark a running row QUARANTINED without the generic HOLD fallback."""
+        with self._lock:
+            current = self._get_scene_row(scene_job_id)
+            if current.get("Job_Status") == "QUARANTINED":
+                return current
+            if current.get("Job_Status") != "RUNNING":
+                raise JobConflictError("Scene Job is not in the exact expected RUNNING state")
+            replacement = {**current, "Job_Status": "QUARANTINED", "Updated_At": occurred_at}
+            validate_scene_job_row(replacement)
+            try:
+                saved = self._rows.update_expected(
+                    "SCENE_JOBS",
+                    key_value=scene_job_id,
+                    expected_digest=self._rows.row_digest("SCENE_JOBS", current),
+                    replacement=replacement,
+                )
+            except SheetsTransactionError as exc:
+                observed = self._get_scene_row(scene_job_id)
+                if self._rows.row_digest("SCENE_JOBS", observed) == self._rows.row_digest(
+                    "SCENE_JOBS", replacement
+                ):
+                    saved = observed
+                else:
+                    raise SheetsTransactionError(
+                        "Scene Job quarantine write is unresolved; replay after fresh read"
+                    ) from exc
+            self._events.append(JobEvent(scene_job_id, "RUNNING", "QUARANTINED", occurred_at))
+            return saved
+
     def claim(self, request: ProductionRequest, requested_at: str) -> JobClaim:
         with self._lock:
             productions = self._rows.read_rows("PRODUCTION_JOBS")
