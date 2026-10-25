@@ -91,8 +91,11 @@ configured `TTS_OUTPUT_ROOT`; the service and caller therefore run on the same
 host or share that approved output path. The provider-owned HTTP client ignores
 proxy environment variables so the loopback API key and dialogue are not sent
 through an ambient proxy. Injected HTTP clients are caller-owned and must use a
-trusted, proxy-safe transport. Uncertain submits remain on HOLD and
-are not retried automatically. A completed `TTS_JOBS` row is reused only when
+trusted, proxy-safe transport. At the provider boundary, canonical neutral
+pitch (`+0st`) and medium volume are translated to the service's accepted
+`+0Hz` and `+10%` controls; unsupported control formats are rejected before
+submission. Uncertain submits remain on HOLD and are not retried automatically.
+A completed `TTS_JOBS` row is reused only when
 its input-text and synthesis-configuration hashes, persistent Drive identity,
 hash, size, duration, remote verification, and
 cleanup evidence are complete.

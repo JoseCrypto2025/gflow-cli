@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import shutil
 import subprocess
@@ -531,9 +532,52 @@ def test_segmented_provider_uses_key_and_validates_completed_artifact(tmp_path: 
     assert seen["path"] == "/tts/segmented-v2/create"
     assert seen["api_key"] == "secret-value"  # pragma: allowlist secret -- synthetic test fixture
     assert "Exact approved text." in str(seen["payload"])
+    payload = json.loads(str(seen["payload"]))
+    assert payload["rate"] == "+0%"
+    assert payload["pitch"] == "+0Hz"
+    assert payload["volume"] == "+10%"
     assert result.provider_execution_id == "SEG2_TTS_TTS_000001_abcdef1234"
     assert result.audio.duration_sec == pytest.approx(0.75, abs=0.05)
     assert result.audio_path.is_file()
+
+
+@pytest.mark.parametrize(("control", "value"), [("pitch", "+1st"), ("volume", "loud")])
+def test_segmented_provider_rejects_unmapped_controls_before_submit(
+    tmp_path: Path, control: str, value: str
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    provider = SegmentedTTSProvider(
+        SegmentedTTSConfig("http://127.0.0.1:8011", "key", tmp_path),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    request = TTSJobRequest(
+        "PRD_000001",
+        "SDL_000001",
+        1,
+        "Exact approved text.",
+        "VOI_000001",
+        "th-TH-NiwatNeural",
+        "th-TH",
+        "PVA_0001",
+        "MDL_TTS_0001",
+        2.0,
+    )
+
+    with pytest.raises(TTSProviderError, match="outside the segmented service contract"):
+        provider.synthesize(
+            request,
+            tts_job_id="TTS_000001",
+            destination=tmp_path / "output.wav",
+            **{control: value},
+        )
+
+    assert calls == 0
 
 
 def test_segmented_provider_owned_client_ignores_proxy_environment(

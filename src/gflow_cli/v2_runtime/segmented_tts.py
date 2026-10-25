@@ -16,6 +16,10 @@ from .media_audio import AudioInfo, inspect_audio
 from .phase_g_artifacts import sha256_file
 from .tts import TTSJobRequest, build_segmented_tts_payload
 
+_RATE_RE = re.compile(r"^[+-]\d+(?:\.\d+)?%$")
+_PITCH_RE = re.compile(r"^[+-]\d+(?:\.\d+)?Hz$")
+_VOLUME_RE = re.compile(r"^[+-]\d+(?:\.\d+)?%$")
+
 
 class TTSProviderError(ValueError):
     """Sanitized provider failure; never includes response bodies or credentials."""
@@ -112,6 +116,14 @@ class SegmentedTTSProvider:
     ) -> TTSProviderResult:
         if destination.exists() or destination.is_symlink():
             raise TTSProviderError("TTS destination must be unused")
+        if pitch == "+0st":
+            pitch = "+0Hz"
+        if volume == "medium":
+            volume = "+10%"
+        if not (
+            _RATE_RE.fullmatch(rate) and _PITCH_RE.fullmatch(pitch) and _VOLUME_RE.fullmatch(volume)
+        ):
+            raise TTSProviderError("TTS controls are outside the segmented service contract")
         payload = build_segmented_tts_payload(
             content_id=tts_job_id,
             text=request.text,
