@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -16,34 +15,29 @@ from gflow_cli.v2_runtime.ambiguous_legacy_recovery_policy import (
     AUDIT_NAME,
     POLICY_VERSION,
     RecoveryPolicyError,
+    ambiguous_legacy_policy_id,
     append_policy_event,
     build_policy_record,
     existing_policy_event,
     validate_policy_preconditions,
 )
 from gflow_cli.v2_runtime.config import load_runtime_settings
-from gflow_cli.v2_runtime.google_sheets import GoogleWorkspaceCredentialProvider
+from gflow_cli.v2_runtime.google_sheets import (
+    GoogleSheetsApiTransport,
+    GoogleSheetsSnapshotSource,
+    GoogleWorkspaceCredentialProvider,
+)
 from gflow_cli.v2_runtime.google_sheets_production_jobs import GoogleSheetsProductionJobStore
 from gflow_cli.v2_runtime.google_sheets_transactions import (
     GoogleSheetsTransactionApiTransport,
     OptimisticGoogleSheetsJobStore,
 )
+from gflow_cli.v2_runtime.phase_g_prod_legacy_reconciliation import (
+    build_legacy_prod_attempt_envelope,
+    find_legacy_prod_reconciliation_audit,
+)
 from gflow_cli.v2_runtime.timestamps import format_utc_timestamp
-
-
-def _read_json_rows(path: Path, kind: str) -> list[dict[str, object]]:
-    if path.is_symlink() or not path.is_file():
-        raise RecoveryPolicyError(f"{kind} ledger is unavailable or unsafe")
-    try:
-        payload: object = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RecoveryPolicyError(f"{kind} ledger is unreadable") from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("attempts"), list):
-        raise RecoveryPolicyError(f"{kind} ledger has an invalid shape")
-    rows = cast(list[object], payload["attempts"])
-    if any(not isinstance(row, dict) for row in rows):
-        raise RecoveryPolicyError(f"{kind} ledger rows are invalid")
-    return cast(list[dict[str, object]], rows)
+from scripts.operations.reconcile_legacy_prod_attempt import build_legacy_sources_from_snapshot
 
 
 def _provider_evidence_present(attempt: Mapping[str, object]) -> bool:
@@ -68,6 +62,82 @@ def _provider_evidence_present(attempt: Mapping[str, object]) -> bool:
     return any(attempt.get(field) not in (None, "", False, 0, []) for field in evidence_fields)
 
 
+def _read_json_rows(path: Path, kind: str) -> list[dict[str, object]]:
+    if path.is_symlink() or not path.is_file():
+        raise RecoveryPolicyError(f"{kind} ledger is unavailable or unsafe")
+    try:
+        payload: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RecoveryPolicyError(f"{kind} ledger is unreadable") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("attempts"), list):
+        raise RecoveryPolicyError(f"{kind} ledger has an invalid shape")
+    rows = cast(list[object], payload["attempts"])
+    if any(not isinstance(row, dict) for row in rows):
+        raise RecoveryPolicyError(f"{kind} ledger rows are invalid")
+    return cast(list[dict[str, object]], rows)
+
+
+def _prior_reconciliation_audit_sha256(
+    runtime_state_root: Path,
+    *,
+    attempt_id: str,
+    production_job_id: str,
+    scene_job_id: str,
+    prior_policy: Mapping[str, object] | None,
+) -> str:
+    """Bind policy to a validated prior ambiguous reconciliation event without rerunning it."""
+    audit_path = runtime_state_root / "phase-g" / "prod-legacy-reconciliation-audit.json"
+    if prior_policy is not None:
+        digest = str(prior_policy.get("reconciliation_audit_sha256", ""))
+        event = find_legacy_prod_reconciliation_audit(runtime_state_root, digest)
+        if event is None:
+            raise RecoveryPolicyError("prior policy reconciliation audit link is unavailable")
+        candidates = [event]
+    else:
+        if audit_path.is_symlink() or not audit_path.is_file():
+            raise RecoveryPolicyError("prior legacy reconciliation audit is unavailable")
+        try:
+            payload: object = json.loads(audit_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RecoveryPolicyError("prior legacy reconciliation audit is unreadable") from exc
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise RecoveryPolicyError("prior legacy reconciliation audit schema is invalid")
+        events = payload.get("events")
+        if not isinstance(events, list) or any(not isinstance(row, dict) for row in events):
+            raise RecoveryPolicyError("prior legacy reconciliation audit event list is invalid")
+        candidates = [
+            cast(dict[str, object], row)
+            for row in events
+            if row.get("legacy_attempt_id") == attempt_id
+            and row.get("result") == "AMBIGUOUS_AFTER_RECONCILIATION"
+        ]
+    exact: list[dict[str, object]] = []
+    for candidate in candidates:
+        provenance = candidate.get("evidence_provenance")
+        if not isinstance(provenance, dict):
+            continue
+        production = provenance.get("production_job_id")
+        scene = provenance.get("scene_job_id")
+        attempt = provenance.get("attempt_id")
+        values_match = (
+            isinstance(production, dict)
+            and production.get("value") == production_job_id
+            and isinstance(scene, dict)
+            and scene.get("value") == scene_job_id
+            and isinstance(attempt, dict)
+            and attempt.get("value") == attempt_id
+        )
+        if values_match and candidate.get("reservation_action") == "UNCHANGED":
+            digest = candidate.get("event_sha256")
+            if isinstance(digest, str):
+                validated = find_legacy_prod_reconciliation_audit(runtime_state_root, digest)
+                if validated is not None:
+                    exact.append(validated)
+    if len(exact) != 1:
+        raise RecoveryPolicyError("exact prior ambiguous reconciliation audit must resolve once")
+    return str(exact[0]["event_sha256"])
+
+
 def apply_policy(
     *,
     attempt_id: str,
@@ -82,13 +152,28 @@ def apply_policy(
     if not runtime_state_root.is_absolute() or runtime_state_root.is_symlink():
         raise RecoveryPolicyError("runtime state root is invalid")
     root = runtime_state_root.resolve(strict=True)
-    d2_rows = _read_json_rows(root / "production" / "phase-g" / "d2-credit-ledger.json", "D2")
-    credit_rows = _read_json_rows(root / "production-credit" / "shared-ledger.json", "credit")
-    attempts = [row for row in d2_rows if row.get("d2_run_id") == attempt_id]
-    reservations = [row for row in credit_rows if row.get("attempt_id") == attempt_id]
-    if len(attempts) != 1 or len(reservations) != 1:
+    token_provider = GoogleWorkspaceCredentialProvider(
+        credential_path, repository_root=Path(__file__).resolve().parents[2]
+    )
+    snapshot_transport = GoogleSheetsApiTransport(token_provider)
+    try:
+        snapshot = GoogleSheetsSnapshotSource(snapshot_transport, schema_dir).read()
+    finally:
+        snapshot_transport.close()
+    sources = build_legacy_sources_from_snapshot(snapshot, root, runtime_namespace="PROD")
+    envelope = build_legacy_prod_attempt_envelope(sources, attempt_id)
+    if not envelope.recovery_prerequisite_satisfied or envelope.identity is None:
+        raise RecoveryPolicyError("fresh legacy identity envelope is ambiguous; quarantine stopped")
+    identity = envelope.identity
+    if identity.d2_run_id != attempt_id:
+        raise RecoveryPolicyError("legacy envelope does not bind the exact target attempt")
+    d2_rows = [row for row in sources.d2_attempts if row.get("d2_run_id") == attempt_id]
+    reservations = [
+        row for row in sources.credit_reservations if row.get("attempt_id") == attempt_id
+    ]
+    if len(d2_rows) != 1 or len(reservations) != 1:
         raise RecoveryPolicyError("exact D2 attempt and credit reservation must each resolve once")
-    attempt = attempts[0]
+    attempt = d2_rows[0]
     if attempt.get("submission_state") != "UNKNOWN_SUBMISSION_STATE":
         raise RecoveryPolicyError("D2 attempt submission state changed from unknown")
     provider_evidence_present = _provider_evidence_present(attempt)
@@ -108,32 +193,47 @@ def apply_policy(
     if credits != 50 or state != "UNKNOWN_SUBMISSION_STATE":
         raise RecoveryPolicyError("credit reservation differs from the approved preserved state")
 
-    token_provider = GoogleWorkspaceCredentialProvider(
-        credential_path, repository_root=Path(__file__).resolve().parents[2]
-    )
     transport = GoogleSheetsTransactionApiTransport(token_provider)
     try:
         row_store = OptimisticGoogleSheetsJobStore(transport, schema_dir, writer_lock_root=root)
         jobs = GoogleSheetsProductionJobStore(row_store)
         scene_rows = row_store.read_rows("SCENE_JOBS")
-        linked_scenes = []
-        for row in scene_rows:
-            scene_id_value = str(row.get("Scene_Job_ID", "")).strip()
-            attempt_no = row.get("Attempt_No")
-            if isinstance(attempt_no, str) and attempt_no.isdigit():
-                attempt_no = int(attempt_no)
-            if not scene_id_value.startswith("SJB_") or not isinstance(attempt_no, int):
-                continue
-            run_key = f"PRODUCTION_SCENE_D2_V1:{scene_id_value}:{attempt_no}"
-            expected_run_id = "D2_" + hashlib.sha256(run_key.encode("utf-8")).hexdigest()[:32]
-            if expected_run_id == attempt_id:
-                linked_scenes.append(row)
+        linked_scenes = [
+            row for row in scene_rows if row.get("Scene_Job_ID") == identity.scene_job_id
+        ]
         if len(linked_scenes) != 1:
             raise RecoveryPolicyError("exact linked Scene Job must resolve once")
         scene = linked_scenes[0]
-        scene_id = str(scene.get("Scene_Job_ID", ""))
-        production_id = str(scene.get("Production_Job_ID", ""))
+        scene_id = identity.scene_job_id
+        production_id = identity.production_job_id
+        snapshot_scene_rows = [
+            row for row in sources.scene_jobs if row.get("Scene_Job_ID") == scene_id
+        ]
+        snapshot_production_rows = [
+            row for row in sources.production_jobs if row.get("Production_Job_ID") == production_id
+        ]
+        if len(snapshot_scene_rows) != 1 or len(snapshot_production_rows) != 1:
+            raise RecoveryPolicyError("legacy envelope job joins are missing or duplicated")
+        snapshot_scene = snapshot_scene_rows[0]
+        snapshot_production = snapshot_production_rows[0]
         production = jobs.read_production_job_row(production_id)
+        try:
+            snapshot_attempt_no = int(str(snapshot_scene.get("Attempt_No", "")))
+            writer_attempt_no = int(str(scene.get("Attempt_No", "")))
+        except ValueError as exc:
+            raise RecoveryPolicyError("linked Scene Job attempt number is invalid") from exc
+        if (
+            any(
+                scene.get(field) != snapshot_scene.get(field)
+                for field in ("Production_Job_ID", "Scene_Prompt_ID", "Job_Status")
+            )
+            or any(
+                production.get(field) != snapshot_production.get(field)
+                for field in ("Execution_Environment", "Job_Status")
+            )
+            or writer_attempt_no != snapshot_attempt_no
+        ):
+            raise RecoveryPolicyError("job rows changed between canonical and transactional reads")
         if production.get("Execution_Environment") != "PROD":
             raise RecoveryPolicyError("linked Production Job is not PROD")
         if scene.get("Job_Status") not in {"RUNNING", "QUARANTINED"}:
@@ -145,19 +245,28 @@ def apply_policy(
                 "linked Production Job is not the exact expected RUNNING state"
             )
 
+        policy_id = ambiguous_legacy_policy_id(attempt_id)
+        prior_intent = existing_policy_event(
+            runtime_state_root / "production" / "phase-g" / AUDIT_NAME,
+            event_type="POLICY_INTENT",
+            policy_id=policy_id,
+        )
+        reconciliation_digest = _prior_reconciliation_audit_sha256(
+            root,
+            attempt_id=attempt_id,
+            production_job_id=production_id,
+            scene_job_id=scene_id,
+            prior_policy=prior_intent,
+        )
         policy = build_policy_record(
             attempt_id=attempt_id,
             production_job_id=production_id,
             scene_job_id=scene_id,
             reservation_id=attempt_id,
+            reconciliation_audit_sha256=reconciliation_digest,
             observed_at=now,
         )
         audit_path = runtime_state_root / "production" / "phase-g" / AUDIT_NAME
-        prior_intent = existing_policy_event(
-            audit_path,
-            event_type="POLICY_INTENT",
-            policy_id=str(policy["policy_id"]),
-        )
         if prior_intent is not None:
             prior_timestamp = prior_intent.get("observed_at")
             policy["observed_at"] = prior_timestamp

@@ -32,9 +32,13 @@ replacement may bind to a predecessor.
 
 The internal `scripts/operations/apply_ambiguous_legacy_recovery_policy.py`
 operator is scoped to the specifically authorized D2 run ID. It reads the
-current exact D2 reservation and linked job rows, checks that the reservation
-is still 50 / `UNKNOWN_SUBMISSION_STATE`, then appends a durable `POLICY_INTENT`
-event before changing job rows. It quarantines Scene Job then Production Job,
+fresh schema-validated canonical snapshot, exact D2/shared-credit rows, and the
+prior reconciliation audit event. The audit digest must bind the same D2,
+Production Job, and Scene Job identities and preserve the ambiguous result.
+The exhausted-evidence result is an operator-confirmed handoff attestation bound
+to that digest; the operator never reruns classification or searches evidence.
+It checks that the reservation is still 50 / `UNKNOWN_SUBMISSION_STATE`, then
+appends a durable `POLICY_INTENT` event before changing job rows. It quarantines Scene Job then Production Job,
 reads both back, and appends `POLICY_APPLIED` only after both statuses are
 verified. The audit is separate from reconciliation and credit ledgers,
 append-only, hash-chained, and idempotent for exact event replay. Partial writes

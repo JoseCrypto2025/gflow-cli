@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -18,6 +19,14 @@ UNKNOWN = "UNKNOWN"
 
 class RecoveryPolicyError(ValueError):
     """Policy precondition or durable audit validation failure."""
+
+
+def ambiguous_legacy_policy_id(attempt_id: str) -> str:
+    """Return the stable policy ID for one exact predecessor attempt."""
+    return (
+        POLICY_ID_PREFIX
+        + hashlib.sha256(f"{POLICY_VERSION}:{attempt_id}".encode()).hexdigest()[:24].upper()
+    )
 
 
 def _canonical(value: object) -> bytes:
@@ -35,18 +44,35 @@ def build_policy_record(
     production_job_id: str,
     scene_job_id: str,
     reservation_id: str,
+    reconciliation_audit_sha256: str,
     observed_at: str,
 ) -> dict[str, object]:
     """Describe quarantine and unresolved exposure without changing credit state."""
-    if not all((attempt_id, production_job_id, scene_job_id, reservation_id, observed_at)):
+    if not all(
+        (
+            attempt_id,
+            production_job_id,
+            scene_job_id,
+            reservation_id,
+            reconciliation_audit_sha256,
+            observed_at,
+        )
+    ) or not re.fullmatch(r"[0-9a-f]{64}", reconciliation_audit_sha256):
         raise RecoveryPolicyError(
             "exact attempt and linked job/reservation identities are required"
         )
     lineage_key = hashlib.sha256(f"legacy-replacement-lineage-v1:{attempt_id}".encode()).hexdigest()
-    policy_id = (
-        POLICY_ID_PREFIX
-        + hashlib.sha256(f"{POLICY_VERSION}:{attempt_id}".encode()).hexdigest()[:24].upper()
-    )
+    policy_id = ambiguous_legacy_policy_id(attempt_id)
+    attestation_sha256 = hashlib.sha256(
+        _canonical(
+            {
+                "attempt_id": attempt_id,
+                "reconciliation_audit_sha256": reconciliation_audit_sha256,
+                "evidence_recovery_result": "AMBIGUOUS_EVIDENCE_EXHAUSTED",
+                "source": "USER_CONFIRMED_HANDOFF",
+            }
+        )
+    ).hexdigest()
     return {
         "policy_id": policy_id,
         "policy_version": POLICY_VERSION,
@@ -57,7 +83,9 @@ def build_policy_record(
         "reservation_credits": 50,
         "reservation_state": "UNKNOWN_SUBMISSION_STATE",
         "reconciliation_result": "AMBIGUOUS_AFTER_RECONCILIATION",
+        "reconciliation_audit_sha256": reconciliation_audit_sha256,
         "evidence_recovery_result": "AMBIGUOUS_EVIDENCE_EXHAUSTED",
+        "evidence_recovery_attestation_sha256": attestation_sha256,
         "provider_submission": UNKNOWN,
         "billing_state": UNKNOWN,
         "production_job_target": "QUARANTINED",

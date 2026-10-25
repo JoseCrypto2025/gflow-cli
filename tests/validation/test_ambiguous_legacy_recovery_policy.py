@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -11,7 +12,12 @@ from gflow_cli.v2_runtime.ambiguous_legacy_recovery_policy import (
     build_policy_record,
     validate_policy_preconditions,
 )
+from gflow_cli.v2_runtime.phase_g_prod_legacy_reconciliation import (
+    LEGACY_PROD_CONTRACT_VERSION,
+    write_legacy_prod_reconciliation_audit,
+)
 from scripts.operations.apply_ambiguous_legacy_recovery_policy import (
+    _prior_reconciliation_audit_sha256,
     _provider_evidence_present,
 )
 
@@ -22,6 +28,7 @@ def _policy() -> dict[str, object]:
         production_job_id="PRD_000001",
         scene_job_id="SJB_000001",
         reservation_id="D2_13c62112d9881710019049d95cb6da57",
+        reconciliation_audit_sha256="a" * 64,
         observed_at="2026-10-25T00:00:00Z",
     )
 
@@ -96,3 +103,60 @@ def test_operator_evidence_guard_uses_only_existing_d2_row_fields() -> None:
         }
     )
     assert _provider_evidence_present({"provider_execution_id": "execution-1"})
+
+
+def test_prior_reconciliation_audit_is_exact_identity_bound_and_hash_validated(
+    tmp_path,
+) -> None:
+    event: dict[str, object] = {
+        "contract_version": LEGACY_PROD_CONTRACT_VERSION,
+        "legacy_attempt_id": "D2_13c62112d9881710019049d95cb6da57",
+        "result": "AMBIGUOUS_AFTER_RECONCILIATION",
+        "reservation_action": "UNCHANGED",
+        "evidence_provenance": {
+            "attempt_id": {"value": "D2_13c62112d9881710019049d95cb6da57"},
+            "production_job_id": {"value": "PRD_000001"},
+            "scene_job_id": {"value": "SJB_000001"},
+        },
+    }
+    event["event_sha256"] = hashlib.sha256(
+        json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    write_legacy_prod_reconciliation_audit(tmp_path, event)
+
+    result = _prior_reconciliation_audit_sha256(
+        tmp_path,
+        attempt_id="D2_13c62112d9881710019049d95cb6da57",
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+        prior_policy=None,
+    )
+
+    assert result == event["event_sha256"]
+
+
+def test_prior_reconciliation_audit_rejects_wrong_identity(tmp_path) -> None:
+    event: dict[str, object] = {
+        "contract_version": LEGACY_PROD_CONTRACT_VERSION,
+        "legacy_attempt_id": "D2_13c62112d9881710019049d95cb6da57",
+        "result": "AMBIGUOUS_AFTER_RECONCILIATION",
+        "reservation_action": "UNCHANGED",
+        "evidence_provenance": {
+            "attempt_id": {"value": "D2_13c62112d9881710019049d95cb6da57"},
+            "production_job_id": {"value": "PRD_000002"},
+            "scene_job_id": {"value": "SJB_000001"},
+        },
+    }
+    event["event_sha256"] = hashlib.sha256(
+        json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    write_legacy_prod_reconciliation_audit(tmp_path, event)
+
+    with pytest.raises(RecoveryPolicyError, match="exact prior ambiguous"):
+        _prior_reconciliation_audit_sha256(
+            tmp_path,
+            attempt_id="D2_13c62112d9881710019049d95cb6da57",
+            production_job_id="PRD_000001",
+            scene_job_id="SJB_000001",
+            prior_policy=None,
+        )
