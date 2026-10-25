@@ -7,6 +7,9 @@ operator. It defaults to a read-only preflight and requires an exact clean
 `automation-v2` commit. It packages only `src/`, `schemas/`, the production F5
 operator, the runtime doctor, `pyproject.toml`, and `uv.lock` from Git; it never
 copies `.git`, tests, docs, ignored files, credentials, or a source virtualenv.
+The allowlisted `validate_v2_data_architecture.py` is included because the
+live Google Sheets snapshot source imports it for full schema and semantic
+validation in the deployed runtime.
 It copies the existing runtime virtualenv into the staged tree and synchronizes
 the locked production dependencies there before promotion. Source builds for
 dependencies are disabled during this root-run step; missing platform wheels

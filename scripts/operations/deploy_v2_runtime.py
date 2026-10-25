@@ -39,6 +39,7 @@ ARCHIVE_PATHS = (
     "scripts/operations/vps_flow_presubmit.py",
     "scripts/operations/run_production_scene.py",
     "scripts/validation/v2_runtime_doctor.py",
+    "scripts/validation/validate_v2_data_architecture.py",
     "pyproject.toml",
     "uv.lock",
 )
@@ -118,6 +119,7 @@ def inspect_archive(data: bytes, expected_sha: str) -> ArchivePlan:
         "scripts/operations/vps_flow_presubmit.py",
         "scripts/operations/run_production_scene.py",
         "scripts/validation/v2_runtime_doctor.py",
+        "scripts/validation/validate_v2_data_architecture.py",
     }
     if not required.issubset(file_hashes):
         raise DeploymentError("source archive is missing a required runtime file")

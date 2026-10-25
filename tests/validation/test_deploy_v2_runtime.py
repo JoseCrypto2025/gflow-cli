@@ -39,6 +39,7 @@ def _required_entries() -> list[tuple[str, bytes, str]]:
         "scripts/operations/vps_flow_presubmit.py",
         "scripts/operations/run_production_scene.py",
         "scripts/validation/v2_runtime_doctor.py",
+        "scripts/validation/validate_v2_data_architecture.py",
         "pyproject.toml",
         "uv.lock",
     )
@@ -60,6 +61,7 @@ def test_archive_plan_hashes_only_allowlisted_runtime_files() -> None:
     assert plan.total_bytes == len(_required_entries()) + len(content) + 2
     assert plan.file_hashes["src/gflow_cli/__init__.py"] == hashlib.sha256(content).hexdigest()
     assert plan.file_hashes["schemas/example.json"] == hashlib.sha256(b"{}").hexdigest()
+    assert "scripts/validation/validate_v2_data_architecture.py" in plan.file_hashes
 
 
 @pytest.mark.parametrize(
