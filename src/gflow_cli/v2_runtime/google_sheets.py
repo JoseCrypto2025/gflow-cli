@@ -544,6 +544,7 @@ class GoogleSheetsSnapshotSource:
 
     def read(self) -> GoogleSheetsSnapshot:
         schemas = load_schema_headers(self._schema_dir)
+        optional_headers = load_schema_optional_headers(self._schema_dir)
         tables: TableRows = {}
         batch_reader = cast(
             Callable[
@@ -568,7 +569,10 @@ class GoogleSheetsSnapshotSource:
             batch_values = batch_values_raw
             for table_name, headers in schemas.items():
                 tables[table_name] = _rows_from_values(
-                    table_name, headers, batch_values[table_name]
+                    table_name,
+                    headers,
+                    batch_values[table_name],
+                    optional_headers=optional_headers[table_name],
                 )
         else:
             for table_name, headers in schemas.items():
@@ -580,7 +584,9 @@ class GoogleSheetsSnapshotSource:
                     raise
                 except Exception as exc:  # noqa: BLE001 — transport details are sensitive
                     raise GoogleSheetsReadError("Google Sheets read failed") from exc
-                tables[table_name] = _rows_from_values(table_name, headers, values)
+                tables[table_name] = _rows_from_values(
+                    table_name, headers, values, optional_headers=optional_headers[table_name]
+                )
         if _contains_secret_field(tables):
             raise GoogleSheetsReadError("V2 snapshot contains a prohibited secret field")
         errors = tuple(self._validator(self._schema_dir, tables))
@@ -684,10 +690,41 @@ def load_schema_headers(schema_dir: Path) -> dict[str, tuple[str, ...]]:
     return headers
 
 
+def load_schema_optional_headers(schema_dir: Path) -> dict[str, tuple[str, ...]]:
+    """List optional columns to permit a backwards-compatible appended-schema migration."""
+    optional: dict[str, tuple[str, ...]] = {}
+    for subdir in ("master", "transaction", "relation"):
+        for schema_path in sorted((schema_dir / subdir).glob("*.schema.json")):
+            try:
+                schema = json.loads(schema_path.read_text(encoding="utf-8"))
+                table = schema["table_name"]
+                fields = schema["fields"]
+                names = tuple(
+                    field["field_name"] for field in fields if field.get("required") is False
+                )
+            except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise GoogleSheetsReadError("local V2 schema is malformed") from exc
+            if not isinstance(table, str) or any(not isinstance(name, str) for name in names):
+                raise GoogleSheetsReadError("local V2 schema is malformed")
+            optional[table] = names
+    return optional
+
+
 def _rows_from_values(
-    table_name: str, headers: tuple[str, ...], values: Sequence[Sequence[object]]
+    table_name: str,
+    headers: tuple[str, ...],
+    values: Sequence[Sequence[object]],
+    *,
+    optional_headers: tuple[str, ...] = (),
 ) -> list[Row]:
-    if not values or tuple(str(value) for value in values[0]) != headers:
+    if not values:
+        raise GoogleSheetsReadError(f"{table_name} headers do not match the local schema")
+    actual_headers = tuple(str(value) for value in values[0])
+    if actual_headers != headers and not (
+        len(actual_headers) < len(headers)
+        and headers[: len(actual_headers)] == actual_headers
+        and set(headers[len(actual_headers) :]).issubset(optional_headers)
+    ):
         raise GoogleSheetsReadError(f"{table_name} headers do not match the local schema")
     rows: list[Row] = []
     for values_row in values[1:]:

@@ -23,6 +23,7 @@ from typing import Protocol, cast
 from gflow_cli.errors import WafRejectionError
 
 from .agent_recovery import AgentSettingsRecoveryJournal, RecoveryJournalError
+from .ambiguous_legacy_recovery_policy import ambiguous_legacy_policy_id
 from .errors import AssetVerificationError, V2RuntimeError
 from .google_flow import FlowPresubmitRequest, build_agent_only_directive
 from .phase_g_artifacts import sha256_file, verify_remote_redownload
@@ -37,7 +38,7 @@ _RUN_ID_RE = re.compile(r"^(?:D2|D6)_[A-Za-z0-9_-]{8,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _D6_RELEASE_CONTRACT_VERSION = 1
-_LEDGER_SCHEMA = 2
+_LEDGER_SCHEMA = 3
 _TEST_SESSION_CONTRACT = "D2_TEST_SESSION_BUDGET_V1"
 _TEST_SESSION_CREDIT_LIMIT = Decimal("40")
 _TEST_SESSION_MAX_ATTEMPTS = 40
@@ -1149,6 +1150,336 @@ class D2DailyCreditLedger:
         return self._mutate(
             lambda payload: self._create(payload, request, retry_authorization=authorization)
         )
+
+    def get_legacy_replacement_authorization(self, authorization_id: str) -> dict[str, object]:
+        """Read one exact authorization under the ledger lock for external audit revalidation."""
+        with self._locked_file():
+            payload = self._read()
+            authorizations = cast(
+                list[dict[str, object]], payload["legacy_replacement_authorizations"]
+            )
+            matches = [
+                row for row in authorizations if row.get("authorization_id") == authorization_id
+            ]
+            if len(matches) != 1:
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_NOT_FOUND",
+                    "exact legacy replacement authorization does not exist",
+                )
+            return dict(matches[0])
+
+    def create_legacy_replacement_authorization(
+        self, authorization: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Persist a one-time legacy replacement authorization without creating an attempt."""
+        required = {
+            "contract_version",
+            "authorization_id",
+            "parent_attempt_id",
+            "production_job_id",
+            "scene_job_id",
+            "policy_id",
+            "reconciliation_audit_id",
+            "decision_input_digest",
+            "legacy_exposure",
+            "replacement_quote",
+            "replacement_quote_unit",
+            "replacement_quote_source",
+            "replacement_quote_source_version",
+            "replacement_quote_input_digest",
+            "replacement_quote_at",
+            "maximum_combined_exposure",
+            "authorized_replacement_count",
+            "replacement_created",
+            "replacement_attempt_id",
+            "consumption_sha256",
+            "authorization_status",
+            "created_at",
+            "created_by",
+            "software_commit",
+            "generate_authorized",
+        }
+        record = dict(authorization)
+        if set(record) != required:
+            raise PhaseGError(
+                "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                "legacy replacement authorization fields are invalid",
+            )
+        try:
+            created_at = datetime.fromisoformat(
+                str(record.get("created_at")).replace("Z", "+00:00")
+            )
+            quote_at = datetime.fromisoformat(
+                str(record.get("replacement_quote_at")).replace("Z", "+00:00")
+            )
+        except ValueError:
+            created_at = quote_at = None
+        if (
+            record.get("contract_version") != "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V1"
+            or not isinstance(record.get("authorization_id"), str)
+            or not re.fullmatch(r"LRA_[0-9A-F]{24}", cast(str, record["authorization_id"]))
+            or record.get("policy_id")
+            != ambiguous_legacy_policy_id(str(record.get("parent_attempt_id", "")))
+            or not isinstance(record.get("parent_attempt_id"), str)
+            or not _RUN_ID_RE.fullmatch(cast(str, record["parent_attempt_id"]))
+            or not str(record.get("parent_attempt_id")).startswith("D2_")
+            or not _SHA256_RE.fullmatch(str(record.get("decision_input_digest", "")))
+            or not _SHA256_RE.fullmatch(str(record.get("reconciliation_audit_id", "")))
+            or not _SHA256_RE.fullmatch(str(record.get("replacement_quote_input_digest", "")))
+            or not isinstance(record.get("replacement_quote_source_version"), str)
+            or not str(record.get("replacement_quote_source_version"))
+            or not str(record.get("replacement_quote_source", "")).startswith("https://")
+            or not isinstance(created_at, datetime)
+            or created_at.tzinfo is None
+            or created_at.utcoffset() is None
+            or not isinstance(quote_at, datetime)
+            or quote_at.tzinfo is None
+            or quote_at.utcoffset() is None
+            or not isinstance(record.get("created_by"), str)
+            or not cast(str, record["created_by"]).strip()
+            or not re.fullmatch(r"[0-9a-f]{40}", str(record.get("software_commit", "")))
+            or record.get("consumption_sha256") is not None
+        ):
+            raise PhaseGError(
+                "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                "legacy replacement authorization identity or audit fields are invalid",
+            )
+
+        def create(payload: dict[str, object]) -> dict[str, object]:
+            attempts = cast(list[dict[str, object]], payload["attempts"])
+            authorizations = cast(
+                list[dict[str, object]], payload["legacy_replacement_authorizations"]
+            )
+            parent_id = record.get("parent_attempt_id")
+            parent_rows = [row for row in attempts if row.get("d2_run_id") == parent_id]
+            if len(parent_rows) != 1:
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_PARENT_INVALID",
+                    "exact legacy replacement parent is not unique in the D2 ledger",
+                )
+            parent = parent_rows[0]
+            exposure = _decimal(record.get("legacy_exposure"), allow_none=True)
+            quote = _decimal(record.get("replacement_quote"), allow_none=True)
+            combined = _decimal(record.get("maximum_combined_exposure"), allow_none=True)
+            if (
+                parent.get("submission_state") != "UNKNOWN_SUBMISSION_STATE"
+                or parent.get("accounted_credit_cost") is None
+                or exposure is None
+                or exposure != _decimal(parent.get("accounted_credit_cost"), allow_none=True)
+                or quote is None
+                or quote <= 0
+                or combined != exposure + quote
+                or parent.get("generate_action_count") != 1
+                or record.get("authorization_status") != "APPROVED"
+                or record.get("replacement_created") is not False
+                or record.get("replacement_attempt_id") is not None
+                or record.get("consumption_sha256") is not None
+                or record.get("authorized_replacement_count") != 1
+                or record.get("replacement_quote_unit") != "CREDIT"
+                or record.get("generate_authorized") is not False
+                or any(row.get("parent_attempt_id") == parent_id for row in authorizations)
+                or any(
+                    isinstance(row.get("legacy_replacement"), dict)
+                    and cast(dict[str, object], row["legacy_replacement"]).get("parent_attempt_id")
+                    == parent_id
+                    for row in attempts
+                )
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                    "legacy replacement parent, exposure, or authorization is invalid",
+                )
+            if any(
+                row.get("authorization_id") == record.get("authorization_id")
+                for row in authorizations
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_CONFLICT",
+                    "legacy replacement authorization already exists",
+                )
+            record["authorization_sha256"] = self._legacy_replacement_auth_digest(record)
+            authorizations.append(record)
+            return dict(record)
+
+        return self._mutate(create)
+
+    def consume_legacy_replacement_authorization(
+        self,
+        authorization_id: str,
+        request: PhaseGExecutionRequest,
+        *,
+        current_quote: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Atomically link one exact authorized replacement attempt and consume its token."""
+        validate_phase_g_request(request)
+
+        def consume(payload: dict[str, object]) -> dict[str, object]:
+            attempts = cast(list[dict[str, object]], payload["attempts"])
+            authorizations = cast(
+                list[dict[str, object]], payload["legacy_replacement_authorizations"]
+            )
+            matches = [
+                row for row in authorizations if row.get("authorization_id") == authorization_id
+            ]
+            if len(matches) != 1:
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_NOT_FOUND",
+                    "exact legacy replacement authorization does not exist",
+                )
+            authorization = matches[0]
+            parent_id = authorization.get("parent_attempt_id")
+            replacement_link = {
+                "contract_version": "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V1",
+                "authorization_id": authorization_id,
+                "parent_attempt_id": parent_id,
+                "production_job_id": authorization.get("production_job_id"),
+                "scene_job_id": authorization.get("scene_job_id"),
+                "policy_id": authorization.get("policy_id"),
+                "reconciliation_audit_id": authorization.get("reconciliation_audit_id"),
+                "decision_input_digest": authorization.get("decision_input_digest"),
+                "generate_authorized": False,
+            }
+            replacement_id = request.d2_run_id
+            if authorization.get("authorization_status") == "CONSUMED":
+                existing = [row for row in attempts if row.get("d2_run_id") == replacement_id]
+                if (
+                    authorization.get("replacement_attempt_id") == replacement_id
+                    and len(existing) == 1
+                    and existing[0].get("legacy_replacement") == replacement_link
+                    and authorization.get("consumption_sha256")
+                    == self._legacy_replacement_consumption_digest(authorization)
+                ):
+                    return dict(existing[0])
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_CONSUMED",
+                    "legacy replacement authorization has already been consumed",
+                )
+            if (
+                authorization.get("authorization_status") != "APPROVED"
+                or authorization.get("replacement_created") is not False
+                or authorization.get("generate_authorized") is not False
+                or authorization.get("authorized_replacement_count") != 1
+                or authorization.get("authorization_sha256")
+                != self._legacy_replacement_auth_digest(authorization)
+                or current_quote.get("valid") is not True
+                or current_quote.get("status") != "VALID"
+                or current_quote.get("unit") != "CREDIT"
+                or str(current_quote.get("amount")) != authorization.get("replacement_quote")
+                or current_quote.get("source_version")
+                != authorization.get("replacement_quote_source_version")
+                or current_quote.get("input_digest")
+                != authorization.get("replacement_quote_input_digest")
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                    "authorization or current quote no longer matches",
+                )
+            parent_rows = [row for row in attempts if row.get("d2_run_id") == parent_id]
+            if len(parent_rows) != 1:
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_PARENT_INVALID",
+                    "exact legacy replacement parent is not unique",
+                )
+            parent = parent_rows[0]
+            expected_parent_values = {
+                "scene_id": request.scene_id,
+                "generation_profile_id": request.generation_profile_id,
+                "provider_id": request.provider_id,
+                "provider_account_id": request.provider_account_id,
+                "provider_project_id": request.provider_project_id,
+                "model_id": request.model_id,
+                "generation_mode": request.generation_mode,
+                "prompt_sha256": request.prompt_sha256,
+                "requested_duration_sec": request.duration_sec,
+                "requested_aspect_ratio": request.aspect_ratio,
+                "requested_output_count": request.output_count,
+            }
+            replacement_already_exists = False
+            for row in attempts:
+                replacement_value = row.get("legacy_replacement")
+                if (
+                    isinstance(replacement_value, dict)
+                    and cast(dict[str, object], replacement_value).get("parent_attempt_id")
+                    == parent_id
+                ):
+                    replacement_already_exists = True
+                    break
+            if (
+                parent.get("submission_state") != "UNKNOWN_SUBMISSION_STATE"
+                or parent.get("accounted_credit_cost") != authorization.get("legacy_exposure")
+                or parent.get("generate_action_count") != 1
+                or any(parent.get(key) != value for key, value in expected_parent_values.items())
+                or replacement_already_exists
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_PARENT_INVALID",
+                    "legacy parent state or generation identity has changed",
+                )
+            self._create(
+                payload,
+                request,
+                legacy_replacement_authorization=authorization,
+            )
+            created = self._attempt(payload, request.d2_run_id)
+            created["legacy_replacement"] = replacement_link
+            authorization.update(
+                authorization_status="CONSUMED",
+                replacement_created=True,
+                replacement_attempt_id=request.d2_run_id,
+                consumed_at=_utc_now(),
+            )
+            authorization["consumption_sha256"] = self._legacy_replacement_consumption_digest(
+                authorization
+            )
+            return dict(created)
+
+        return self._mutate(consume)
+
+    @staticmethod
+    def _legacy_replacement_auth_digest(authorization: Mapping[str, object]) -> str:
+        immutable = {
+            key: value
+            for key, value in authorization.items()
+            if key
+            not in {
+                "authorization_sha256",
+                "authorization_status",
+                "replacement_created",
+                "replacement_attempt_id",
+                "consumed_at",
+                "consumption_sha256",
+            }
+        }
+        return hashlib.sha256(
+            json.dumps(
+                immutable,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _legacy_replacement_consumption_digest(
+        authorization: Mapping[str, object],
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "authorization_sha256": authorization.get("authorization_sha256"),
+                    "authorization_id": authorization.get("authorization_id"),
+                    "authorization_status": authorization.get("authorization_status"),
+                    "replacement_created": authorization.get("replacement_created"),
+                    "replacement_attempt_id": authorization.get("replacement_attempt_id"),
+                    "consumed_at": authorization.get("consumed_at"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
 
     def open_test_session(
         self,
@@ -3250,10 +3581,25 @@ class D2DailyCreditLedger:
         *,
         retry_authorization: D2RetryAuthorization | None = None,
         test_session: dict[str, object] | None = None,
+        legacy_replacement_authorization: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         attempts = cast(list[dict[str, object]], payload["attempts"])
         if any(row["d2_run_id"] == request.d2_run_id for row in attempts):
             raise PhaseGError("PHASE_G_DUPLICATE_RUN_ID", "D2 run ID already exists in the ledger")
+        if (
+            sum(
+                authorization is not None
+                for authorization in (
+                    retry_authorization,
+                    test_session,
+                    legacy_replacement_authorization,
+                )
+            )
+            > 1
+        ):
+            raise PhaseGError(
+                "PHASE_G_AUTHORIZATION_CONFLICT", "D2 attempt authorizations cannot be combined"
+            )
         retry_predecessor: dict[str, object] | None = None
         if retry_authorization is not None:
             retry_predecessor = self._validate_retry_authorization(
@@ -3275,6 +3621,14 @@ class D2DailyCreditLedger:
                 "GENERATION_PENDING",
                 "SUBMISSION_ACKNOWLEDGED",
             }:
+                if (
+                    legacy_replacement_authorization is not None
+                    and previous.get("d2_run_id")
+                    == legacy_replacement_authorization.get("parent_attempt_id")
+                    and legacy_replacement_authorization.get("authorization_status") == "APPROVED"
+                    and legacy_replacement_authorization.get("replacement_created") is False
+                ):
+                    continue
                 raise PhaseGError(
                     "PHASE_G_ATTEMPT_UNRESOLVED", "prior D2 attempt requires reconciliation"
                 )
@@ -3329,6 +3683,22 @@ class D2DailyCreditLedger:
                 "predecessor_d2_run_id": retry_authorization.predecessor_d2_run_id,
                 "expected_terminal_state": retry_authorization.expected_terminal_state,
                 "consumed_at": _utc_now(),
+            }
+        if legacy_replacement_authorization is not None:
+            attempt["legacy_replacement"] = {
+                "contract_version": "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V1",
+                "authorization_id": legacy_replacement_authorization.get("authorization_id"),
+                "parent_attempt_id": legacy_replacement_authorization.get("parent_attempt_id"),
+                "production_job_id": legacy_replacement_authorization.get("production_job_id"),
+                "scene_job_id": legacy_replacement_authorization.get("scene_job_id"),
+                "policy_id": legacy_replacement_authorization.get("policy_id"),
+                "reconciliation_audit_id": legacy_replacement_authorization.get(
+                    "reconciliation_audit_id"
+                ),
+                "decision_input_digest": legacy_replacement_authorization.get(
+                    "decision_input_digest"
+                ),
+                "generate_authorized": False,
             }
         attempts.append(attempt)
         return dict(attempt)
@@ -3741,6 +4111,7 @@ class D2DailyCreditLedger:
                 "daily_budget": self.daily_budget,
                 "attempts": [],
                 "test_sessions": [],
+                "legacy_replacement_authorizations": [],
             }
         if self.path.is_symlink():
             raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "ledger may not be a symlink")
@@ -3768,14 +4139,38 @@ class D2DailyCreditLedger:
                 "daily_budget": self.daily_budget,
                 "attempts": payload["attempts"],
                 "test_sessions": [],
+                "legacy_replacement_authorizations": [],
             }
-        if set(payload) != {"schema_version", "daily_budget", "attempts", "test_sessions"}:
+        v2_keys = {"schema_version", "daily_budget", "attempts", "test_sessions"}
+        v3_keys = v2_keys | {"legacy_replacement_authorizations"}
+        if schema_version == 2 and set(payload) == v2_keys:
+            if (
+                payload.get("daily_budget") != self.daily_budget
+                or not isinstance(payload.get("attempts"), list)
+                or not isinstance(payload.get("test_sessions"), list)
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CORRUPT", "legacy D2 credit ledger version or budget is invalid"
+                )
+            return {
+                "schema_version": _LEDGER_SCHEMA,
+                "daily_budget": self.daily_budget,
+                "attempts": payload["attempts"],
+                "test_sessions": payload["test_sessions"],
+                "legacy_replacement_authorizations": [],
+            }
+        if set(payload) != v3_keys:
             raise PhaseGError("PHASE_G_LEDGER_CORRUPT", "D2 credit ledger has an invalid shape")
         if (
             schema_version != _LEDGER_SCHEMA
             or payload["daily_budget"] != self.daily_budget
             or not isinstance(payload["attempts"], list)
             or not isinstance(payload["test_sessions"], list)
+            or not isinstance(payload["legacy_replacement_authorizations"], list)
+            or any(
+                not isinstance(row, dict)
+                for row in cast(list[object], payload["legacy_replacement_authorizations"])
+            )
         ):
             raise PhaseGError(
                 "PHASE_G_LEDGER_CORRUPT", "D2 credit ledger version or budget is invalid"

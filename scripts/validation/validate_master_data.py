@@ -33,6 +33,14 @@ def load_schemas():
 def value(row, key):
     return (row.get(key) or "").strip()
 
+def headers_match_schema(headers, expected, optional_fields):
+    if headers == expected:
+        return True
+    if len(headers) > len(expected) or expected[:len(headers)] != headers:
+        return False
+    missing_trailing = expected[len(headers):]
+    return set(missing_trailing).issubset(optional_fields)
+
 def is_active(row):
     return value(row, "Status").upper() == "ACTIVE"
 
@@ -71,7 +79,10 @@ def validate(csv_dir):
         expected = [f["field_name"] for f in schema["fields"]]
         if len(headers) != len(set(headers)):
             errors.append(f"{table}: duplicate headers")
-        if headers != expected:
+        optional_fields = {
+            field["field_name"] for field in schema["fields"] if field.get("required") is False
+        }
+        if not headers_match_schema(headers, expected, optional_fields):
             errors.append(f"{table}: headers do not match schema")
         records[table] = rows
         seen = set()
@@ -271,6 +282,7 @@ def validate(csv_dir):
             profile_defaults.add(key)
 
     # Cost rows are source-backed, effective-dated, and provider-consistent.
+    profile_rows={value(row,"Generation_Profile_ID"):row for row in records.get("GENERATION_PROFILE_MASTER",[]) if value(row,"Generation_Profile_ID")}
     for rownum,row in enumerate(records.get("PROVIDER_COST_MASTER",[]),start=2):
         provider_id,account_id,model_id=(value(row,k) for k in ("Provider_ID","Provider_Account_ID","Model_ID"))
         account,model=account_rows.get(account_id),model_rows.get(model_id)
@@ -278,6 +290,35 @@ def validate(csv_dir):
             errors.append(f"PROVIDER_COST_MASTER row {rownum}: provider does not match provider account")
         if model and provider_id != value(model,"Provider_ID"):
             errors.append(f"PROVIDER_COST_MASTER row {rownum}: provider does not match model")
+        profile_id=value(row,"Generation_Profile_ID")
+        if profile_id:
+            profile=profile_rows.get(profile_id)
+            if profile is None:
+                errors.append(f"PROVIDER_COST_MASTER row {rownum}: generation profile is missing")
+            else:
+                scope_fields=(
+                    ("Provider_Account_ID","Provider_Account_ID"),
+                    ("Model_ID","Model_ID"),
+                    ("Generation_Mode","Generation_Mode"),
+                    ("Duration_Sec","Default_Duration_Sec"),
+                    ("Aspect_Ratio","Default_Aspect_Ratio"),
+                    ("Resolution","Default_Resolution"),
+                    ("Audio_Mode","Audio_Mode"),
+                    ("Output_Count","Default_Output_Count"),
+                    ("Quality_Tier","Quality_Tier"),
+                )
+                for cost_field,profile_field in scope_fields:
+                    cost_value,profile_value=value(row,cost_field),value(profile,profile_field)
+                    if not cost_value or not profile_value:
+                        errors.append(f"PROVIDER_COST_MASTER row {rownum}: profile quote scope is incomplete ({cost_field})")
+                    elif cost_field in {"Duration_Sec","Output_Count"}:
+                        try:
+                            if float(cost_value) != float(profile_value):
+                                errors.append(f"PROVIDER_COST_MASTER row {rownum}: {cost_field} differs from generation profile")
+                        except ValueError:
+                            errors.append(f"PROVIDER_COST_MASTER row {rownum}: {cost_field} is invalid")
+                    elif cost_value != profile_value:
+                        errors.append(f"PROVIDER_COST_MASTER row {rownum}: {cost_field} differs from generation profile")
         unit,currency=value(row,"Cost_Unit"),value(row,"Currency")
         if unit and unit!="CREDIT" and not currency:
             errors.append(f"PROVIDER_COST_MASTER row {rownum}: currency required unless Cost_Unit is CREDIT")

@@ -237,6 +237,66 @@
       "description": "Last update timestamp in ISO 8601 UTC.",
       "example": null,
       "validation_rule": null
+    },
+    {
+      "field_name": "Generation_Profile_ID",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": "GENERATION_PROFILE_MASTER.Generation_Profile_ID",
+      "foreign_key_status": "ACTIVE FK",
+      "allowed_values": null,
+      "description": "Optional exact generation profile scope for a source-verified rate.",
+      "example": null,
+      "validation_rule": "Required for direct replacement quotes."
+    },
+    {
+      "field_name": "Duration_Sec",
+      "data_type": "NUMBER",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional exact duration scope for the source-verified rate.",
+      "example": null,
+      "validation_rule": "Required for direct replacement quotes."
+    },
+    {
+      "field_name": "Aspect_Ratio",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional exact aspect-ratio scope for the source-verified rate.",
+      "example": null,
+      "validation_rule": "Required for direct replacement quotes."
+    },
+    {
+      "field_name": "Audio_Mode",
+      "data_type": "STRING",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional exact audio-mode scope for the source-verified rate.",
+      "example": null,
+      "validation_rule": "Required for direct replacement quotes."
+    },
+    {
+      "field_name": "Output_Count",
+      "data_type": "INTEGER",
+      "required": false,
+      "primary_key": false,
+      "foreign_key": null,
+      "foreign_key_status": null,
+      "allowed_values": null,
+      "description": "Optional exact output-count scope for the source-verified rate.",
+      "example": null,
+      "validation_rule": "Required for direct replacement quotes."
     }
   ]
 }

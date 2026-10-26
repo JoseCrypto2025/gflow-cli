@@ -26,7 +26,9 @@ decision. Eligibility is not authorization. This policy cannot create a
 replacement attempt, approve it, or authorize Generate. Its deterministic
 lineage key binds any later replacement decision to this predecessor. A future
 replacement must have an explicit authorization event, and only one such
-replacement may bind to a predecessor.
+replacement may bind to a predecessor. Quote resolution, one-time authorization,
+and atomic future parent linkage are specified separately in
+[`D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V1.md`](D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V1.md).
 
 ## Operator and durable audit
 

@@ -185,7 +185,7 @@ Primary key: Generation_Profile_ID (GPR_0001). Provider_Account_ID, Model_ID, an
 
 Effective-dated provider, account, or model pricing. No rows are added until rates are verified. Rate changes create new rows; historical values are retained.
 
-Primary key: Provider_Cost_ID (PCT_000001). Provider_ID is required; Provider_Account_ID and Model_ID are optional foreign keys. Each cost row requires Cost_Rate, Effective_From, Source, and Verified_At. Currency is an uppercase three-letter currency code and is required except for CREDIT units. Effective_To, when present, must be later than Effective_From. Fields: Provider_Cost_ID, Provider_ID, Provider_Account_ID, Model_ID, Billing_Plan_Name, Generation_Mode, Quality_Tier, Resolution, Cost_Unit, Cost_Rate, Currency, Effective_From, Effective_To, Source, Verified_At, Status, Created_At, Updated_At.
+Primary key: Provider_Cost_ID (PCT_000001). Provider_ID is required; Provider_Account_ID and Model_ID are optional foreign keys. Each cost row requires Cost_Rate, Effective_From, Source, and Verified_At. Currency is an uppercase three-letter currency code and is required except for CREDIT units. Effective_To, when present, must be later than Effective_From. Optional exact quote-scope fields are Generation_Profile_ID, Duration_Sec, Aspect_Ratio, Audio_Mode, and Output_Count. A direct replacement reservation quote requires all of these plus account, model, mode, quality tier, and resolution to match the active generation profile exactly; incomplete or ambiguous rows cannot supply a quote. Fields: Provider_Cost_ID, Provider_ID, Provider_Account_ID, Model_ID, Billing_Plan_Name, Generation_Mode, Quality_Tier, Resolution, Cost_Unit, Cost_Rate, Currency, Effective_From, Effective_To, Source, Verified_At, Status, Created_At, Updated_At, Generation_Profile_ID, Duration_Sec, Aspect_Ratio, Audio_Mode, Output_Count.
 
 ## Provider-neutral generation rules
 
@@ -206,5 +206,5 @@ Primary key: Provider_Cost_ID (PCT_000001). Provider_ID is required; Provider_Ac
 - Google Drive owns actual reference files. Provider mappings are separate.
 - Prompt_* values are curated canonical fragments, not automatic copies of raw descriptions.
 - No credentials, tokens, passwords, API keys, or private keys belong in the database.
-- Cost design is documented but unpopulated until verified rates exist. Future fields: Cost_Unit, Cost_Rate, Currency, Resolution, Effective_From, Effective_To, Cost_Last_Verified_At.
+- The direct-credit quote resolver is internal to the ambiguous legacy replacement path. It never infers cost from historical usage; when no exact source-verified effective row exists, quote status is `QUOTE_UNAVAILABLE` and replacement decision remains HOLD.
 

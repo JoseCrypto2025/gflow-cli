@@ -1180,11 +1180,32 @@ def test_test_session_migrates_v1_without_changing_historical_attempts(tmp_path:
     _open_test_budget_session(ledger)
 
     migrated = json.loads(ledger.path.read_text(encoding="utf-8"))
-    assert migrated["schema_version"] == 2
+    assert migrated["schema_version"] == 3
     assert migrated["daily_budget"] == 50
     assert migrated["attempts"] == before
     assert migrated["attempts"][0]["accounted_credit_cost"] == "50"
     assert len(migrated["test_sessions"]) == 1
+    assert migrated["legacy_replacement_authorizations"] == []
+
+
+def test_test_session_migrates_schema_two_without_changing_existing_rows(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "state")
+    ledger.root.mkdir(parents=True)
+    old = {
+        "schema_version": 2,
+        "daily_budget": 50,
+        "attempts": [{"d2_run_id": "D2_existing-0001", "accounted_credit_cost": "12"}],
+        "test_sessions": [{"session_id": "D2TS_existing", "status": "STOPPED"}],
+    }
+    ledger.path.write_text(json.dumps(old), encoding="utf-8")
+
+    ledger._mutate(lambda payload: payload)  # noqa: SLF001
+    migrated = json.loads(ledger.path.read_text(encoding="utf-8"))
+
+    assert migrated["schema_version"] == 3
+    assert migrated["attempts"] == old["attempts"]
+    assert migrated["test_sessions"] == old["test_sessions"]
+    assert migrated["legacy_replacement_authorizations"] == []
 
 
 def test_test_session_authorizes_exact_lane_over_historical_daily_reservation(

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Legacy PROD replacement quote and one-time authorization.** Adds a read-only
+  exact-scope provider-cost quote that returns `QUOTE_UNAVAILABLE` without a verified
+  rate, a replacement decision gate, and a schema-3 D2 ledger authorization consumed
+  atomically with one explicit parent-linked `PREPARED` row. It does not authorize
+  Generate or change the existing legacy reservation. The current applicable quote
+  remains unavailable because no source-backed cost row exists.
+
 - **Ambiguous legacy PROD quarantine policy.** Adds a terminal `QUARANTINED` state for both job
   tables, blocks orchestrator resume/recovery/generation for that state, and provides a scoped
   operator with a separate hash-chained intent/application audit. The policy preserves the

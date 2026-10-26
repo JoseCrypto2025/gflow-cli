@@ -418,6 +418,39 @@ def test_full_34_schema_snapshot_uses_one_batch_and_keeps_validation(tmp_path: P
     client.close()
 
 
+def test_cost_schema_accepts_only_missing_optional_trailing_scope_columns() -> None:
+    from gflow_cli.v2_runtime.google_sheets import (
+        GoogleSheetsReadError,
+        _rows_from_values,
+        load_schema_headers,
+        load_schema_optional_headers,
+    )
+
+    schema_dir = Path(__file__).resolve().parents[2] / "schemas"
+    headers = load_schema_headers(schema_dir)["PROVIDER_COST_MASTER"]
+    optional = load_schema_optional_headers(schema_dir)["PROVIDER_COST_MASTER"]
+    legacy_headers = headers[:-5]
+    legacy_row = [""] * len(legacy_headers)
+    legacy_row[legacy_headers.index("Provider_Cost_ID")] = "PCT_000001"
+
+    rows = _rows_from_values(
+        "PROVIDER_COST_MASTER",
+        headers,
+        [legacy_headers, legacy_row],
+        optional_headers=optional,
+    )
+
+    assert rows[0]["Provider_Cost_ID"] == "PCT_000001"
+    assert rows[0]["Generation_Profile_ID"] == ""
+    with pytest.raises(GoogleSheetsReadError, match="headers do not match"):
+        _rows_from_values(
+            "PROVIDER_COST_MASTER",
+            headers,
+            [headers[1:], [""] * (len(headers) - 1)],
+            optional_headers=optional,
+        )
+
+
 @pytest.mark.parametrize("response_count", [0, 2])
 def test_batch_get_range_count_mismatch_has_bounded_diagnostic(response_count: int) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
