@@ -5,8 +5,8 @@
 `scripts/operations/deploy_v2_runtime.py` is the application deployment
 operator. It defaults to a read-only preflight and requires an exact clean
 `automation-v2` commit. It packages only `src/`, `schemas/`, the production F5
-operator, the legacy reconciliation and ambiguous-policy operators, the runtime doctor,
-`pyproject.toml`, and `uv.lock` from Git; it never
+operator, the legacy reconciliation and ambiguous-policy operators, the read-only Flow
+pricing inspector, the runtime doctor, `pyproject.toml`, and `uv.lock` from Git; it never
 copies `.git`, tests, docs, ignored files, credentials, or a source virtualenv.
 The allowlisted `validate_v2_data_architecture.py` is included because the
 live Google Sheets snapshot source imports it for full schema and semantic
@@ -287,3 +287,76 @@ credit balance/quote and live composer/assets, and deploy the approved source
 to `/opt/gflow-v2` only through a separately approved deployment workflow
 before reconsidering release readiness. Generate, Approve, and production D2
 remain unexecuted.
+
+## Read-only PROD Flow pricing inspection — 2026-10-27 implementation
+
+The 2026-10-23 readiness findings above are a historical checkpoint. The
+current inspection path is `scripts/operations/inspect_flow_pricing_read_only.py`
+and is deliberately limited to `PVA_0002`, `GFLOW_PROD_AUTH` / `gflow-prod`,
+and project `aafe9282-071f-4333-baa4-92b9f76a9c27`. Invoke it only for that
+exact target:
+
+```bash
+python scripts/operations/inspect_flow_pricing_read_only.py \
+  --provider-account-id PVA_0002 \
+  --project-id aafe9282-071f-4333-baa4-92b9f76a9c27
+```
+
+The operation obtains the repository `ProfileLease` non-blockingly before
+session verification and retains it through browser close. Contention returns
+`PROFILE_IN_USE`; it never bypasses either the repository lease or Chromium's
+native profile lock. It reuses V2 Agent-only project navigation and the
+read-only settings snapshot, including the duration radio's locale-invariant
+number when that group is present. It does not call `prepare_live_flow()`,
+`apply_settings()`, prompt-fill methods, or any Generate/approval/submission
+method. The settings pane may be opened and closed to read selected values;
+no save control is used. The Generate control is read-only text evidence and
+is never clicked.
+
+A cost is accepted only when one unambiguous `credits` amount appears in the
+current Generate control label on an English UI. It is not inferred from
+balance, account plan, historical prices, or model defaults. Other locales,
+absent or ambiguous labels, hidden duration/configuration fields, and
+unsupported UI shapes remain `UNKNOWN` or return a sanitized HOLD code.
+`CONFIG_MATCH=PASS` requires all three canonical fields (duration, aspect
+ratio, and output count) to be directly visible and equal to the intended
+values. A visible quote is marked `CREDIT_COST_AUTHORITATIVE=YES` only when
+that configuration, the expected model, and standard priority are verified.
+Screenshots are clipped to the settings panel and, only when a quote is found,
+the Generate control. Evidence files are stored under a unique
+`flow-pricing-inspection/<timestamp>/` directory with owner-only permissions.
+The DOM digest is computed from the allowlisted evidence envelope, not a raw
+page dump. The operation writes no pricing/master-data, attempt, reservation,
+prompt, or production job record.
+
+This inspection path reports only the fields observed in its live run. It does
+not validate assets or authorize Generate/Approve. It navigates the browser to
+the exact project and opens/closes the settings view; `FLOW_STATE_CHANGED=NO`
+means no persistent Flow project, prompt, model, or setting data was changed.
+Pricing master-data updates and any production execution remain separate
+tasks.
+
+After deployment manifest parity and runtime doctor pass, run the bound live
+regression once from the clean source checkout. It invokes the deployed
+`/opt/gflow-v2` inspector script and requires the existing profile path; it
+does not create a copy of the authenticated profile:
+
+```sh
+cd /opt/gflow-v2-src
+GFLOW_CLI_HOME=/var/lib/gflow/browser-state \
+GFLOW_CLI_E2E_PROFILE=gflow-prod \
+RUNTIME_ENV=production \
+STORAGE_PROVIDER=google-drive \
+RUNTIME_STATE_ROOT=/var/lib/gflow \
+TEMP_ROOT=/var/tmp/gflow \
+LOG_ROOT=/var/log/gflow \
+PYTHONUTF8=1 uv run --locked --extra dev --python 3.11 \
+  python -m pytest -q -s -m e2e_auth \
+  tests/e2e/test_flow_pricing_inspector_e2e.py
+```
+
+The E2E test holds the same profile lease through the deployed inspector, prints
+only its sanitized JSON report, and checks account/project identity and zero
+provider mutations. A HOLD for unavailable model/config/quote evidence is a
+valid inspection result; identity mismatch, profile contention, or an unsafe
+surface fails the regression and must stop further pricing work.

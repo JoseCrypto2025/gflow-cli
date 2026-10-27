@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
 
@@ -39,6 +40,7 @@ _VIDEO_MODEL_BUTTON = 'button[aria-label="Video generation default model"]'
 _SAVE_BUTTON = "button.settings-save-button"
 _BACK_BUTTON = "flow-agent-panel button:has(mat-icon:text-is('arrow_back'))"
 _GENERATE_BUTTON = "flow-generate-icon-button button"
+_DURATION_RADIO_RE = re.compile(r"^\s*(\d+)(?!\d)(?!\s*[pPkK]\b)\D*$")
 _AUTH_PROFILE_NAMES = {
     "GFLOW_V2_TEST_AUTH": "gflow-v2-test",
     "GFLOW_PROD_AUTH": "gflow-prod",
@@ -250,6 +252,11 @@ class GoogleFlowAgentOnlyPort:
             await self._playwright.stop()
             self._playwright = None
 
+    @property
+    def session_email(self) -> str | None:
+        """Verified account email, available without reading composer content."""
+        return self._session_email if self._session_verified else None
+
     async def inspect_session(self) -> FlowSessionState:
         if not self._session_verified:
             raise FlowPresubmitError("FLOW_AUTH_NOT_READY", "profile session was not verified")
@@ -259,6 +266,23 @@ class GoogleFlowAgentOnlyPort:
     async def active_page(self) -> Page:
         """Expose the repository-owned page to a separate, bound extension port."""
         return await self._ensure_page()
+
+    async def read_generate_control_label(
+        self, *, screenshot_path: Path | None = None
+    ) -> str | None:
+        """Read only the visible Generate control label and optionally capture that control."""
+        page = await self._ensure_page()
+        control = page.locator(_GENERATE_BUTTON)
+        if await control.count() != 1 or not await control.is_visible():
+            return None
+        label = await control.inner_text()
+        if screenshot_path is not None:
+            try:
+                await control.screenshot(path=str(screenshot_path), animations="disabled")
+            except Exception:
+                # Evidence capture is optional and never changes the UI result.
+                pass
+        return label
 
     async def select_project(self, project_id: str) -> FlowProjectState:
         if project_id != self.provider_project_id:
@@ -302,11 +326,31 @@ class GoogleFlowAgentOnlyPort:
         )
         return self._surface
 
-    async def snapshot_settings(self) -> Mapping[str, object]:
+    async def snapshot_settings(
+        self,
+        *,
+        screenshot_path: Path | None = None,
+        allow_unmapped_model: bool = False,
+    ) -> Mapping[str, object]:
         await self._ensure_page()
         await self._open_settings()
         try:
-            return await self._read_video_settings()
+            if screenshot_path is not None:
+                view = self._page.locator(_SETTINGS_VIEW) if self._page is not None else None
+                if view is not None:
+                    prompt_controls = view.locator(
+                        f"{_PROMPT_SELECTOR}, [contenteditable='true'], textarea"
+                    )
+                    if await prompt_controls.count() == 0:
+                        try:
+                            await view.screenshot(
+                                path=str(screenshot_path), animations="disabled", timeout=5_000
+                            )
+                        except Exception:
+                            # Evidence capture is optional; a screenshot failure
+                            # must not widen the observation or change its result.
+                            pass
+            return await self._read_video_settings(allow_unmapped_model=allow_unmapped_model)
         finally:
             await self._close_settings()
 
@@ -476,14 +520,23 @@ class GoogleFlowAgentOnlyPort:
         await back.click(timeout=5_000)
         await view.wait_for(state="hidden", timeout=10_000)
 
-    async def _read_video_settings(self) -> dict[str, object]:
+    async def _read_video_settings(
+        self, *, allow_unmapped_model: bool = False
+    ) -> dict[str, object]:
         page = await self._ensure_page()
         view = page.locator(_SETTINGS_VIEW)
         await view.wait_for(state="visible", timeout=10_000)
         model_button = view.locator(_VIDEO_MODEL_BUTTON)
         model_text = (await model_button.inner_text()).strip().splitlines()[0]
-        model_id = resolve_model_id_from_display(model_text, self.model_display_names)
-        if model_id is None:
+        model_priority = "UNKNOWN"
+        model_base_text = model_text
+        lower_priority_suffix = " [lower priority]"
+        if model_text.casefold().endswith(lower_priority_suffix):
+            model_priority = "LOWER_PRIORITY"
+            if allow_unmapped_model:
+                model_base_text = model_text[: -len(lower_priority_suffix)].strip()
+        model_id = resolve_model_id_from_display(model_base_text, self.model_display_names)
+        if model_id is None and not allow_unmapped_model:
             raise FlowPresubmitError(
                 "FLOW_MODEL_UNMAPPED", "live Agent model is absent from validated model mapping"
             )
@@ -500,6 +553,12 @@ class GoogleFlowAgentOnlyPort:
             raise FlowPresubmitError(
                 "FLOW_AGENT_SETTINGS_UNREADABLE", "video aspect or count readback is unavailable"
             )
+        duration: int | None = None
+        if allow_unmapped_model:
+            duration_text = await self._selected_radio_text(groups.nth(1))
+            duration_match = _DURATION_RADIO_RE.fullmatch(duration_text)
+            if duration_match is not None:
+                duration = int(duration_match.group(1))
         confirmation = view.locator('input[type="radio"]:checked')
         if await confirmation.count() != 1:
             raise FlowPresubmitError(
@@ -511,13 +570,18 @@ class GoogleFlowAgentOnlyPort:
             raise FlowPresubmitError(
                 "FLOW_AGENT_SETTINGS_UNREADABLE", "confirmation preference is not recognized"
             )
-        return {
+        settings: dict[str, object] = {
             "model_id": model_id,
+            "model_name": model_text,
+            "model_priority": model_priority,
             "generation_mode": "TEXT_TO_VIDEO",
             "aspect_ratio": aspect_match.group(0),
             "output_count": int(count_match.group(1)),
             "confirm_before_generating": confirm_value,
         }
+        if allow_unmapped_model:
+            settings["duration"] = duration
+        return settings
 
     @staticmethod
     async def _selected_radio_text(group: Locator) -> str:
