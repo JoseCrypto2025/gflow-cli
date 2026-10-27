@@ -350,11 +350,15 @@ STORAGE_PROVIDER=google-drive \
 RUNTIME_STATE_ROOT=/var/lib/gflow \
 TEMP_ROOT=/var/tmp/gflow \
 LOG_ROOT=/var/log/gflow \
-PYTHONUTF8=1 uv run --locked --extra dev --python 3.11 \
+PYTHONUTF8=1 xvfb-run -a \
+  uv run --locked --extra dev --python 3.11 \
   python -m pytest -q -s -m e2e_auth \
   --basetemp=/tmp/gflow-pricing-inspection-e2e \
   tests/e2e/test_flow_pricing_inspector_e2e.py
 ```
+
+The `xvfb-run -a` wrapper provides a headed display in SSH sessions with no
+`DISPLAY` while keeping the existing profile and browser engine.
 
 The E2E test holds the same profile lease through the deployed inspector, prints
 only its sanitized JSON report, and checks account/project identity and zero
