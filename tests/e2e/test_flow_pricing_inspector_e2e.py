@@ -15,6 +15,7 @@ from pytest_bdd import given, scenarios, then, when
 
 from gflow_cli.v2_runtime.flow_pricing_inspector import (
     EXPECTED_EMAIL,
+    EXPECTED_PROFILE_NAME,
     EXPECTED_PROFILE_PATH,
     EXPECTED_PROJECT_ID,
     EXPECTED_PROVIDER_ACCOUNT_ID,
@@ -29,9 +30,14 @@ def world() -> dict[str, Any]:
 
 
 @given("the existing gflow-prod profile and exact production project")
-def _pinned_profile_and_project(world: dict[str, Any], e2e_profile_dir: Path) -> None:
-    assert e2e_profile_dir.resolve(strict=True) == EXPECTED_PROFILE_PATH.resolve(strict=False)
-    world["profile"] = e2e_profile_dir
+def _pinned_profile_and_project(world: dict[str, Any]) -> None:
+    # The shared e2e_profile_dir fixture intentionally drops GFLOW_CLI_HOME
+    # and resolves the interactive user's default profile store. This V2
+    # service profile lives at a separately configured, exact production path.
+    assert os.environ.get("GFLOW_CLI_E2E_PROFILE") == EXPECTED_PROFILE_NAME
+    assert EXPECTED_PROFILE_PATH.is_dir() and not EXPECTED_PROFILE_PATH.is_symlink()
+    assert EXPECTED_PROFILE_PATH.resolve(strict=True) == EXPECTED_PROFILE_PATH.resolve(strict=False)
+    world["profile"] = EXPECTED_PROFILE_PATH
 
 
 @when("I run the read-only Flow pricing inspection")
@@ -40,6 +46,7 @@ def _inspect_flow_pricing(world: dict[str, Any]) -> None:
     assert script.is_file() and not script.is_symlink(), "deployed inspector script is unavailable"
     environment = os.environ.copy()
     environment["PYTHONUTF8"] = "1"
+    environment["GFLOW_CLI_HOME"] = str(EXPECTED_PROFILE_PATH.parent)
     completed = subprocess.run(
         [
             sys.executable,
