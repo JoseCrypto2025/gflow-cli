@@ -63,7 +63,12 @@ def _inspect_flow_pricing(world: dict[str, Any]) -> None:
         timeout=180,
     )
     assert completed.returncode in {0, 2}, f"inspector exited {completed.returncode}"
-    report = json.loads(completed.stdout)
+    report_line = next(
+        (line for line in reversed(completed.stdout.splitlines()) if line.lstrip().startswith("{")),
+        None,
+    )
+    assert report_line is not None, "inspector did not emit its sanitized JSON report"
+    report = json.loads(report_line)
     assert re.fullmatch(r"[0-9a-f]{40}", report["SOFTWARE_COMMIT"])
     world["report"] = report
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
