@@ -16,6 +16,7 @@ from gflow_cli.auth.verification import (
     verify_flow_session,
 )
 from gflow_cli.errors import SecurityError
+from gflow_cli.profile_lease import ProfileLease
 
 # Representative authenticated /api/auth/session body. Sanitised — no real
 # PII. Pins the endpoint contract: if Google changes the response shape, the
@@ -93,6 +94,25 @@ class TestEvaluateSessionResponse:
     def test_source_is_passed_through(self) -> None:
         status = evaluate_session_response(200, "{}", google_session=False, source="internal")
         assert status.source == "internal"
+
+
+@pytest.mark.asyncio
+async def test_verify_flow_profile_passes_borrowed_lease_to_session_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "gflow_home" / "profile_default"
+    profile.mkdir(parents=True)
+    lease = ProfileLease(profile).acquire()
+    fetch = AsyncMock(return_value=(200, AUTHENTICATED_BODY, True))
+    monkeypatch.setattr("gflow_cli.auth.verification.fetch_flow_session_httpx", fetch)
+
+    try:
+        status = await verify_flow_profile(profile, profile_lease=lease)
+    finally:
+        lease.release()
+
+    assert status.outcome is FlowSessionOutcome.AUTHENTICATED
+    fetch.assert_awaited_once_with(profile, profile_lease=lease)
 
 
 # ---------------------------------------------------------------------------

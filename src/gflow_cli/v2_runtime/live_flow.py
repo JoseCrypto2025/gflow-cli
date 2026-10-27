@@ -20,6 +20,7 @@ from gflow_cli.api.transports.migrated_composer import AGENT_MODE_CHIP_ANY, READ
 from gflow_cli.auth.internal_chromium import login_launch_kwargs
 from gflow_cli.auth.verification import FlowSessionOutcome, verify_flow_profile
 from gflow_cli.browser_manager import channel_for_profile, ensure_profile_engine_compatible
+from gflow_cli.profile_lease import ProfileLease
 
 from .errors import FlowPresubmitError
 from .google_flow import (
@@ -216,6 +217,7 @@ class GoogleFlowAgentOnlyPort:
         expected_email: str | None = None,
         headless: bool = False,
         block_service_workers: bool = False,
+        profile_lease: ProfileLease | None = None,
     ) -> GoogleFlowAgentOnlyPort:
         """Verify the existing profile session without starting a login flow."""
         port = cls(
@@ -228,7 +230,14 @@ class GoogleFlowAgentOnlyPort:
             headless=headless,
             block_service_workers=block_service_workers,
         )
-        status = await verify_flow_profile(port.profile_dir, source="v2-agent-only")
+        if profile_lease is None:
+            status = await verify_flow_profile(port.profile_dir, source="v2-agent-only")
+        else:
+            status = await verify_flow_profile(
+                port.profile_dir,
+                source="v2-agent-only",
+                profile_lease=profile_lease,
+            )
         if status.outcome is not FlowSessionOutcome.AUTHENTICATED:
             raise FlowPresubmitError(
                 "FLOW_AUTH_NOT_READY", "repository auth verification did not confirm a Flow session"

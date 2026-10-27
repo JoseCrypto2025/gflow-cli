@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -134,8 +134,13 @@ def _get_chrome_cookies3(profile_dir: Path) -> ChromeCookieSnapshot:
     )
 
 
-async def _get_chrome_cookies_playwright(profile_dir: Path) -> ChromeCookieSnapshot:
+async def _get_chrome_cookies_playwright(
+    profile_dir: Path, *, profile_lease: ProfileLease | None = None
+) -> ChromeCookieSnapshot:
     """Slow path: extract cookies through a marker-gated Chrome Playwright context."""
+    if profile_lease is not None:
+        profile_lease.assert_held_for(profile_dir)
+
     channel = channel_for_profile(profile_dir)
     if channel != "chrome":
         msg = (
@@ -149,22 +154,31 @@ async def _get_chrome_cookies_playwright(profile_dir: Path) -> ChromeCookieSnaps
     # Lazy import avoids strategies -> real_chrome -> verification import cycles.
     from .strategies import async_playwright
 
-    # Own the profile for this momentary cookie-read context (D3). The lease is
-    # the OUTER context so it releases only after the driver stops (inner
-    # async_playwright exits first). Contention -> ProfileLockedError before the
-    # headless Chrome launches.
-    async with ProfileLease(profile_dir), async_playwright() as pw:
-        ctx = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            channel=channel,
-            headless=True,
-            args=["--password-store=basic"],
-        )
-        try:
-            all_cookies = await ctx.cookies()
-            flow_cookies = await ctx.cookies([_FLOW_COOKIE_URL])
-        finally:
-            await ctx.close()
+    async def _read_cookie_jar() -> tuple[Sequence[object], Sequence[object]]:
+        async with async_playwright() as pw:
+            ctx = await pw.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                channel=channel,
+                headless=True,
+                args=["--password-store=basic"],
+            )
+            try:
+                all_cookies = await ctx.cookies()
+                flow_cookies = await ctx.cookies([_FLOW_COOKIE_URL])
+            finally:
+                await ctx.close()
+        return all_cookies, flow_cookies
+
+    if profile_lease is None:
+        # Own the profile for standalone probes (D3). The lease is the OUTER
+        # context so it releases only after the driver stops.
+        async with ProfileLease(profile_dir):
+            all_cookies, flow_cookies = await _read_cookie_jar()
+    else:
+        # A caller such as the pricing inspector already holds this profile.
+        # Borrow its lease; reacquiring here would fail fast as same-process
+        # contention and incorrectly turn an authenticated session into a hold.
+        all_cookies, flow_cookies = await _read_cookie_jar()
 
     # #222: derive the flow cookies from the FULL jar (domain-filtered), NOT from
     # ctx.cookies([_FLOW_COOKIE_URL]) — that URL filter only returns cookies whose
@@ -183,15 +197,24 @@ async def _get_chrome_cookies_playwright(profile_dir: Path) -> ChromeCookieSnaps
     )
 
 
-async def get_chrome_cookie_snapshot(profile_dir: Path) -> ChromeCookieSnapshot:
+async def get_chrome_cookie_snapshot(
+    profile_dir: Path, *, profile_lease: ProfileLease | None = None
+) -> ChromeCookieSnapshot:
     """Return the Chrome cookies needed by the Flow session probe.
 
     Strategy:
     1. browser_cookie3 direct SQLite read, with httpx cookies filtered to labs.google.
     2. marker-gated Playwright fallback when browser-cookie3 reports decryption failure.
     """
+    if profile_lease is not None:
+        profile_lease.assert_held_for(profile_dir)
+
     try:
         return _get_chrome_cookies3(profile_dir=profile_dir)
     except PermissionError:
         logger.info("cookie_decryption_failed_falling_back_to_playwright", profile=str(profile_dir))
-        return await _get_chrome_cookies_playwright(profile_dir=profile_dir)
+        if profile_lease is None:
+            return await _get_chrome_cookies_playwright(profile_dir=profile_dir)
+        return await _get_chrome_cookies_playwright(
+            profile_dir=profile_dir, profile_lease=profile_lease
+        )

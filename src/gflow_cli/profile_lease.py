@@ -256,6 +256,12 @@ class ProfileLease:
             raise RuntimeError(msg)
         return self._metadata
 
+    def assert_held_for(self, profile_dir: Path | str) -> None:
+        """Require this active lease to own the canonical *profile_dir*."""
+        if self._fd is None or self._canonical != _canonicalize(profile_dir):
+            msg = "profile lease is not held for the requested profile"
+            raise RuntimeError(msg)
+
     # -- sync core ---------------------------------------------------------
 
     def acquire(self) -> ProfileLease:

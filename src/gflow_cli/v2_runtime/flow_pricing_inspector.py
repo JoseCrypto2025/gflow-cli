@@ -620,9 +620,8 @@ async def inspect_flow_pricing_read_only(
     port: GoogleFlowAgentOnlyPort | None = None
     try:
         # The outer lease spans auth verification, exact-project navigation,
-        # DOM reads, and browser teardown. `verify_flow_profile` performs a
-        # cookie-backed HTTP probe (and only a short-lived fallback context),
-        # but does not acquire its own ProfileLease.
+        # DOM reads, and browser teardown. Pass it through verification so a
+        # cookie-decryption fallback borrows it instead of nesting a lease.
         port = await GoogleFlowAgentOnlyPort.open(
             auth_profile_key="GFLOW_PROD_AUTH",
             provider_account_id=provider_account_id,
@@ -631,6 +630,7 @@ async def inspect_flow_pricing_read_only(
             model_display_names=MODEL_DISPLAY_NAMES,
             expected_email=expected_email,
             headless=False,
+            profile_lease=lease,
         )
         return await inspect_with_port(
             port,

@@ -3,11 +3,13 @@ from __future__ import annotations
 import ast
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import gflow_cli.v2_runtime.flow_pricing_inspector as inspector
+from gflow_cli.auth.verification import FlowSessionOutcome
 from gflow_cli.v2_runtime.flow_pricing_inspector import (
     EXPECTED_EMAIL,
     EXPECTED_PROFILE_PATH,
@@ -442,3 +444,78 @@ def test_profile_lock_contention_stops_before_browser_open(
     )
     assert report["REASON_CODE"] == "PROFILE_IN_USE"
     assert report["INSPECTION_STATUS"] == "HOLD"
+
+
+def test_inspector_passes_held_profile_lease_into_auth_verification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class HeldLease:
+        def __init__(self, _: Path) -> None:
+            self.acquired = False
+            self.released = False
+
+        def try_acquire(self) -> bool:
+            self.acquired = True
+            return True
+
+        def release(self) -> None:
+            self.released = True
+
+    lease: HeldLease | None = None
+
+    class TrackedLease(HeldLease):
+        def __init__(self, path: Path) -> None:
+            nonlocal lease
+            super().__init__(path)
+            lease = self
+
+    original_is_dir = Path.is_dir
+
+    def profile_is_dir(path: Path) -> bool:
+        if path == EXPECTED_PROFILE_PATH.resolve(strict=False):
+            return True
+        return original_is_dir(path)
+
+    seen: dict[str, object] = {}
+
+    async def verify(
+        _profile: Path, *, source: str, profile_lease: object | None = None
+    ) -> SimpleNamespace:
+        seen["source"] = source
+        seen["lease"] = profile_lease
+        return SimpleNamespace(
+            outcome=FlowSessionOutcome.AUTHENTICATED,
+            user_email=EXPECTED_EMAIL,
+        )
+
+    monkeypatch.setattr(inspector.auth, "profile_dir", lambda _: EXPECTED_PROFILE_PATH)
+    monkeypatch.setattr(inspector, "ProfileLease", TrackedLease)
+    monkeypatch.setattr(Path, "is_dir", profile_is_dir)
+    monkeypatch.setattr("gflow_cli.v2_runtime.live_flow.verify_flow_profile", verify)
+    monkeypatch.setattr(
+        inspector,
+        "inspect_with_port",
+        lambda *_args, **_kwargs: _immediate_async_value({"INSPECTION_STATUS": "READY"}),
+    )
+
+    report = _run_immediate(
+        inspector.inspect_flow_pricing_read_only(
+            provider_account_id="PVA_0002",
+            expected_project_id=EXPECTED_PROJECT_ID,
+            expected_email=EXPECTED_EMAIL,
+            runtime_state_root=tmp_path,
+            software_commit="a" * 40,
+        )
+    )
+
+    assert report["INSPECTION_STATUS"] == "READY"
+    assert seen["source"] == "v2-agent-only"
+    assert seen["lease"] is lease
+    assert lease is not None and lease.acquired and lease.released
+
+
+def _immediate_async_value(value: object) -> Any:
+    async def _value() -> object:
+        return value
+
+    return _value()

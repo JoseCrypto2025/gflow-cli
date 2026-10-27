@@ -25,6 +25,25 @@ def test_owner_metadata_before_acquire_raises(tmp_path: Path) -> None:
         _ = lease.owner_metadata
 
 
+def test_assert_held_for_requires_active_lease_for_same_profile(tmp_path: Path) -> None:
+    profile = tmp_path / "profile"
+    lease = ProfileLease(profile)
+
+    with pytest.raises(RuntimeError, match="held for the requested profile"):
+        lease.assert_held_for(profile)
+
+    lease.acquire()
+    try:
+        lease.assert_held_for(profile)
+        with pytest.raises(RuntimeError, match="held for the requested profile"):
+            lease.assert_held_for(tmp_path / "other-profile")
+    finally:
+        lease.release()
+
+    with pytest.raises(RuntimeError, match="held for the requested profile"):
+        lease.assert_held_for(profile)
+
+
 def test_kernel_lock_rejects_second_opener_even_if_registry_is_bypassed(
     tmp_path: Path,
 ) -> None:

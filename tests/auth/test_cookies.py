@@ -7,6 +7,7 @@ import pytest
 
 from gflow_cli.auth import cookies as cookies_mod
 from gflow_cli.auth.cookies import _get_chrome_cookies3, _get_chrome_cookies_playwright
+from gflow_cli.profile_lease import ProfileLease
 
 
 def _make_profile_with_cookies(tmp_path: Path) -> Path:
@@ -159,3 +160,68 @@ async def test_playwright_cookie_read_wraps_launch_in_profile_lease(
 
     await _get_chrome_cookies_playwright(profile)
     assert events == ["acquire", "launch", "release"]
+
+
+@pytest.mark.asyncio
+async def test_playwright_cookie_read_reuses_borrowed_profile_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    lease = ProfileLease(profile).acquire()
+
+    mock_ctx = MagicMock()
+    mock_ctx.cookies = AsyncMock(return_value=[])
+    mock_ctx.close = AsyncMock()
+    mock_pw = MagicMock()
+    mock_pw.chromium.launch_persistent_context = AsyncMock(return_value=mock_ctx)
+    mock_cm = MagicMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_pw)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    monkeypatch.setattr(
+        "gflow_cli.auth.strategies.async_playwright", MagicMock(return_value=mock_cm)
+    )
+    monkeypatch.setattr(cookies_mod, "channel_for_profile", lambda _pd: "chrome")
+
+    def _unexpected_acquire(_self: ProfileLease) -> ProfileLease:
+        raise AssertionError("fallback must borrow the caller's held lease")
+
+    monkeypatch.setattr(ProfileLease, "acquire", _unexpected_acquire)
+    try:
+        await _get_chrome_cookies_playwright(profile, profile_lease=lease)
+    finally:
+        lease.release()
+
+    mock_pw.chromium.launch_persistent_context.assert_awaited_once()
+    mock_ctx.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_lease", [False, True])
+async def test_cookie_snapshot_rejects_unowned_borrowed_lease_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_lease: bool
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    other_profile = tmp_path / "other-profile"
+    other_profile.mkdir()
+    lease = ProfileLease(other_profile).acquire()
+    if release_lease:
+        lease.release()
+
+    monkeypatch.setattr(
+        cookies_mod,
+        "_get_chrome_cookies3",
+        lambda **_: pytest.fail("must validate the borrowed lease before cookie access"),
+    )
+    playwright = MagicMock()
+    monkeypatch.setattr("gflow_cli.auth.strategies.async_playwright", playwright)
+    try:
+        with pytest.raises(RuntimeError, match="held for the requested profile"):
+            await cookies_mod.get_chrome_cookie_snapshot(profile, profile_lease=lease)
+    finally:
+        if not release_lease:
+            lease.release()
+
+    playwright.assert_not_called()

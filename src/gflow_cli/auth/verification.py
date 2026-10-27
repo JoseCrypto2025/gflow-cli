@@ -235,6 +235,8 @@ async def _fetch_session_httpx(client: Any) -> tuple[int, str]:
 
 async def fetch_flow_session_httpx(
     profile_dir: Path,
+    *,
+    profile_lease: ProfileLease | None = None,
 ) -> tuple[int, str, bool]:
     """Read a profile's cookies and probe Flow's session endpoint with retries.
 
@@ -246,7 +248,10 @@ async def fetch_flow_session_httpx(
 
     import httpx
 
-    cookie_snapshot = await get_chrome_cookie_snapshot(profile_dir)
+    if profile_lease is None:
+        cookie_snapshot = await get_chrome_cookie_snapshot(profile_dir)
+    else:
+        cookie_snapshot = await get_chrome_cookie_snapshot(profile_dir, profile_lease=profile_lease)
     async with httpx.AsyncClient(
         cookies=cookie_snapshot.httpx_cookies,
         headers=_SESSION_HEADERS,
@@ -521,6 +526,7 @@ async def verify_flow_profile(
     profile_dir: Path,
     *,
     source: str = "chrome",
+    profile_lease: ProfileLease | None = None,
 ) -> FlowSessionStatus:
     """Probe `profile_dir` for a usable Flow app session via the fast httpx path.
 
@@ -531,13 +537,24 @@ async def verify_flow_profile(
 
     ai4u delta (2026-09-12): when the labs oracle yields GOOGLE_SESSION_ONLY,
     a migrated-host fallback probe runs (see _verify_migrated_host_fallback).
+
+    `profile_lease` may be supplied by a caller that holds the profile across
+    verification and browser inspection. The cookie fallback borrows that
+    lease; standalone callers continue to acquire their own.
     """
     _validate_profile_in_home(profile_dir)
+    if profile_lease is not None:
+        profile_lease.assert_held_for(profile_dir)
 
     status_code: int
     body: str
     try:
-        status_code, body, google_session = await fetch_flow_session_httpx(profile_dir)
+        if profile_lease is None:
+            status_code, body, google_session = await fetch_flow_session_httpx(profile_dir)
+        else:
+            status_code, body, google_session = await fetch_flow_session_httpx(
+                profile_dir, profile_lease=profile_lease
+            )
 
     # #796: the marker gate is local profile state, not a network fault. It was
     # flattened into VERIFICATION_ERROR, whose remediation says "check network
