@@ -32,7 +32,7 @@ from .phase_g_prod_legacy_reconciliation import find_legacy_prod_reconciliation_
 if TYPE_CHECKING:
     from .phase_g import D2DailyCreditLedger, PhaseGExecutionRequest
 
-_AUTHORIZATION_VERSION = "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V1"
+_AUTHORIZATION_VERSION = "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V2"
 _AUTHORIZATION_ID_RE = re.compile(r"^LRA_[0-9A-F]{24}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -50,12 +50,14 @@ class ReplacementGenerationConfig:
     model_id: str
     generation_profile_id: str
     generation_mode: str
-    duration_sec: float
-    aspect_ratio: str
-    resolution: str
-    audio_mode: str
+    pricing_variant: str
+    account_pricing_class: str
     output_count: int
-    quality_tier: str
+    duration_sec: float | None = None
+    aspect_ratio: str | None = None
+    resolution: str | None = None
+    audio_mode: str | None = None
+    quality_tier: str | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -66,17 +68,20 @@ class ReplacementGenerationConfig:
                 self.model_id,
                 self.generation_profile_id,
                 self.generation_mode,
-                self.aspect_ratio,
-                self.resolution,
-                self.audio_mode,
-                self.quality_tier,
+                self.pricing_variant,
+                self.account_pricing_class,
             )
         ):
             raise ValueError("replacement generation configuration is incomplete")
         if (
-            type(self.duration_sec) not in (int, float)
-            or not math.isfinite(self.duration_sec)
-            or self.duration_sec <= 0
+            (
+                self.duration_sec is not None
+                and (
+                    type(self.duration_sec) not in (int, float)
+                    or not math.isfinite(self.duration_sec)
+                    or self.duration_sec <= 0
+                )
+            )
             or type(self.output_count) is not int
             or self.output_count < 1
         ):
@@ -111,6 +116,8 @@ class LegacyReplacementAuthorizationRequest:
     parent_attempt_id: str
     production_job_id: str
     scene_job_id: str
+    replacement_production_job_id: str
+    replacement_scene_job_id: str
     policy_id: str
     reconciliation_audit_id: str
     decision: ReplacementDecision
@@ -128,6 +135,31 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def legacy_replacement_request_idempotency_key(
+    *,
+    parent_attempt_id: str,
+    policy_id: str,
+    reconciliation_audit_id: str,
+    decision_input_digest: str,
+) -> str:
+    """Return the stable V2 Production Job key bound to one approved decision."""
+    authorization_id = (
+        "LRA_"
+        + hashlib.sha256(
+            (
+                f"{parent_attempt_id}:{policy_id}:{reconciliation_audit_id}:{decision_input_digest}"
+            ).encode()
+        )
+        .hexdigest()[:24]
+        .upper()
+    )
+    if not _AUTHORIZATION_ID_RE.fullmatch(authorization_id) or not _SHA256_RE.fullmatch(
+        decision_input_digest
+    ):
+        raise ValueError("legacy replacement decision identity is invalid")
+    return f"LEGACY_REPLACEMENT_V2_{authorization_id}"
 
 
 def _decimal_value(value: object) -> Decimal | None:
@@ -149,11 +181,6 @@ def _timestamp(value: object) -> datetime | None:
 
 
 def _profile_matches(profile: Mapping[str, object], config: ReplacementGenerationConfig) -> bool:
-    try:
-        profile_duration = Decimal(str(profile.get("Default_Duration_Sec")))
-        profile_outputs = int(str(profile.get("Default_Output_Count")))
-    except (InvalidOperation, TypeError, ValueError):
-        return False
     return (
         profile.get("Generation_Profile_ID") == config.generation_profile_id
         and profile.get("Provider_Account_ID") == config.provider_account_id
@@ -161,34 +188,36 @@ def _profile_matches(profile: Mapping[str, object], config: ReplacementGeneratio
         and profile.get("Generation_Mode") == config.generation_mode
         and profile.get("Environment") == "PROD"
         and profile.get("Status") == "ACTIVE"
-        and profile_duration.is_finite()
-        and profile_duration == Decimal(str(config.duration_sec))
-        and profile.get("Default_Aspect_Ratio") == config.aspect_ratio
-        and profile.get("Default_Resolution") == config.resolution
-        and profile_outputs == config.output_count
-        and profile.get("Audio_Mode") == config.audio_mode
-        and profile.get("Quality_Tier") == config.quality_tier
+    )
+
+
+def _account_matches(account: Mapping[str, object], config: ReplacementGenerationConfig) -> bool:
+    return (
+        account.get("Provider_Account_ID") == config.provider_account_id
+        and account.get("Provider_ID") == config.provider_id
+        and account.get("Environment") == "PROD"
+        and account.get("Status") == "ACTIVE"
+    )
+
+
+def _model_matches(model: Mapping[str, object], config: ReplacementGenerationConfig) -> bool:
+    name = model.get("Model_Name")
+    normalized_name = re.sub(r"[^a-z0-9]+", "", name.casefold()) if isinstance(name, str) else ""
+    return (
+        model.get("Model_ID") == config.model_id
+        and model.get("Provider_ID") == config.provider_id
+        and model.get("Status") == "ACTIVE"
+        and normalized_name == "veo31lite"
     )
 
 
 def _row_matches(row: Mapping[str, object], config: ReplacementGenerationConfig) -> bool:
-    try:
-        duration = Decimal(str(row.get("Duration_Sec")))
-        output_count = int(str(row.get("Output_Count")))
-    except (InvalidOperation, ValueError):
-        return False
     return (
         row.get("Provider_ID") == config.provider_id
         and row.get("Provider_Account_ID") == config.provider_account_id
         and row.get("Model_ID") == config.model_id
-        and row.get("Generation_Profile_ID") == config.generation_profile_id
+        and row.get("Billing_Plan_Name") == config.account_pricing_class
         and row.get("Generation_Mode") == config.generation_mode
-        and row.get("Quality_Tier") == config.quality_tier
-        and row.get("Resolution") == config.resolution
-        and duration == Decimal(str(config.duration_sec))
-        and row.get("Aspect_Ratio") == config.aspect_ratio
-        and row.get("Audio_Mode") == config.audio_mode
-        and output_count == config.output_count
         and row.get("Cost_Unit") == "CREDIT"
         and row.get("Currency") in (None, "")
         and row.get("Status") == "ACTIVE"
@@ -225,27 +254,36 @@ def quote_generation_reservation(
     )
     snapshot_read_at = _timestamp(snapshot.read_at)
     if (
-        snapshot.spreadsheet_id != APPROVED_SPREADSHEET_ID
+        config.pricing_variant != "STANDARD_LITE"
+        or config.account_pricing_class != "NON_ULTRA"
+        or snapshot.spreadsheet_id != APPROVED_SPREADSHEET_ID
         or snapshot.source != SOURCE_LIVE_GOOGLE_SHEETS
         or snapshot_read_at is None
         or snapshot_read_at != when
     ):
         return unavailable
+    accounts = snapshot.tables.get("PROVIDER_ACCOUNT_MASTER", [])
+    account_matches = [row for row in accounts if _account_matches(row, config)]
+    account_identity_rows = [
+        row for row in accounts if row.get("Provider_Account_ID") == config.provider_account_id
+    ]
+    models = snapshot.tables.get("MODEL_MASTER", [])
+    model_matches = [row for row in models if _model_matches(row, config)]
+    model_identity_rows = [row for row in models if row.get("Model_ID") == config.model_id]
     profiles = snapshot.tables.get("GENERATION_PROFILE_MASTER", [])
     profile_matches = [row for row in profiles if _profile_matches(row, config)]
     profile_identity_rows = [
         row for row in profiles if row.get("Generation_Profile_ID") == config.generation_profile_id
     ]
-    if len(profile_matches) != 1 or len(profile_identity_rows) != 1:
+    if (
+        len(account_matches) != 1
+        or len(account_identity_rows) != 1
+        or len(model_matches) != 1
+        or len(model_identity_rows) != 1
+        or len(profile_matches) != 1
+        or len(profile_identity_rows) != 1
+    ):
         return unavailable
-    input_digest = _digest(
-        {
-            "config": asdict(config),
-            "spreadsheet_id": snapshot.spreadsheet_id,
-            "snapshot_read_at": snapshot.read_at,
-            "profile": dict(profile_matches[0]),
-        }
-    )
     cost_rows = snapshot.tables.get("PROVIDER_COST_MASTER", [])
     matching: list[Mapping[str, object]] = []
     for row in cost_rows:
@@ -260,7 +298,8 @@ def quote_generation_reservation(
         if (
             parsed_source is None
             or parsed_source.scheme != "https"
-            or not parsed_source.netloc
+            or parsed_source.hostname != "support.google.com"
+            or parsed_source.path != "/flow/answer/16526234"
             or verified_at is None
             or verified_at > when
             or start is None
@@ -274,20 +313,31 @@ def quote_generation_reservation(
         return unavailable
     row = matching[0]
     try:
-        amount = Decimal(str(row.get("Cost_Rate")))
+        per_generation_rate = Decimal(str(row.get("Cost_Rate")))
     except (InvalidOperation, ValueError):
         return unavailable
-    if not amount.is_finite() or amount <= 0:
+    if not per_generation_rate.is_finite() or per_generation_rate <= 0:
         return unavailable
+    amount = per_generation_rate * config.output_count
     cost_id = row.get("Provider_Cost_ID")
     if not isinstance(cost_id, str) or not cost_id.strip():
         return unavailable
+    input_digest = _digest(
+        {
+            "config": asdict(config),
+            "spreadsheet_id": snapshot.spreadsheet_id,
+            "account": dict(account_matches[0]),
+            "model": dict(model_matches[0]),
+            "profile": dict(profile_matches[0]),
+            "cost_row": dict(row),
+        }
+    )
     return ReplacementQuote(
         ReplacementQuoteStatus.VALID,
         amount,
         "CREDIT",
         cast(str, row["Source"]),
-        f"{cost_id}:{row['Verified_At']}:{snapshot.read_at}:"
+        f"{cost_id}:{row['Verified_At']}:"
         f"{_digest({'spreadsheet_id': snapshot.spreadsheet_id, 'row': dict(row)})}",
         input_digest,
         when.isoformat(),
@@ -488,6 +538,10 @@ def create_legacy_replacement_authorization(
         not re.fullmatch(r"D2_[A-Za-z0-9_-]{8,64}", request.parent_attempt_id)
         or not re.fullmatch(r"PRD_[0-9]{6}", request.production_job_id)
         or not re.fullmatch(r"SJB_[0-9]{6}", request.scene_job_id)
+        or not re.fullmatch(r"PRD_[0-9]{6}", request.replacement_production_job_id)
+        or not re.fullmatch(r"SJB_[0-9]{6}", request.replacement_scene_job_id)
+        or request.production_job_id == request.replacement_production_job_id
+        or request.scene_job_id == request.replacement_scene_job_id
         or request.policy_id != ambiguous_legacy_policy_id(request.parent_attempt_id)
         or not _SHA256_RE.fullmatch(request.reconciliation_audit_id)
         or not _SHA256_RE.fullmatch(quote.input_digest)
@@ -519,6 +573,14 @@ def create_legacy_replacement_authorization(
         "parent_attempt_id": request.parent_attempt_id,
         "production_job_id": request.production_job_id,
         "scene_job_id": request.scene_job_id,
+        "replacement_production_job_id": request.replacement_production_job_id,
+        "replacement_scene_job_id": request.replacement_scene_job_id,
+        "replacement_request_idempotency_key": legacy_replacement_request_idempotency_key(
+            parent_attempt_id=request.parent_attempt_id,
+            policy_id=request.policy_id,
+            reconciliation_audit_id=request.reconciliation_audit_id,
+            decision_input_digest=decision.input_digest,
+        ),
         "policy_id": request.policy_id,
         "reconciliation_audit_id": request.reconciliation_audit_id,
         "decision_input_digest": decision.input_digest,
@@ -551,7 +613,7 @@ def consume_legacy_replacement_authorization(
     parent_quarantined: bool,
     current_quote: ReplacementQuote,
 ) -> dict[str, object]:
-    """Atomically consume an exact authorization with one parent-linked PREPARED D2 row."""
+    """Consume an exact V2 authorization with one job-bound PREPARED D2 row."""
     if not parent_quarantined:
         raise PhaseGError(
             "PHASE_G_LEGACY_REPLACEMENT_PARENT_INVALID",
@@ -569,6 +631,24 @@ def consume_legacy_replacement_authorization(
         raise PhaseGError(
             "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
             "legacy replacement exposure is invalid",
+        )
+    context = request.execution_context
+    if (
+        context is None
+        or context.legacy_replacement_authorization_id != authorization_id
+        or context.legacy_replacement_parent_attempt_id != authorization.get("parent_attempt_id")
+        or context.production_job_id != authorization.get("replacement_production_job_id")
+        or context.scene_job_id != authorization.get("replacement_scene_job_id")
+        or context.legacy_replacement_quote_credits
+        != _decimal_value(authorization.get("replacement_quote"))
+        or context.legacy_replacement_quote_input_digest
+        != authorization.get("replacement_quote_input_digest")
+        or context.legacy_replacement_quote_source_version
+        != authorization.get("replacement_quote_source_version")
+    ):
+        raise PhaseGError(
+            "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+            "replacement request does not bind the exact V2 child jobs and quote",
         )
     _validate_authorization_audits(
         ledger,

@@ -36,12 +36,18 @@ from gflow_cli.v2_runtime.phase_g import (
     D2DailyCreditLedger,
     D2RetryAuthorization,
     FlowSubmissionBaseline,
+    GoogleFlowAgentOnlyGenerationExecutor,
     PhaseGError,
     PhaseGExecutionRequest,
 )
 from gflow_cli.v2_runtime.phase_g_prod_legacy_reconciliation import (
     LEGACY_PROD_CONTRACT_VERSION,
     write_legacy_prod_reconciliation_audit,
+)
+from gflow_cli.v2_runtime.production_execution import (
+    CreditBudgetContext,
+    ProductionCreditGuard,
+    ProductionExecutionContext,
 )
 from tests.validation.test_phase_g import request_for
 
@@ -80,12 +86,14 @@ def _config(**updates: object) -> ReplacementGenerationConfig:
         "model_id": "MDL_0001",
         "generation_profile_id": "GPR_0001",
         "generation_mode": "TEXT_TO_VIDEO",
+        "pricing_variant": "STANDARD_LITE",
+        "account_pricing_class": "NON_ULTRA",
         "duration_sec": 8,
         "aspect_ratio": "9:16",
-        "resolution": "720p",
-        "audio_mode": "GENERATED",
+        "resolution": None,
+        "audio_mode": None,
         "output_count": 1,
-        "quality_tier": "STANDARD",
+        "quality_tier": None,
     }
     values.update(updates)
     return ReplacementGenerationConfig(**values)  # type: ignore[arg-type]
@@ -108,36 +116,69 @@ def _profile() -> dict[str, object]:
     }
 
 
+def _profile_for_account(
+    profile_id: str, account_id: str, *, aspect_ratio: str = "9:16"
+) -> dict[str, object]:
+    row = _profile()
+    row.update(
+        Generation_Profile_ID=profile_id,
+        Provider_Account_ID=account_id,
+        Default_Aspect_Ratio=aspect_ratio,
+    )
+    return row
+
+
+def _account(account_id: str) -> dict[str, object]:
+    return {
+        "Provider_Account_ID": account_id,
+        "Provider_ID": "PRV_0001",
+        "Environment": "PROD",
+        "Provider_Project_ID": "aafe9282-071f-4333-baa4-92b9f76a9c27",
+        "Status": "ACTIVE",
+    }
+
+
+def _model() -> dict[str, object]:
+    return {
+        "Model_ID": "MDL_0001",
+        "Provider_ID": "PRV_0001",
+        "Model_Name": "Veo 3.1 Lite",
+        "Status": "ACTIVE",
+    }
+
+
 def _cost_row(**updates: object) -> dict[str, object]:
     row: dict[str, object] = {
         "Provider_Cost_ID": "PCT_000001",
         "Provider_ID": "PRV_0001",
         "Provider_Account_ID": "PVA_0001",
         "Model_ID": "MDL_0001",
-        "Generation_Profile_ID": "GPR_0001",
-        "Duration_Sec": "8",
-        "Aspect_Ratio": "9:16",
-        "Audio_Mode": "GENERATED",
-        "Output_Count": "1",
+        "Billing_Plan_Name": "NON_ULTRA",
         "Generation_Mode": "TEXT_TO_VIDEO",
-        "Quality_Tier": "STANDARD",
-        "Resolution": "720p",
+        "Quality_Tier": "",
+        "Resolution": "",
         "Cost_Unit": "CREDIT",
-        "Cost_Rate": "17",
+        "Cost_Rate": "10",
         "Currency": "",
         "Effective_From": "2026-01-01T00:00:00Z",
         "Effective_To": "",
-        "Source": "https://pricing.example.test/provider",
+        "Source": "https://support.google.com/flow/answer/16526234?hl=en",
         "Verified_At": "2026-01-01T00:00:00Z",
         "Status": "ACTIVE",
+        "Created_At": "2026-01-01T00:00:00Z",
+        "Updated_At": "2026-01-01T00:00:00Z",
     }
     row.update(updates)
     return row
 
 
-def _quote(rows: list[dict[str, object]] | None = None):
+def _quote(
+    rows: list[dict[str, object]] | None = None,
+    *,
+    config: ReplacementGenerationConfig | None = None,
+):
     return quote_generation_reservation(
-        _config(),
+        config or _config(),
         snapshot=_snapshot(cost_rows=rows or []),
         quoted_at=_OBSERVED_AT,
     )
@@ -155,7 +196,12 @@ def _snapshot(
         read_at="2026-10-26T00:00:00Z",
         source=source,
         tables={
-            "GENERATION_PROFILE_MASTER": [profile or _profile()],
+            "PROVIDER_ACCOUNT_MASTER": [_account("PVA_0001"), _account("PVA_0002")],
+            "MODEL_MASTER": [_model()],
+            "GENERATION_PROFILE_MASTER": [
+                profile or _profile(),
+                _profile_for_account("GPR_0002", "PVA_0002"),
+            ],
             "PROVIDER_COST_MASTER": cost_rows or [],
         },
     )
@@ -212,6 +258,8 @@ def _authorization_request(quote, **updates: object) -> LegacyReplacementAuthori
         "parent_attempt_id": _PARENT,
         "production_job_id": _PRODUCTION,
         "scene_job_id": _SCENE_JOB,
+        "replacement_production_job_id": "PRD_000002",
+        "replacement_scene_job_id": "SJB_000002",
         "policy_id": _POLICY,
         "reconciliation_audit_id": _RECONCILIATION,
         "decision": evaluate_replacement_decision(
@@ -244,18 +292,49 @@ def _approved_ledger(tmp_path: Path) -> tuple[D2DailyCreditLedger, dict[str, obj
 
 
 def _replacement_request(
-    tmp_path: Path, parent: PhaseGExecutionRequest, run_id: str = "D2_test-replacement-0001"
+    tmp_path: Path,
+    parent: PhaseGExecutionRequest,
+    run_id: str = "D2_test-replacement-0001",
+    *,
+    authorization: dict[str, object] | None = None,
 ) -> PhaseGExecutionRequest:
-    return PhaseGExecutionRequest.from_presubmit(parent.presubmit_request, run_id)
+    context = None
+    if authorization is not None:
+        context = ProductionExecutionContext(
+            environment="PROD",
+            provider_id=parent.provider_id,
+            provider_account_id=parent.provider_account_id,
+            provider_project_id=parent.provider_project_id,
+            auth_profile="GFLOW_PROD_AUTH",
+            scene_id=parent.scene_id,
+            generation_profile_id=parent.generation_profile_id,
+            scene_prompt_id=parent.scene_prompt_id,
+            attempt_id=run_id,
+            credit_budget_context=CreditBudgetContext(provider_remaining_free=Decimal("50")),
+            production_job_id=str(authorization["replacement_production_job_id"]),
+            scene_job_id=str(authorization["replacement_scene_job_id"]),
+            legacy_replacement_authorization_id=str(authorization["authorization_id"]),
+            legacy_replacement_parent_attempt_id=str(authorization["parent_attempt_id"]),
+            legacy_replacement_quote_credits=Decimal(str(authorization["replacement_quote"])),
+            legacy_replacement_quote_input_digest=str(
+                authorization["replacement_quote_input_digest"]
+            ),
+            legacy_replacement_quote_source_version=str(
+                authorization["replacement_quote_source_version"]
+            ),
+        )
+    return PhaseGExecutionRequest.from_presubmit(
+        parent.presubmit_request, run_id, execution_context=context
+    )
 
 
-def test_valid_source_verified_direct_credit_cost_returns_quote() -> None:
+def test_valid_source_verified_standard_lite_cost_returns_quote() -> None:
     quote = _quote([_cost_row()])
 
     assert quote.status is ReplacementQuoteStatus.VALID
-    assert quote.amount == Decimal("17")
+    assert quote.amount == Decimal("10")
     assert quote.unit == "CREDIT"
-    assert quote.source == "https://pricing.example.test/provider"
+    assert quote.source == "https://support.google.com/flow/answer/16526234?hl=en"
     assert quote.source_version
     assert quote.input_digest
     assert quote.quoted_at == _OBSERVED_AT.isoformat()
@@ -284,6 +363,7 @@ def test_historical_accounted_cost_is_not_an_input_to_quote() -> None:
         {"Model_ID": "MDL_9999"},
         {"Provider_Account_ID": "PVA_9999"},
         {"Generation_Mode": "IMAGE_TO_VIDEO"},
+        {"Billing_Plan_Name": "ULTRA"},
         {"Status": "HOLD"},
         {"Cost_Unit": "USD"},
         {"Verified_At": ""},
@@ -326,9 +406,9 @@ def test_quote_requires_canonical_live_snapshot_and_exact_profile(snapshot) -> N
     assert quote.status is ReplacementQuoteStatus.QUOTE_UNAVAILABLE
 
 
-def test_incomplete_new_quote_scope_is_unavailable() -> None:
+def test_missing_account_pricing_class_is_unavailable() -> None:
     row = _cost_row()
-    row.pop("Duration_Sec")
+    row.pop("Billing_Plan_Name")
 
     quote = _quote([row])
 
@@ -359,8 +439,105 @@ def test_expired_and_future_cost_rows_are_unavailable() -> None:
 
 
 @pytest.mark.parametrize("updates", [{"Resolution": "1080p"}, {"Quality_Tier": "HIGH"}])
-def test_wrong_cost_dimensions_are_unavailable(updates: dict[str, object]) -> None:
-    assert _quote([_cost_row(**updates)]).status is ReplacementQuoteStatus.QUOTE_UNAVAILABLE
+def test_non_pricing_cost_dimensions_do_not_change_rate_match(updates: dict[str, object]) -> None:
+    quote = _quote([_cost_row(**updates)])
+
+    assert quote.status is ReplacementQuoteStatus.VALID
+    assert quote.amount == Decimal("10")
+
+
+def test_standard_lite_non_ultra_quote_uses_live_account_and_eighteen_columns() -> None:
+    config = _config(provider_account_id="PVA_0002", generation_profile_id="GPR_0002")
+    row = _cost_row(Provider_Account_ID="PVA_0002")
+
+    quote = _quote([row], config=config)
+
+    assert len(row) == 18
+    assert quote.status is ReplacementQuoteStatus.VALID
+    assert quote.amount == Decimal("10")
+
+
+def test_output_count_multiplies_the_per_generation_rate() -> None:
+    config = _config(output_count=3)
+
+    quote = _quote([_cost_row()], config=config)
+
+    assert quote.status is ReplacementQuoteStatus.VALID
+    assert quote.amount == Decimal("30")
+
+
+def test_non_pricing_runtime_dimensions_do_not_create_false_mismatch() -> None:
+    config = _config(
+        duration_sec=8,
+        aspect_ratio="9:16",
+        resolution=None,
+        audio_mode=None,
+        quality_tier=None,
+    )
+    profile = _profile()
+    profile["Default_Aspect_Ratio"] = "16:9"
+    snapshot = _snapshot(profile=profile, cost_rows=[_cost_row()])
+
+    quote = quote_generation_reservation(config, snapshot=snapshot, quoted_at=_OBSERVED_AT)
+
+    assert quote.status is ReplacementQuoteStatus.VALID
+    assert quote.amount == Decimal("10")
+
+
+@pytest.mark.parametrize(
+    "config_updates",
+    [
+        {"provider_id": "PRV_9999"},
+        {"provider_account_id": "PVA_9999"},
+        {"model_id": "MDL_9999"},
+        {"generation_mode": "IMAGE_TO_VIDEO"},
+        {"account_pricing_class": "ULTRA"},
+        {"pricing_variant": "LOWER_PRIORITY_LITE"},
+    ],
+)
+def test_wrong_pricing_identity_is_rejected(config_updates: dict[str, object]) -> None:
+    assert _quote([_cost_row()], config=_config(**config_updates)).status is (
+        ReplacementQuoteStatus.QUOTE_UNAVAILABLE
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://pricing.example.test/veo-lite",
+        "https://support.google.com.evil.test/flow/answer/16526234",
+        "http://support.google.com/flow/answer/16526234",
+    ],
+)
+def test_non_official_pricing_source_is_rejected(source: str) -> None:
+    assert _quote([_cost_row(Source=source)]).status is ReplacementQuoteStatus.QUOTE_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "table,row_updates",
+    [
+        ("PROVIDER_ACCOUNT_MASTER", {"Provider_ID": "PRV_9999"}),
+        ("PROVIDER_ACCOUNT_MASTER", {"Status": "HOLD"}),
+        ("MODEL_MASTER", {"Model_Name": "Veo 3.1 - Lite (Lower Priority)"}),
+        ("MODEL_MASTER", {"Status": "HOLD"}),
+    ],
+)
+def test_quote_requires_unique_active_account_and_standard_lite_model(
+    table: str, row_updates: dict[str, object]
+) -> None:
+    snapshot = _snapshot(cost_rows=[_cost_row()])
+    tables = {name: list(rows) for name, rows in snapshot.tables.items()}
+    target_id = "PVA_0001" if table == "PROVIDER_ACCOUNT_MASTER" else "MDL_0001"
+    identity_key = "Provider_Account_ID" if table == "PROVIDER_ACCOUNT_MASTER" else "Model_ID"
+    rows = tables[table]
+    index = next(i for i, row in enumerate(rows) if row.get(identity_key) == target_id)
+    rows[index] = {**rows[index], **row_updates}
+    invalid = GoogleSheetsSnapshot(
+        snapshot.spreadsheet_id, snapshot.read_at, snapshot.source, tables
+    )
+
+    result = quote_generation_reservation(_config(), snapshot=invalid, quoted_at=_OBSERVED_AT)
+    assert result.status is ReplacementQuoteStatus.QUOTE_UNAVAILABLE
 
 
 def test_quote_does_not_create_an_attempt_reservation_or_generate_action(tmp_path: Path) -> None:
@@ -407,7 +584,7 @@ def test_valid_quote_calculates_combined_exposure_without_authorizing() -> None:
     )
 
     assert decision.status == "APPROVE"
-    assert decision.maximum_combined_exposure == Decimal("67")
+    assert decision.maximum_combined_exposure == Decimal("60")
     assert decision.authorization_created is False
 
 
@@ -508,8 +685,8 @@ def test_authorization_captures_bounded_exposure_and_decision_digest(tmp_path: P
     record = create_legacy_replacement_authorization(ledger, request)
 
     assert record["legacy_exposure"] == "50"
-    assert record["replacement_quote"] == "17"
-    assert record["maximum_combined_exposure"] == "67"
+    assert record["replacement_quote"] == "10"
+    assert record["maximum_combined_exposure"] == "60"
     assert record["decision_input_digest"]
     assert record["reconciliation_audit_id"] == _RECONCILIATION
 
@@ -612,7 +789,7 @@ def test_consumption_links_exactly_one_replacement_and_never_authorizes_generate
     quote = state["quote"]
     authorization = state["authorization"]
     assert isinstance(parent, PhaseGExecutionRequest)
-    replacement = _replacement_request(tmp_path, parent)
+    replacement = _replacement_request(tmp_path, parent, authorization=authorization)
 
     created = consume_legacy_replacement_authorization(
         ledger,
@@ -633,13 +810,77 @@ def test_consumption_links_exactly_one_replacement_and_never_authorizes_generate
     assert saved_auth["authorization_status"] == "CONSUMED"
     assert saved_auth["replacement_created"] is True
     assert saved_auth["replacement_attempt_id"] == replacement.d2_run_id
+    assert ledger.validate_consumed_legacy_replacement(replacement) == created
+
+
+def test_consumption_requires_exact_child_job_pair_and_replacement_capability(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    ledger, state = _approved_ledger(tmp_path)
+    parent, quote, authorization = state["parent"], state["quote"], state["authorization"]
+    assert isinstance(parent, PhaseGExecutionRequest)
+    auth_id = str(authorization["authorization_id"])
+    ordinary_request = _replacement_request(tmp_path, parent)
+    with pytest.raises(PhaseGError, match="V2"):
+        consume_legacy_replacement_authorization(
+            ledger,
+            auth_id,
+            ordinary_request,
+            parent_quarantined=True,
+            current_quote=quote,
+        )
+
+    bound_request = _replacement_request(tmp_path, parent, authorization=authorization)
+    assert bound_request.execution_context is not None
+    wrong_context = replace(bound_request.execution_context, scene_job_id="SJB_000003")
+    wrong_request = replace(bound_request, execution_context=wrong_context)
+    with pytest.raises(PhaseGError):
+        consume_legacy_replacement_authorization(
+            ledger,
+            auth_id,
+            wrong_request,
+            parent_quarantined=True,
+            current_quote=quote,
+        )
+    assert len(ledger.attempts()) == 1
+
+
+def test_phase_g_checks_consumed_capability_before_any_ui_mutation(tmp_path: Path) -> None:
+    ledger, state = _approved_ledger(tmp_path)
+    parent, authorization = state["parent"], state["authorization"]
+    assert isinstance(parent, PhaseGExecutionRequest)
+    request = _replacement_request(tmp_path, parent, authorization=authorization)
+
+    class PortSpy:
+        bind_called = False
+
+        async def bind_request(self, _request: PhaseGExecutionRequest) -> None:
+            self.bind_called = True
+
+    port = PortSpy()
+    executor = GoogleFlowAgentOnlyGenerationExecutor(
+        port,  # type: ignore[arg-type]
+        ledger,
+        object(),  # type: ignore[arg-type]
+        production_credit_guard=ProductionCreditGuard(tmp_path / "runtime"),
+    )
+    pending = executor.execute(request)
+    try:
+        with pytest.raises(PhaseGError, match="not unique"):
+            pending.send(None)
+    finally:
+        pending.close()
+
+    assert port.bind_called is False
 
 
 def test_consumption_replay_with_same_id_is_idempotent(tmp_path: Path) -> None:
     ledger, state = _approved_ledger(tmp_path)
     parent, quote, authorization = state["parent"], state["quote"], state["authorization"]
     assert isinstance(parent, PhaseGExecutionRequest)
-    replacement = _replacement_request(tmp_path, parent)
+    replacement = _replacement_request(tmp_path, parent, authorization=authorization)
     auth_id = str(authorization["authorization_id"])
 
     first = consume_legacy_replacement_authorization(
@@ -657,7 +898,7 @@ def test_consumption_replay_rejects_tampered_consumption_audit(tmp_path: Path) -
     ledger, state = _approved_ledger(tmp_path)
     parent, quote, authorization = state["parent"], state["quote"], state["authorization"]
     assert isinstance(parent, PhaseGExecutionRequest)
-    replacement = _replacement_request(tmp_path, parent)
+    replacement = _replacement_request(tmp_path, parent, authorization=authorization)
     auth_id = str(authorization["authorization_id"])
     consume_legacy_replacement_authorization(
         ledger, auth_id, replacement, parent_quarantined=True, current_quote=quote
@@ -679,7 +920,7 @@ def test_concurrent_consumption_creates_only_one_linked_replacement(tmp_path: Pa
     ledger, state = _approved_ledger(tmp_path)
     parent, quote, authorization = state["parent"], state["quote"], state["authorization"]
     assert isinstance(parent, PhaseGExecutionRequest)
-    request = _replacement_request(tmp_path, parent)
+    request = _replacement_request(tmp_path, parent, authorization=authorization)
     auth_id = str(authorization["authorization_id"])
     barrier = Barrier(2)
 
@@ -708,7 +949,7 @@ def test_consumption_rejects_second_or_different_replacement_id(tmp_path: Path) 
     consume_legacy_replacement_authorization(
         ledger,
         auth_id,
-        _replacement_request(tmp_path, parent),
+        _replacement_request(tmp_path, parent, authorization=authorization),
         parent_quarantined=True,
         current_quote=quote,
     )
@@ -717,7 +958,12 @@ def test_consumption_rejects_second_or_different_replacement_id(tmp_path: Path) 
         consume_legacy_replacement_authorization(
             ledger,
             auth_id,
-            _replacement_request(tmp_path, parent, "D2_test-replacement-0002"),
+            _replacement_request(
+                tmp_path,
+                parent,
+                "D2_test-replacement-0002",
+                authorization=authorization,
+            ),
             parent_quarantined=True,
             current_quote=quote,
         )
@@ -728,7 +974,7 @@ def test_consumption_requires_quarantined_parent_and_unchanged_quote(tmp_path: P
     ledger, state = _approved_ledger(tmp_path)
     parent, quote, authorization = state["parent"], state["quote"], state["authorization"]
     assert isinstance(parent, PhaseGExecutionRequest)
-    replacement = _replacement_request(tmp_path, parent)
+    replacement = _replacement_request(tmp_path, parent, authorization=authorization)
     auth_id = str(authorization["authorization_id"])
 
     with pytest.raises(PhaseGError):
@@ -754,7 +1000,7 @@ def test_consumption_revalidates_durable_policy_and_reconciliation_audits(
         consume_legacy_replacement_authorization(
             ledger,
             str(authorization["authorization_id"]),
-            _replacement_request(tmp_path, parent),
+            _replacement_request(tmp_path, parent, authorization=authorization),
             parent_quarantined=True,
             current_quote=quote,
         )
@@ -775,7 +1021,7 @@ def test_consumption_rejects_changed_parent_reservation(tmp_path: Path) -> None:
         consume_legacy_replacement_authorization(
             ledger,
             str(authorization["authorization_id"]),
-            _replacement_request(tmp_path, parent),
+            _replacement_request(tmp_path, parent, authorization=authorization),
             parent_quarantined=True,
             current_quote=quote,
         )
@@ -788,7 +1034,10 @@ def test_consumption_rejects_replacement_with_wrong_parent_configuration(tmp_pat
     ledger, state = _approved_ledger(tmp_path)
     parent, quote, authorization = state["parent"], state["quote"], state["authorization"]
     assert isinstance(parent, PhaseGExecutionRequest)
-    wrong = replace(_replacement_request(tmp_path, parent), provider_account_id="PVA_9999")
+    wrong = replace(
+        _replacement_request(tmp_path, parent, authorization=authorization),
+        provider_account_id="PVA_9999",
+    )
 
     with pytest.raises(PhaseGError):
         consume_legacy_replacement_authorization(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -31,6 +32,135 @@ def _context(
         production_job_id="PRD_000001" if environment == "PROD" else None,
         scene_job_id="SJB_000001" if environment == "PROD" else None,
     )
+
+
+def _replacement_context() -> ProductionExecutionContext:
+    return replace(
+        _context("PROD", "D2_replacement-0001"),
+        legacy_replacement_authorization_id="LRA_" + "A" * 24,
+        legacy_replacement_parent_attempt_id="D2_parent-00000001",
+        legacy_replacement_quote_credits=Decimal("10"),
+        legacy_replacement_quote_input_digest="a" * 64,
+        legacy_replacement_quote_source_version="PCT_000001:verified:snapshot:sha256",
+    )
+
+
+def test_replacement_quote_is_reserved_before_generate_and_exactly_once(tmp_path: Path) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    fixed = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+    context = _replacement_context()
+    guard.prepare(context, now=fixed)
+
+    amount = guard.reserve_replacement_quote_before_submit(
+        context,
+        quoted_credits=Decimal("10"),
+        budget=context.credit_budget_context,
+        now=fixed,
+    )
+    replay = guard.reserve_replacement_quote_before_submit(
+        context,
+        quoted_credits=Decimal("10"),
+        budget=context.credit_budget_context,
+        now=fixed,
+    )
+    row = guard._read()["attempts"][0]  # noqa: SLF001 - inspect persisted pre-click state
+
+    assert amount == replay == Decimal("10")
+    assert row["state"] == "PRE_GENERATE_RESERVED"
+    assert row["quoted_credits"] == row["reserved_credits"] == "10"
+    assert row["generate_click_count"] == 0
+    assert row["legacy_replacement_authorization_id"] == context.legacy_replacement_authorization_id
+
+    guard.record_replacement_generate_click(
+        context.attempt_id,
+        authorization_id=str(context.legacy_replacement_authorization_id),
+    )
+    with pytest.raises(ProductionExecutionError, match="single Generate"):
+        guard.record_replacement_generate_click(
+            context.attempt_id,
+            authorization_id=str(context.legacy_replacement_authorization_id),
+        )
+
+
+def test_replacement_confirmation_must_match_pre_reserved_quote(tmp_path: Path) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    fixed = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+    context = _replacement_context()
+    guard.prepare(context, now=fixed)
+    guard.reserve_replacement_quote_before_submit(
+        context,
+        quoted_credits=10,
+        budget=context.credit_budget_context,
+        now=fixed,
+    )
+    guard.record_replacement_generate_click(
+        context.attempt_id,
+        authorization_id=str(context.legacy_replacement_authorization_id),
+    )
+
+    assert guard.verify_replacement_confirmation(context, video_count=1, quoted_credits=10) == 10
+    with pytest.raises(ProductionExecutionError, match="differs"):
+        guard.verify_replacement_confirmation(context, video_count=1, quoted_credits=11)
+    with pytest.raises(ProductionExecutionError, match="differs"):
+        guard.verify_replacement_confirmation(context, video_count=2, quoted_credits=10)
+
+    guard.resolve(context.attempt_id, "UNKNOWN_SUBMISSION_STATE")
+    row = guard._read()["attempts"][0]  # noqa: SLF001 - unknown retains exact quote exposure
+    assert row["state"] == "UNKNOWN_SUBMISSION_STATE"
+    assert row["reserved_credits"] == "10"
+
+
+def test_replacement_reservation_rejects_mismatch_day_conflict_and_release_after_click(
+    tmp_path: Path,
+) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    fixed = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+    context = _replacement_context()
+    guard.prepare(context, now=fixed)
+    with pytest.raises(ProductionExecutionError, match="exact credit capability"):
+        guard.reserve_replacement_quote_before_submit(
+            context,
+            quoted_credits=11,
+            budget=context.credit_budget_context,
+            now=fixed,
+        )
+    guard.reserve_replacement_quote_before_submit(
+        context,
+        quoted_credits=10,
+        budget=context.credit_budget_context,
+        now=fixed,
+    )
+    with pytest.raises(ProductionExecutionError, match="single Generate"):
+        guard.record_generate_click(context.attempt_id)
+    guard.record_replacement_generate_click(
+        context.attempt_id,
+        authorization_id=str(context.legacy_replacement_authorization_id),
+    )
+    with pytest.raises(ProductionExecutionError, match="pre-Generate"):
+        guard.release_replacement_before_submit(context)
+
+    conflicting = replace(_context("PROD", "D2_replacement-0002"))
+    with pytest.raises(ProductionExecutionError, match="unresolved"):
+        guard.prepare(conflicting, now=fixed)
+
+
+def test_pre_generate_replacement_release_requires_zero_clicks(tmp_path: Path) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    fixed = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+    context = _replacement_context()
+    guard.prepare(context, now=fixed)
+    guard.reserve_replacement_quote_before_submit(
+        context,
+        quoted_credits=10,
+        budget=context.credit_budget_context,
+        now=fixed,
+    )
+
+    guard.release_replacement_before_submit(context)
+    row = guard._read()["attempts"][0]  # noqa: SLF001 - validate safe zero-click release
+    assert row["state"] == "FAILED_CONFIRMED"
+    assert row["reserved_credits"] == "0"
+    assert row["generate_click_count"] == 0
 
 
 def test_execution_context_requires_exact_resolved_identity() -> None:

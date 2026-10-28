@@ -5,8 +5,8 @@
 `scripts/operations/deploy_v2_runtime.py` is the application deployment
 operator. It defaults to a read-only preflight and requires an exact clean
 `automation-v2` commit. It packages only `src/`, `schemas/`, the production F5
-operator, the legacy reconciliation and ambiguous-policy operators, the read-only Flow
-pricing inspector, the runtime doctor, `pyproject.toml`, and `uv.lock` from Git; it never
+operator, the legacy reconciliation, ambiguous-policy, and one-shot replacement operators,
+the read-only Flow pricing inspector, the runtime doctor, `pyproject.toml`, and `uv.lock` from Git; it never
 copies `.git`, tests, docs, ignored files, credentials, or a source virtualenv.
 The allowlisted `validate_v2_data_architecture.py` is included because the
 live Google Sheets snapshot source imports it for full schema and semantic
@@ -186,6 +186,41 @@ F5 report verified the PROD account/project, Agent-only surface, prepared model,
 9:16 aspect, one output, exact provider UI prompt digest, enabled Generate
 control without clicking it, and a `CLEAN` recovery journal. It recorded
 `generate_clicked=false` and `credits_used=0`.
+
+The internal `run_legacy_replacement.py` operator is also included in the
+deployment allowlist. Quote mode is read-only. Execute mode requires the exact
+quarantined parent, one official Standard Veo 3.1 Lite NON_ULTRA quote, a
+fresh formal decision, and a parent-linked V2 authorization. It reserves the
+exact quote before Phase G, permits one Generate click and at most one exact
+confirmation approval, then stops after same-attempt reconciliation and local
+output validation. For non-subscribers it holds fresh Generate execution during
+Google's published 14:00–17:00 UTC availability window; an already-clicked
+attempt may still be reconciled during that window. It never enters D7.
+
+Run it from the deployed application source path with the existing V2 roots,
+Google Workspace credential, and `gflow-prod` profile. Omit `--execute` for a
+quote-only read. Add `--execute` only for the exact approved one-shot lifecycle;
+the operator itself holds new Generate actions during the published peak window.
+
+```sh
+cd /opt/gflow-v2
+GFLOW_CLI_HOME=/var/lib/gflow/browser-state \
+PYTHONPATH=/opt/gflow-v2/src:/opt/gflow-v2 \
+RUNTIME_ENV=production STORAGE_PROVIDER=google-drive \
+RUNTIME_STATE_ROOT=/var/lib/gflow TEMP_ROOT=/var/tmp/gflow LOG_ROOT=/var/log/gflow \
+GFLOW_GOOGLE_WORKSPACE_CREDENTIALS=/etc/gflow-v2/google-authorized-user.json \
+PYTHONUTF8=1 xvfb-run -a python scripts/operations/run_legacy_replacement.py \
+  --scene-id SCN_000001 \
+  --profile-id GPR_0002 \
+  --provider-account-id PVA_0002 \
+  --provider-project-id aafe9282-071f-4333-baa4-92b9f76a9c27 \
+  --expected-email singleava508@gmail.com \
+  --parent-attempt-id D2_13c62112d9881710019049d95cb6da57
+```
+
+For the authorized execution, append `--execute` after confirming the latest
+quote and wait until after 17:00 UTC for this non-subscriber account. Never
+invoke the operator with another parent or account identity.
 
 ## D7 transaction coordinator — backend integration (offline-tested)
 

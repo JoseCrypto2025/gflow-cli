@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Callable
@@ -72,6 +73,11 @@ class ProductionExecutionContext:
     prerequisite_d2_run_id: str | None = None
     production_job_id: str | None = None
     scene_job_id: str | None = None
+    legacy_replacement_authorization_id: str | None = None
+    legacy_replacement_parent_attempt_id: str | None = None
+    legacy_replacement_quote_credits: Decimal | None = None
+    legacy_replacement_quote_input_digest: str | None = None
+    legacy_replacement_quote_source_version: str | None = None
 
     def validate(self, resolved: dict[str, str]) -> None:
         if self.environment not in {"DEV", "TEST", "PROD"}:
@@ -90,6 +96,33 @@ class ProductionExecutionContext:
             raise ProductionExecutionError("execution identity is incomplete")
         if self.environment == "PROD" and (not self.production_job_id or not self.scene_job_id):
             raise ProductionExecutionError("PROD execution must bind production and scene jobs")
+        replacement_values = (
+            self.legacy_replacement_authorization_id,
+            self.legacy_replacement_parent_attempt_id,
+            self.legacy_replacement_quote_credits,
+            self.legacy_replacement_quote_input_digest,
+            self.legacy_replacement_quote_source_version,
+        )
+        if any(value is not None for value in replacement_values):
+            if (
+                self.environment != "PROD"
+                or not self.production_job_id
+                or not self.scene_job_id
+                or not isinstance(self.legacy_replacement_authorization_id, str)
+                or not re.fullmatch(r"LRA_[0-9A-F]{24}", self.legacy_replacement_authorization_id)
+                or not isinstance(self.legacy_replacement_parent_attempt_id, str)
+                or not re.fullmatch(
+                    r"D2_[A-Za-z0-9_-]{8,64}", self.legacy_replacement_parent_attempt_id
+                )
+                or self.legacy_replacement_quote_credits is None
+                or not self.legacy_replacement_quote_credits.is_finite()
+                or self.legacy_replacement_quote_credits <= 0
+                or not isinstance(self.legacy_replacement_quote_input_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", self.legacy_replacement_quote_input_digest)
+                or not isinstance(self.legacy_replacement_quote_source_version, str)
+                or not self.legacy_replacement_quote_source_version.strip()
+            ):
+                raise ProductionExecutionError("legacy replacement capability is incomplete")
         if resolved != expected:
             raise ProductionExecutionError(
                 "resolved provider identity differs from execution context"
@@ -171,14 +204,215 @@ class ProductionCreditGuard:
         return self._mutate(update)
 
     def record_generate_click(self, attempt_id: str) -> None:
+        self._record_generate_click(attempt_id, replacement_authorization_id=None)
+
+    def record_replacement_generate_click(self, attempt_id: str, *, authorization_id: str) -> None:
+        self._record_generate_click(attempt_id, replacement_authorization_id=authorization_id)
+
+    def _record_generate_click(
+        self, attempt_id: str, *, replacement_authorization_id: str | None
+    ) -> None:
         def update(payload: dict[str, object]) -> dict[str, object]:
             row = self._find(payload, attempt_id)
-            if row.get("state") != "PREPARED" or row.get("generate_click_count") != 0:
+            replacement_reserved = row.get("state") == "PRE_GENERATE_RESERVED"
+            if (
+                row.get("generate_click_count") != 0
+                or (
+                    replacement_reserved
+                    and row.get("legacy_replacement_authorization_id")
+                    != replacement_authorization_id
+                )
+                or (
+                    not replacement_reserved
+                    and (row.get("state") != "PREPARED" or replacement_authorization_id is not None)
+                )
+            ):
                 raise ProductionExecutionError(
                     "attempt is not eligible for its single Generate click"
                 )
             row["generate_click_count"] = 1
             row["state"] = "SUBMISSION_UNRESOLVED"
+            return dict(row)
+
+        self._mutate(update)
+
+    def reserve_replacement_quote_before_submit(
+        self,
+        context: ProductionExecutionContext,
+        *,
+        quoted_credits: Decimal | int | float | str,
+        budget: CreditBudgetContext,
+        now: datetime | None = None,
+    ) -> Decimal:
+        """Reserve one exact approved replacement quote before its provider click."""
+        authorization_id = context.legacy_replacement_authorization_id
+        parent_attempt_id = context.legacy_replacement_parent_attempt_id
+        quote_input_digest = context.legacy_replacement_quote_input_digest
+        quote_source_version = context.legacy_replacement_quote_source_version
+        expected_quote = context.legacy_replacement_quote_credits
+        if (
+            authorization_id is None
+            or parent_attempt_id is None
+            or quote_input_digest is None
+            or quote_source_version is None
+            or expected_quote is None
+        ):
+            raise ProductionExecutionError("legacy replacement capability is incomplete")
+        try:
+            quote = Decimal(str(quoted_credits))
+        except InvalidOperation as exc:
+            raise ProductionExecutionError("replacement quote is invalid") from exc
+        if (
+            not quote.is_finite()
+            or quote <= 0
+            or quote != expected_quote
+            or quote > budget.daily_user_ceiling
+            or not budget.is_free_quota
+            or budget.paid_fallback
+            or budget.provider_remaining_free is None
+            or quote > budget.provider_remaining_free
+        ):
+            raise ProductionExecutionError("replacement quote exceeds its exact credit capability")
+        moment = now or datetime.now(UTC)
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ProductionExecutionError("credit guard timestamp must be timezone-aware")
+        day = moment.astimezone(_BANGKOK).date().isoformat()
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            records = cast(list[dict[str, object]], payload["attempts"])
+            row = self._find(payload, context.attempt_id)
+            expected_identity = (
+                context.provider_id,
+                day,
+                context.provider_account_id,
+                context.provider_project_id,
+                context.environment,
+                context.production_job_id,
+                context.scene_job_id,
+            )
+            actual_identity = (
+                row.get("provider_id"),
+                row.get("date"),
+                row.get("provider_account_id"),
+                row.get("provider_project_id"),
+                row.get("environment"),
+                row.get("production_job_id"),
+                row.get("scene_job_id"),
+            )
+            if actual_identity != expected_identity:
+                raise ProductionExecutionError("replacement reservation identity differs")
+            binding = {
+                "legacy_replacement_authorization_id": authorization_id,
+                "legacy_replacement_parent_attempt_id": parent_attempt_id,
+                "legacy_replacement_quote_input_digest": quote_input_digest,
+                "legacy_replacement_quote_source_version": quote_source_version,
+            }
+            if row.get("state") == "PRE_GENERATE_RESERVED":
+                if (
+                    any(row.get(key) != value for key, value in binding.items())
+                    or row.get("quoted_credits") != str(quote)
+                    or row.get("reserved_credits") != str(quote)
+                ):
+                    raise ProductionExecutionError("replacement reservation replay differs")
+                return dict(row)
+            if row.get("state") != "PREPARED" or row.get("generate_click_count") != 0:
+                raise ProductionExecutionError("replacement attempt is not pre-Generate")
+            if any(
+                item.get("attempt_id") != context.attempt_id
+                and item.get("provider_id") == context.provider_id
+                and item.get("date") == day
+                and item.get("state") not in _TERMINAL
+                for item in records
+            ):
+                raise ProductionExecutionError("an unresolved provider attempt already exists")
+            if any(
+                item.get("provider_id") == context.provider_id
+                and item.get("date") == day
+                and item.get("state") in {"SUCCESS", "WAF_REJECTION"}
+                for item in records
+            ):
+                raise ProductionExecutionError("provider generation stop condition is active")
+            already_reserved = sum(
+                (
+                    Decimal(str(item.get("reserved_credits", "0")))
+                    for item in records
+                    if item.get("provider_id") == context.provider_id
+                    and item.get("date") == day
+                    and item.get("attempt_id") != context.attempt_id
+                ),
+                Decimal(0),
+            )
+            if already_reserved + quote > budget.daily_user_ceiling:
+                raise ProductionExecutionError(
+                    "quote exceeds remaining shared daily free credit ceiling"
+                )
+            row.update(binding)
+            row["quoted_credits"] = str(quote)
+            row["reserved_credits"] = str(quote)
+            row["state"] = "PRE_GENERATE_RESERVED"
+            row["reservation_created_at"] = format_utc_timestamp(moment)
+            return dict(row)
+
+        self._mutate(update)
+        return quote
+
+    def verify_replacement_confirmation(
+        self,
+        context: ProductionExecutionContext,
+        *,
+        video_count: int | None,
+        quoted_credits: Decimal | int | float | str | None,
+    ) -> Decimal:
+        """Require Flow's confirmation to equal the already reserved quote."""
+        authorization_id = context.legacy_replacement_authorization_id
+        expected_quote = context.legacy_replacement_quote_credits
+        if authorization_id is None or expected_quote is None:
+            raise ProductionExecutionError("legacy replacement capability is incomplete")
+        try:
+            quote = Decimal(str(quoted_credits)) if quoted_credits is not None else None
+        except InvalidOperation as exc:
+            raise ProductionExecutionError("provider credit quote is invalid") from exc
+        if video_count != 1 or quote is None or not quote.is_finite() or quote != expected_quote:
+            raise ProductionExecutionError(
+                "Flow confirmation differs from reserved replacement quote"
+            )
+        with self._file_lock():
+            row = self._find(self._read(), context.attempt_id)
+            if (
+                row.get("state") != "SUBMISSION_UNRESOLVED"
+                or row.get("generate_click_count") != 1
+                or row.get("legacy_replacement_authorization_id") != authorization_id
+                or row.get("legacy_replacement_parent_attempt_id")
+                != context.legacy_replacement_parent_attempt_id
+                or row.get("legacy_replacement_quote_input_digest")
+                != context.legacy_replacement_quote_input_digest
+                or row.get("legacy_replacement_quote_source_version")
+                != context.legacy_replacement_quote_source_version
+                or row.get("quoted_credits") != str(quote)
+                or row.get("reserved_credits") != str(quote)
+            ):
+                raise ProductionExecutionError("persisted replacement reservation differs")
+        return quote
+
+    def release_replacement_before_submit(self, context: ProductionExecutionContext) -> None:
+        """Release only an exact pre-Generate replacement reservation with zero clicks."""
+        authorization_id = context.legacy_replacement_authorization_id
+        if authorization_id is None:
+            raise ProductionExecutionError("legacy replacement capability is incomplete")
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            row = self._find(payload, context.attempt_id)
+            if (
+                row.get("state") != "PRE_GENERATE_RESERVED"
+                or row.get("generate_click_count") != 0
+                or row.get("legacy_replacement_authorization_id") != authorization_id
+                or row.get("production_job_id") != context.production_job_id
+                or row.get("scene_job_id") != context.scene_job_id
+            ):
+                raise ProductionExecutionError("replacement reservation is not pre-Generate")
+            row["reserved_credits"] = "0"
+            row["state"] = "FAILED_CONFIRMED"
+            row["released_before_generate"] = True
             return dict(row)
 
         self._mutate(update)

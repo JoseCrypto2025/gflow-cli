@@ -1,5 +1,10 @@
 # D2 PROD Legacy Replacement Quote and Authorization V1
 
+**Status:** frozen historical contract. Its exact-dimension quote matcher and
+post-Generate reservation describe V1 only. New model-aware quotes and
+pre-Generate replacement reservations follow
+[`D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V2.md`](D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V2.md).
+
 This contract is separate from legacy reconciliation, the ambiguous recovery
 policy, modern PROD recovery, and frozen TEST retry behavior. It is an internal
 runtime capability; it adds no CLI, MCP, queue, scheduler, or Flow surface.

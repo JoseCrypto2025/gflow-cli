@@ -120,3 +120,13 @@ fields or change the Flow generation CLI/MCP surface.
 
 The current one-scene production NO_AUDIO operator and its exact gate are
 documented in [Production Scene Orchestrator V2](operations/PRODUCTION_SCENE_ORCHESTRATOR_V2.md).
+
+Ambiguous legacy PROD attempts use the separately versioned
+[Legacy Replacement Authorization V2](operations/D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V2.md)
+and its internal `scripts/operations/run_legacy_replacement.py` operator. It
+binds one new Production Job, Scene Job, and D2 attempt to a current official
+credit quote, reserves the exact quote before Generate, and stops after local
+output validation without entering D7. Standard Veo 3.1 Lite uses the official
+NON_ULTRA per-generation credit rate. The operator holds fresh Generate
+execution during Google's published 14:00–17:00 UTC non-subscriber window;
+same-attempt reconciliation remains available while held.

@@ -604,6 +604,51 @@ def make_executor(tmp_path: Path, port: FakeGenerationPort):
 
 
 @pytest.mark.asyncio
+async def test_unconsumed_legacy_replacement_stops_before_ui_or_credit_mutation(
+    tmp_path: Path,
+) -> None:
+    port = FakeGenerationPort()
+    base = request_for(tmp_path)
+    context = ProductionExecutionContext(
+        environment="PROD",
+        provider_id="PRV_0001",
+        provider_account_id="PVA_0001",
+        provider_project_id=base.provider_project_id,
+        auth_profile="GFLOW_PROD_AUTH",
+        scene_id="SCN_000001",
+        generation_profile_id="GPR_0001",
+        scene_prompt_id="SPV_000002",
+        attempt_id="D2_replacement-0001",
+        credit_budget_context=CreditBudgetContext(provider_remaining_free=Decimal("50")),
+        production_job_id="PRD_000002",
+        scene_job_id="SJB_000002",
+        legacy_replacement_authorization_id="LRA_" + "A" * 24,
+        legacy_replacement_parent_attempt_id="D2_parent-00000001",
+        legacy_replacement_quote_credits=Decimal("10"),
+        legacy_replacement_quote_input_digest="d" * 64,
+        legacy_replacement_quote_source_version="PCT_000001:verified:source-hash",
+    )
+    request = PhaseGExecutionRequest.from_presubmit(
+        base, context.attempt_id, execution_context=context
+    )
+    ledger = D2DailyCreditLedger(tmp_path / "production-runtime")
+    journal = AgentSettingsRecoveryJournal(
+        tmp_path / "runtime", "PVA_0001", request.provider_project_id
+    )
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+
+    with pytest.raises(PhaseGError, match="consumed replacement") as refused:
+        await GoogleFlowAgentOnlyGenerationExecutor(
+            port, ledger, journal, production_credit_guard=guard
+        ).execute(request)
+
+    assert refused.value.code == "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID"
+    assert port.calls == []
+    assert ledger.attempts() == ()
+    assert not guard.path.exists()
+
+
+@pytest.mark.asyncio
 async def test_phase_g_executes_single_approved_gate_and_restores_original_settings(
     tmp_path: Path,
 ) -> None:

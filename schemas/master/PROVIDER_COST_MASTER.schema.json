@@ -91,7 +91,7 @@
       "foreign_key": null,
       "foreign_key_status": null,
       "allowed_values": null,
-      "description": "Optional quality tier.",
+      "description": "Optional quality context; use as a pricing key only when the official provider source differentiates this tier.",
       "example": null,
       "validation_rule": null
     },
@@ -103,7 +103,7 @@
       "foreign_key": null,
       "foreign_key_status": null,
       "allowed_values": null,
-      "description": "Optional resolution context.",
+      "description": "Optional resolution context; use as a pricing key only when the official provider source differentiates this resolution.",
       "example": null,
       "validation_rule": null
     },
@@ -246,9 +246,9 @@
       "foreign_key": "GENERATION_PROFILE_MASTER.Generation_Profile_ID",
       "foreign_key_status": "ACTIVE FK",
       "allowed_values": null,
-      "description": "Optional exact generation profile scope for a source-verified rate.",
+      "description": "Optional supplemental generation-profile scope; do not require it as a pricing key unless the official provider source differentiates profiles.",
       "example": null,
-      "validation_rule": "Required for direct replacement quotes."
+      "validation_rule": "Optional metadata; may be blank and is not a pricing key."
     },
     {
       "field_name": "Duration_Sec",
@@ -258,9 +258,9 @@
       "foreign_key": null,
       "foreign_key_status": null,
       "allowed_values": null,
-      "description": "Optional exact duration scope for the source-verified rate.",
+      "description": "Optional supplemental duration scope; do not require it as a pricing key unless the official provider source differentiates durations.",
       "example": null,
-      "validation_rule": "Required for direct replacement quotes."
+      "validation_rule": "Optional supplemental scope; blank is valid when the official provider source does not differentiate duration."
     },
     {
       "field_name": "Aspect_Ratio",
@@ -270,9 +270,9 @@
       "foreign_key": null,
       "foreign_key_status": null,
       "allowed_values": null,
-      "description": "Optional exact aspect-ratio scope for the source-verified rate.",
+      "description": "Optional supplemental aspect-ratio scope; do not require it as a pricing key unless the official provider source differentiates aspect ratios.",
       "example": null,
-      "validation_rule": "Required for direct replacement quotes."
+      "validation_rule": "Optional supplemental scope; blank is valid when the official provider source does not differentiate aspect ratio."
     },
     {
       "field_name": "Audio_Mode",
@@ -282,9 +282,9 @@
       "foreign_key": null,
       "foreign_key_status": null,
       "allowed_values": null,
-      "description": "Optional exact audio-mode scope for the source-verified rate.",
+      "description": "Optional supplemental audio-mode scope; do not require it as a pricing key unless the official provider source differentiates audio modes.",
       "example": null,
-      "validation_rule": "Required for direct replacement quotes."
+      "validation_rule": "Optional supplemental scope; blank is valid when the official provider source does not differentiate audio mode."
     },
     {
       "field_name": "Output_Count",
@@ -294,9 +294,9 @@
       "foreign_key": null,
       "foreign_key_status": null,
       "allowed_values": null,
-      "description": "Optional exact output-count scope for the source-verified rate.",
+      "description": "Optional supplemental output-count scope. A per-generation rate is multiplied by requested output count.",
       "example": null,
-      "validation_rule": "Required for direct replacement quotes."
+      "validation_rule": "Optional supplemental scope; output count is a multiplier when the source rate is per generation."
     }
   ]
 }

@@ -1,5 +1,12 @@
 Feature: Legacy ambiguous replacement readiness
 
+  Scenario: Standard Lite uses the account-specific non-Ultra per-generation rate
+    Given one official Standard Lite NON_ULTRA cost row
+    And the request is 8 seconds, 9:16, and one output
+    When the replacement quote is calculated
+    Then the quote is valid for 10 credits
+    And the quote calculation creates no authorization, attempt, reservation, approval, or Generate
+
   Scenario: Missing authoritative cost keeps the replacement decision on hold
     Given a quarantined ambiguous legacy attempt with a 50-credit unresolved reservation
     And no applicable verified credit-price row

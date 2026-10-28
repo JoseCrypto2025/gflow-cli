@@ -14,6 +14,8 @@ from gflow_cli.v2_runtime.legacy_replacement import (
 from gflow_cli.v2_runtime.phase_g import D2DailyCreditLedger, PhaseGError, PhaseGExecutionRequest
 from tests.validation.test_legacy_replacement import (
     _approved_ledger,
+    _config,
+    _cost_row,
     _quote,
     _replacement_request,
     _seed_parent,
@@ -25,6 +27,48 @@ scenarios(Path(__file__).with_name("legacy_replacement.feature"))
 @pytest.fixture
 def replacement_context() -> dict[str, object]:
     return {}
+
+
+@given("one official Standard Lite NON_ULTRA cost row")
+def standard_lite_non_ultra_cost_row(replacement_context: dict[str, object]) -> None:
+    replacement_context["cost_rows"] = [_cost_row(Provider_Account_ID="PVA_0002")]
+
+
+@given("the request is 8 seconds, 9:16, and one output")
+def standard_lite_request(replacement_context: dict[str, object]) -> None:
+    replacement_context["config"] = _config(
+        provider_account_id="PVA_0002",
+        generation_profile_id="GPR_0002",
+        duration_sec=8,
+        aspect_ratio="9:16",
+        resolution=None,
+        audio_mode=None,
+        output_count=1,
+        quality_tier=None,
+    )
+
+
+@when("the replacement quote is calculated")
+def standard_lite_quote_calculated(replacement_context: dict[str, object]) -> None:
+    config = replacement_context["config"]
+    cost_rows = replacement_context["cost_rows"]
+    replacement_context["quote"] = _quote(cost_rows, config=config)
+
+
+@then("the quote is valid for 10 credits")
+def standard_lite_quote_is_ten(replacement_context: dict[str, object]) -> None:
+    quote = replacement_context["quote"]
+    assert quote.status is ReplacementQuoteStatus.VALID
+    assert quote.amount == Decimal("10")
+
+
+@then("the quote calculation creates no authorization, attempt, reservation, approval, or Generate")
+def standard_lite_quote_has_no_side_effects(
+    replacement_context: dict[str, object], tmp_path: Path
+) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    assert not ledger.path.exists()
+    assert len(ledger.attempts()) == 0
 
 
 @given("a quarantined ambiguous legacy attempt with a 50-credit unresolved reservation")
@@ -90,7 +134,7 @@ def consume_approved_authorization(replacement_context: dict[str, object], tmp_p
     replacement_context["replacement"] = consume_legacy_replacement_authorization(
         ledger,
         authorization["authorization_id"],
-        _replacement_request(tmp_path, parent),
+        _replacement_request(tmp_path, parent, authorization=authorization),
         parent_quarantined=True,
         current_quote=quote,
     )
@@ -122,7 +166,9 @@ def authorization_consumed_once(replacement_context: dict[str, object], tmp_path
         consume_legacy_replacement_authorization(
             ledger,
             authorization["authorization_id"],
-            _replacement_request(tmp_path, parent, "D2_test-replacement-0002"),
+            _replacement_request(
+                tmp_path, parent, "D2_test-replacement-0002", authorization=authorization
+            ),
             parent_quarantined=True,
             current_quote=quote,
         )

@@ -377,6 +377,27 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 "PHASE_G_EXECUTION_CONTEXT_REQUIRED",
                 "production execution context and shared credit guard must be supplied together",
             )
+        replacement_context = request.execution_context
+        replacement_authorization_id = (
+            replacement_context.legacy_replacement_authorization_id
+            if replacement_context is not None
+            else None
+        )
+        is_legacy_replacement = replacement_authorization_id is not None
+        if is_legacy_replacement and (
+            retry_authorization is not None
+            or test_session_id is not None
+            or request.d2_run_id.startswith("D6_")
+        ):
+            raise PhaseGError(
+                "PHASE_G_AUTHORIZATION_CONFLICT",
+                "legacy replacement capability cannot be combined with another attempt lane",
+            )
+        if is_legacy_replacement:
+            # The token was consumed into this exact zero-action child attempt by the
+            # dedicated replacement operator. Verify the persisted capability before
+            # the browser adapter can mutate Flow settings.
+            self.ledger.validate_consumed_legacy_replacement(request)
         d6_proof: D6PrerequisiteProof | None = None
         if request.d2_run_id.startswith("D6_"):
             assert request.prerequisite_d2_run_id is not None
@@ -452,36 +473,50 @@ class GoogleFlowAgentOnlyGenerationExecutor:
         try:
             if request.execution_context is not None and self.production_credit_guard is not None:
                 self.production_credit_guard.prepare(request.execution_context)
-            try:
-                if d6_proof is not None:
-                    self.ledger.create_d6_attempt(request, proof=d6_proof)
-                elif test_session_id is not None:
-                    profile_key = getattr(self.port, "auth_profile_key", None)
-                    if not isinstance(profile_key, str):
+                if is_legacy_replacement:
+                    assert replacement_context is not None
+                    quote = replacement_context.legacy_replacement_quote_credits
+                    if quote is None:
                         raise PhaseGError(
-                            "PHASE_G_TEST_SESSION_PROFILE_UNVERIFIED",
-                            "live Flow adapter does not expose its verified TEST profile",
+                            "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                            "replacement quote is missing from the capability",
                         )
-                    assert test_session_credits_before is not None
-                    self.ledger.create_test_session_attempt(
-                        request,
-                        session_id=test_session_id,
-                        auth_profile_key=profile_key,
-                        provider_credits_before=test_session_credits_before,
+                    self.production_credit_guard.reserve_replacement_quote_before_submit(
+                        replacement_context,
+                        quoted_credits=quote,
+                        budget=replacement_context.credit_budget_context,
                     )
-                elif retry_authorization is not None:
-                    self.ledger.create_authorized_retry_attempt(request, retry_authorization)
-                else:
-                    self.ledger.create_attempt(request)
-            except BaseException:
-                if (
-                    request.execution_context is not None
-                    and self.production_credit_guard is not None
-                ):
-                    self.production_credit_guard.fail_before_submit(
-                        request.execution_context.attempt_id
-                    )
-                raise
+            if not is_legacy_replacement:
+                try:
+                    if d6_proof is not None:
+                        self.ledger.create_d6_attempt(request, proof=d6_proof)
+                    elif test_session_id is not None:
+                        profile_key = getattr(self.port, "auth_profile_key", None)
+                        if not isinstance(profile_key, str):
+                            raise PhaseGError(
+                                "PHASE_G_TEST_SESSION_PROFILE_UNVERIFIED",
+                                "live Flow adapter does not expose its verified TEST profile",
+                            )
+                        assert test_session_credits_before is not None
+                        self.ledger.create_test_session_attempt(
+                            request,
+                            session_id=test_session_id,
+                            auth_profile_key=profile_key,
+                            provider_credits_before=test_session_credits_before,
+                        )
+                    elif retry_authorization is not None:
+                        self.ledger.create_authorized_retry_attempt(request, retry_authorization)
+                    else:
+                        self.ledger.create_attempt(request)
+                except BaseException:
+                    if (
+                        request.execution_context is not None
+                        and self.production_credit_guard is not None
+                    ):
+                        self.production_credit_guard.fail_before_submit(
+                            request.execution_context.attempt_id
+                        )
+                    raise
             applied = dict(await self.port.apply_settings(target))
             if any(applied.get(key) != value for key, value in target.items()):
                 raise PhaseGError(
@@ -514,9 +549,16 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             generate_recorded = True
             started = True
             if request.execution_context is not None and self.production_credit_guard is not None:
-                self.production_credit_guard.record_generate_click(
-                    request.execution_context.attempt_id
-                )
+                if is_legacy_replacement:
+                    assert replacement_authorization_id is not None
+                    self.production_credit_guard.record_replacement_generate_click(
+                        request.execution_context.attempt_id,
+                        authorization_id=replacement_authorization_id,
+                    )
+                else:
+                    self.production_credit_guard.record_generate_click(
+                        request.execution_context.attempt_id
+                    )
             observation_deadline = time.monotonic() + 240
             await self.port.click_generate_once()
             dispatch = await self.port.await_submit_dispatch()
@@ -589,12 +631,19 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                             raise ProductionExecutionError(
                                 "provider free balance changed since the execution context was read"
                             )
-                        self.production_credit_guard.reserve_quote(
-                            request.execution_context.attempt_id,
-                            video_count=gate.video_count,
-                            quoted_credits=gate.credit_cost,
-                            budget=budget,
-                        )
+                        if is_legacy_replacement:
+                            self.production_credit_guard.verify_replacement_confirmation(
+                                request.execution_context,
+                                video_count=gate.video_count,
+                                quoted_credits=gate.credit_cost,
+                            )
+                        else:
+                            self.production_credit_guard.reserve_quote(
+                                request.execution_context.attempt_id,
+                                video_count=gate.video_count,
+                                quoted_credits=gate.credit_cost,
+                                budget=budget,
+                            )
                     self.ledger.approve_gate(
                         request.d2_run_id,
                         video_count=gate.video_count,
@@ -756,9 +805,14 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 self._record_unknown(request)
             elif request.execution_context is not None and self.production_credit_guard is not None:
                 try:
-                    self.production_credit_guard.fail_before_submit(
-                        request.execution_context.attempt_id
-                    )
+                    if is_legacy_replacement:
+                        self.production_credit_guard.release_replacement_before_submit(
+                            request.execution_context
+                        )
+                    else:
+                        self.production_credit_guard.fail_before_submit(
+                            request.execution_context.attempt_id
+                        )
                 except ProductionExecutionError:
                     pass
             raise
@@ -788,6 +842,13 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 ) from restoring_error
 
     def _record_no_charge(self, request: PhaseGExecutionRequest) -> None:
+        if (
+            request.execution_context is not None
+            and request.execution_context.legacy_replacement_authorization_id is not None
+        ):
+            # A clicked replacement with conflicting or incomplete confirmation remains
+            # financially unresolved. Keep its pre-Generate quote reservation for recovery.
+            return
         self.ledger.record_state(
             request.d2_run_id,
             submission_state="RECONCILED_NO_CHARGE",
@@ -1178,6 +1239,9 @@ class D2DailyCreditLedger:
             "parent_attempt_id",
             "production_job_id",
             "scene_job_id",
+            "replacement_production_job_id",
+            "replacement_scene_job_id",
+            "replacement_request_idempotency_key",
             "policy_id",
             "reconciliation_audit_id",
             "decision_input_digest",
@@ -1215,9 +1279,17 @@ class D2DailyCreditLedger:
         except ValueError:
             created_at = quote_at = None
         if (
-            record.get("contract_version") != "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V1"
+            record.get("contract_version") != "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V2"
             or not isinstance(record.get("authorization_id"), str)
             or not re.fullmatch(r"LRA_[0-9A-F]{24}", cast(str, record["authorization_id"]))
+            or record.get("replacement_request_idempotency_key")
+            != f"LEGACY_REPLACEMENT_V2_{record.get('authorization_id')}"
+            or not re.fullmatch(
+                r"PRD_[0-9]{6}", str(record.get("replacement_production_job_id", ""))
+            )
+            or not re.fullmatch(r"SJB_[0-9]{6}", str(record.get("replacement_scene_job_id", "")))
+            or record.get("replacement_production_job_id") == record.get("production_job_id")
+            or record.get("replacement_scene_job_id") == record.get("scene_job_id")
             or record.get("policy_id")
             != ambiguous_legacy_policy_id(str(record.get("parent_attempt_id", "")))
             or not isinstance(record.get("parent_attempt_id"), str)
@@ -1328,15 +1400,50 @@ class D2DailyCreditLedger:
                 )
             authorization = matches[0]
             parent_id = authorization.get("parent_attempt_id")
+            context = request.execution_context
+            if (
+                authorization.get("contract_version")
+                != "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V2"
+                or context is None
+                or context.environment != "PROD"
+                or context.attempt_id != request.d2_run_id
+                or context.legacy_replacement_authorization_id != authorization_id
+                or context.legacy_replacement_parent_attempt_id != parent_id
+                or context.production_job_id != authorization.get("replacement_production_job_id")
+                or context.scene_job_id != authorization.get("replacement_scene_job_id")
+                or context.legacy_replacement_quote_credits
+                != _decimal(authorization.get("replacement_quote"))
+                or context.legacy_replacement_quote_input_digest
+                != authorization.get("replacement_quote_input_digest")
+                or context.legacy_replacement_quote_source_version
+                != authorization.get("replacement_quote_source_version")
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                    "replacement request does not bind the authorized V2 attempt identity",
+                )
             replacement_link = {
-                "contract_version": "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V1",
+                "contract_version": "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V2",
                 "authorization_id": authorization_id,
                 "parent_attempt_id": parent_id,
                 "production_job_id": authorization.get("production_job_id"),
                 "scene_job_id": authorization.get("scene_job_id"),
+                "replacement_production_job_id": authorization.get("replacement_production_job_id"),
+                "replacement_scene_job_id": authorization.get("replacement_scene_job_id"),
+                "replacement_request_idempotency_key": authorization.get(
+                    "replacement_request_idempotency_key"
+                ),
                 "policy_id": authorization.get("policy_id"),
                 "reconciliation_audit_id": authorization.get("reconciliation_audit_id"),
                 "decision_input_digest": authorization.get("decision_input_digest"),
+                "replacement_quote": authorization.get("replacement_quote"),
+                "replacement_quote_unit": authorization.get("replacement_quote_unit"),
+                "replacement_quote_source_version": authorization.get(
+                    "replacement_quote_source_version"
+                ),
+                "replacement_quote_input_digest": authorization.get(
+                    "replacement_quote_input_digest"
+                ),
                 "generate_authorized": False,
             }
             replacement_id = request.d2_run_id
@@ -1434,6 +1541,108 @@ class D2DailyCreditLedger:
             return dict(created)
 
         return self._mutate(consume)
+
+    def validate_consumed_legacy_replacement(
+        self, request: PhaseGExecutionRequest
+    ) -> dict[str, object]:
+        """Verify the exact consumed V2 capability and zero-action child attempt."""
+        context = request.execution_context
+        if context is None or context.legacy_replacement_authorization_id is None:
+            raise PhaseGError(
+                "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                "Phase G request has no legacy replacement capability",
+            )
+        with self._locked_file():
+            payload = self._read()
+            attempts = cast(list[dict[str, object]], payload["attempts"])
+            authorizations = cast(
+                list[dict[str, object]], payload["legacy_replacement_authorizations"]
+            )
+            attempt_rows = [row for row in attempts if row.get("d2_run_id") == request.d2_run_id]
+            authorization_rows = [
+                row
+                for row in authorizations
+                if row.get("authorization_id") == context.legacy_replacement_authorization_id
+            ]
+            if len(attempt_rows) != 1 or len(authorization_rows) != 1:
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                    "consumed replacement attempt or authorization is not unique",
+                )
+            attempt = attempt_rows[0]
+            authorization = authorization_rows[0]
+            expected_link = {
+                "contract_version": "D2_PROD_LEGACY_REPLACEMENT_AUTHORIZATION_V2",
+                "authorization_id": authorization.get("authorization_id"),
+                "parent_attempt_id": authorization.get("parent_attempt_id"),
+                "production_job_id": authorization.get("production_job_id"),
+                "scene_job_id": authorization.get("scene_job_id"),
+                "replacement_production_job_id": authorization.get("replacement_production_job_id"),
+                "replacement_scene_job_id": authorization.get("replacement_scene_job_id"),
+                "replacement_request_idempotency_key": authorization.get(
+                    "replacement_request_idempotency_key"
+                ),
+                "policy_id": authorization.get("policy_id"),
+                "reconciliation_audit_id": authorization.get("reconciliation_audit_id"),
+                "decision_input_digest": authorization.get("decision_input_digest"),
+                "replacement_quote": authorization.get("replacement_quote"),
+                "replacement_quote_unit": authorization.get("replacement_quote_unit"),
+                "replacement_quote_source_version": authorization.get(
+                    "replacement_quote_source_version"
+                ),
+                "replacement_quote_input_digest": authorization.get(
+                    "replacement_quote_input_digest"
+                ),
+                "generate_authorized": False,
+            }
+            expected_attempt_identity = {
+                "execution_environment": "PROD",
+                "production_job_id": context.production_job_id,
+                "scene_job_id": context.scene_job_id,
+                "provider_id": context.provider_id,
+                "provider_account_id": context.provider_account_id,
+                "provider_project_id": context.provider_project_id,
+                "scene_id": context.scene_id,
+                "generation_profile_id": context.generation_profile_id,
+                "scene_prompt_id": context.scene_prompt_id,
+                "prompt_sha256": request.prompt_sha256,
+                "model_id": request.model_id,
+                "generation_mode": request.generation_mode,
+                "requested_duration_sec": request.duration_sec,
+                "requested_aspect_ratio": request.aspect_ratio,
+                "requested_output_count": request.output_count,
+                "submission_state": "PREPARED",
+                "generate_action_count": 0,
+                "approval_action_count": 0,
+            }
+            if (
+                authorization.get("authorization_status") != "CONSUMED"
+                or authorization.get("replacement_created") is not True
+                or authorization.get("replacement_attempt_id") != request.d2_run_id
+                or authorization.get("authorization_sha256")
+                != self._legacy_replacement_auth_digest(authorization)
+                or authorization.get("consumption_sha256")
+                != self._legacy_replacement_consumption_digest(authorization)
+                or attempt.get("legacy_replacement") != expected_link
+                or any(
+                    attempt.get(key) != value for key, value in expected_attempt_identity.items()
+                )
+                or authorization.get("replacement_production_job_id") != context.production_job_id
+                or authorization.get("replacement_scene_job_id") != context.scene_job_id
+                or authorization.get("parent_attempt_id")
+                != context.legacy_replacement_parent_attempt_id
+                or authorization.get("replacement_quote")
+                != str(context.legacy_replacement_quote_credits)
+                or authorization.get("replacement_quote_input_digest")
+                != context.legacy_replacement_quote_input_digest
+                or authorization.get("replacement_quote_source_version")
+                != context.legacy_replacement_quote_source_version
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
+                    "consumed replacement capability or persisted attempt differs",
+                )
+            return dict(attempt)
 
     @staticmethod
     def _legacy_replacement_auth_digest(authorization: Mapping[str, object]) -> str:
