@@ -138,8 +138,8 @@ attempt without entering D7.
   regressions.
 - [x] Run Ruff check, Ruff format check, and focused Pyright; do not install extra local dependencies or run
   full coverage.
-- [ ] Run the new pre-mutation Phase G async regression on a Linux Python runtime. On this Windows Python 3.14 host, pytest hangs during asyncio Proactor socketpair setup before the test body.
-- [ ] Confirm `.test-tmp/` is pre-existing and excluded from staged changes.
+- [x] Run the new pre-mutation Phase G async regression on Linux Python 3.11: 1 passed. The Windows Python 3.14 runner hung during asyncio Proactor socketpair setup before the test body.
+- [x] Confirm `.test-tmp/` is pre-existing and excluded from staged changes.
 
 ## Task 6 — Commit, push, and deploy
 
