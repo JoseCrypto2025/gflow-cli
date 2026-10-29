@@ -27,6 +27,7 @@ from .ambiguous_legacy_recovery_policy import ambiguous_legacy_policy_id
 from .errors import AssetVerificationError, V2RuntimeError
 from .google_flow import FlowPresubmitRequest, build_agent_only_directive
 from .phase_g_artifacts import sha256_file, verify_remote_redownload
+from .phase_g_diagnostics import PhaseGExecutionProgress, PhaseGStage
 from .production_execution import (
     ProductionCreditGuard,
     ProductionExecutionContext,
@@ -336,6 +337,15 @@ class PhaseGExecutionResult:
     provider_project_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PhaseGPreclickDiagnosticResult:
+    """Read-only result after Phase G's pre-journal checks and settings snapshot."""
+
+    attempt_id: str
+    last_completed_stage: str
+    stopped_before_stage: str = "JOURNAL_BEGIN"
+
+
 class FlowGenerationPort(Protocol):
     """Generation-only interface kept separate from the F5 preparation port."""
 
@@ -391,9 +401,13 @@ class GoogleFlowAgentOnlyGenerationExecutor:
         retry_authorization: D2RetryAuthorization | None = None,
         test_session_id: str | None = None,
         test_session_credits_before: Decimal | None = None,
+        progress: PhaseGExecutionProgress | None = None,
     ) -> PhaseGExecutionResult:
         """Apply settings, click once, validate one new gate and restore defaults."""
+        progress = progress or PhaseGExecutionProgress()
+        progress.start("REQUEST_BINDING")
         validate_phase_g_request(request)
+        progress.complete("REQUEST_BINDING")
         if (test_session_id is None) != (test_session_credits_before is None):
             raise PhaseGError(
                 "PHASE_G_TEST_SESSION_AUTHORIZATION_INVALID",
@@ -442,7 +456,9 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             # The token was consumed into this exact zero-action child attempt by the
             # dedicated replacement operator. Verify the persisted capability before
             # the browser adapter can mutate Flow settings.
+            progress.start("CONSUMED_AUTHORIZATION_VALIDATION")
             self.ledger.validate_consumed_legacy_replacement(request)
+            progress.complete("CONSUMED_AUTHORIZATION_VALIDATION")
         d6_proof: D6PrerequisiteProof | None = None
         if request.d2_run_id.startswith("D6_"):
             assert request.prerequisite_d2_run_id is not None
@@ -481,15 +497,18 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 auth_profile_key=profile_key,
                 provider_credits_before=test_session_credits_before,
             )
+        progress.start("JOURNAL_PREFLIGHT")
         try:
             self.recovery_journal.require_clean_or_missing()
         except RecoveryJournalError as exc:
             raise PhaseGError(
                 "PHASE_G_RECOVERY_REQUIRED", "settings recovery must be clean before Phase G"
             ) from exc
+        progress.complete("JOURNAL_PREFLIGHT")
         await self.port.bind_request(request)
 
         # Snapshot all relevant defaults before the journal or first mutation.
+        progress.start("SETTINGS_SNAPSHOT")
         original = dict(await self.port.snapshot_settings())
         if not original:
             raise PhaseGError(
@@ -507,17 +526,22 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 "PHASE_G_SETTINGS_SNAPSHOT_INVALID",
                 "original settings snapshot omits a setting Phase G will change",
             )
+        progress.complete("SETTINGS_SNAPSHOT")
+        progress.start("JOURNAL_BEGIN")
         self.recovery_journal.begin(
             correlation_id=request.d2_run_id,
             original_settings=original,
             intended_settings=target,
         )
+        progress.complete("JOURNAL_BEGIN")
         started = False
         generate_recorded = False
         gate_approved = False
         try:
             if request.execution_context is not None and self.production_credit_guard is not None:
+                progress.start("CREDIT_GUARD_PREPARE")
                 self.production_credit_guard.prepare(request.execution_context)
+                progress.complete("CREDIT_GUARD_PREPARE")
                 if is_legacy_replacement:
                     assert replacement_context is not None
                     quote = replacement_context.legacy_replacement_quote_credits
@@ -526,11 +550,13 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                             "PHASE_G_LEGACY_REPLACEMENT_AUTH_INVALID",
                             "replacement quote is missing from the capability",
                         )
+                    progress.start("RESERVATION_CREATE")
                     self.production_credit_guard.reserve_replacement_quote_before_submit(
                         replacement_context,
                         quoted_credits=quote,
                         budget=replacement_context.credit_budget_context,
                     )
+                    progress.complete("RESERVATION_CREATE")
             if not is_legacy_replacement:
                 try:
                     if d6_proof is not None:
@@ -562,11 +588,31 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                             request.execution_context.attempt_id
                         )
                     raise
+            progress.start("SETTINGS_APPLY")
             applied = dict(await self.port.apply_settings(target))
-            if any(applied.get(key) != value for key, value in target.items()):
+            if progress.current_stage == "SETTINGS_APPLY":
+                progress.complete("SETTINGS_APPLY")
+            readback_stages: tuple[tuple[PhaseGStage, str], ...] = (
+                ("MODEL_READBACK", "model_id"),
+                ("ASPECT_RATIO_READBACK", "aspect_ratio"),
+                ("OUTPUT_COUNT_READBACK", "output_count"),
+            )
+            for stage, key in readback_stages:
+                progress.start(stage)
+                if applied.get(key) != target[key]:
+                    raise PhaseGError(
+                        "PHASE_G_SETTINGS_READBACK_MISMATCH", "Flow settings differ from request"
+                    )
+                progress.complete(stage)
+            if any(
+                applied.get(key) != value
+                for key, value in target.items()
+                if key not in {"model_id", "aspect_ratio", "output_count"}
+            ):
                 raise PhaseGError(
                     "PHASE_G_SETTINGS_READBACK_MISMATCH", "Flow settings differ from request"
                 )
+            progress.start("PROMPT_PREPARE")
             directive = build_agent_only_directive(
                 request.compiled_prompt_text,
                 request.presubmit_request.preflight.technical_configuration,
@@ -577,7 +623,9 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                     "PHASE_G_PROMPT_READBACK_MISMATCH",
                     "Flow composer prompt differs from the pinned Agent directive",
                 )
+            progress.complete("PROMPT_PREPARE")
             # This baseline is deliberately captured immediately before submit.
+            progress.start("SUBMISSION_BASELINE")
             baseline = await self.port.capture_submission_baseline()
             if baseline.project_id != request.provider_project_id:
                 raise PhaseGError("PHASE_G_PROJECT_MISMATCH", "baseline belongs to another project")
@@ -590,6 +638,8 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             )
             self.ledger.capture_baseline(request.d2_run_id, baseline)
             await self.port.arm_submit_request_observer()
+            progress.complete("SUBMISSION_BASELINE")
+            progress.start("GENERATE_CHECKPOINT")
             self.ledger.mark_generate_action(request.d2_run_id)
             generate_recorded = True
             started = True
@@ -604,8 +654,11 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                     self.production_credit_guard.record_generate_click(
                         request.execution_context.attempt_id
                     )
+            progress.complete("GENERATE_CHECKPOINT")
             observation_deadline = time.monotonic() + 240
+            progress.start("GENERATE_CLICK")
             await self.port.click_generate_once()
+            progress.complete("GENERATE_CLICK")
             dispatch = await self.port.await_submit_dispatch()
             self.ledger.record_submit_transport_evidence(request.d2_run_id, dispatch)
             if dispatch.submission_surface == "AGENT_ONLY":
@@ -900,6 +953,63 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             terminal_state="RECONCILED_NO_CHARGE",
             accounted_credit_cost=0,
             provider_project_id=request.provider_project_id,
+        )
+
+    async def diagnose_preclick(
+        self,
+        request: PhaseGExecutionRequest,
+        *,
+        progress: PhaseGExecutionProgress,
+    ) -> PhaseGPreclickDiagnosticResult:
+        """Run the shared read-only Phase G prefix and stop before journal.begin."""
+        progress.start("REQUEST_BINDING")
+        validate_phase_g_request(request)
+        progress.complete("REQUEST_BINDING")
+        context = request.execution_context
+        if (
+            context is None
+            or context.environment != "PROD"
+            or context.legacy_replacement_authorization_id is None
+            or self.production_credit_guard is not None
+        ):
+            raise PhaseGError(
+                "PHASE_G_DIAGNOSTIC_LANE_INVALID",
+                "pre-click diagnosis requires one legacy PROD replacement without a credit guard",
+            )
+        progress.start("CONSUMED_AUTHORIZATION_VALIDATION")
+        self.ledger.validate_consumed_legacy_replacement(request)
+        progress.complete("CONSUMED_AUTHORIZATION_VALIDATION")
+        progress.start("JOURNAL_PREFLIGHT")
+        try:
+            self.recovery_journal.require_clean_or_missing()
+        except RecoveryJournalError as exc:
+            raise PhaseGError(
+                "PHASE_G_RECOVERY_REQUIRED", "settings recovery must be clean before Phase G"
+            ) from exc
+        progress.complete("JOURNAL_PREFLIGHT")
+        await self.port.bind_request(request)
+        progress.start("SETTINGS_SNAPSHOT")
+        original = dict(await self.port.snapshot_settings())
+        if not original:
+            raise PhaseGError(
+                "PHASE_G_SETTINGS_SNAPSHOT_INVALID", "original settings snapshot is empty"
+            )
+        target_keys = {
+            "model_id",
+            "generation_mode",
+            "aspect_ratio",
+            "output_count",
+            "confirm_before_generating",
+        }
+        if not target_keys.issubset(original):
+            raise PhaseGError(
+                "PHASE_G_SETTINGS_SNAPSHOT_INVALID",
+                "original settings snapshot omits a setting Phase G will change",
+            )
+        progress.complete("SETTINGS_SNAPSHOT")
+        return PhaseGPreclickDiagnosticResult(
+            request.d2_run_id,
+            progress.last_completed_stage or "SETTINGS_SNAPSHOT",
         )
         self._resolve_production_guard(request, "FAILED_CONFIRMED", 0)
 

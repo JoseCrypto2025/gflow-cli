@@ -66,6 +66,25 @@ zero clicks. After a click, all failures remain on the same attempt and preserve
 for reconciliation. Ambiguity never proves non-submission, never authorizes a retry, and never
 releases either reservation.
 
+### Pre-click diagnosis
+
+`scripts/operations/run_legacy_replacement.py --diagnose-preclick` is a read-only diagnostic lane
+for one already-consumed authorization and its existing `PREPARED` replacement attempt. It requires
+the authorization, attempt, Production Job, and Scene Job IDs explicitly, then rechecks the fresh
+quote, parent quarantine and reservation, child-job linkage, zero-action attempt, and consumed
+authorization before opening Flow.
+
+The lane verifies the signed-in profile, project, and current settings snapshot. It stops before
+`journal.begin`, settings application, prompt filling, submission baseline capture, attempt creation,
+shared-credit reservation, Generate checkpoint, or provider submission. Flow navigation and opening
+the settings view are read-only and the settings view is closed after snapshotting. The lane cannot
+create or consume authorization, attempt, or job records. It writes append-only, redacted stage and
+failure events to `production/phase-g/execution-diagnostics/<attempt-id>.jsonl`; it never stores
+cookies, tokens, OAuth credentials, browser storage, authentication headers, or prompt text. A
+failure retains the public reason code `PHASE_G_EXECUTION_FAILED_BEFORE_CLICK` and includes the
+failing stage, last completed stage, exception class and sanitized message, source location, and a
+digest of the raw traceback.
+
 The operator stops after exact local media validation. It does not upload, persist `FINAL_OUTPUT`,
 or enter D7/D8.
 

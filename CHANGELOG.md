@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase G pre-click diagnostics.** Adds durable redacted stage and failure records, plus a
+  read-only diagnostic mode bound to one existing consumed legacy replacement. The mode verifies
+  the profile, project, and settings snapshot, then stops before journal, settings, prompt, credit,
+  attempt, Generate, or provider-submission mutations.
+
 - **Proof-bound legacy PROD job-linkage repair.** Adds a separate V1 repair contract and an
   exact-target operator that requires unique canonical D2/Scene Job/Production Job/reservation
   joins plus the durable policy and reconciliation audits. The D2 ledger migrates to schema v4

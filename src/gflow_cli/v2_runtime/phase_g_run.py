@@ -32,12 +32,14 @@ from .phase_g import (
     PhaseGError,
     PhaseGExecutionRequest,
     PhaseGExecutionResult,
+    PhaseGPreclickDiagnosticResult,
 )
 from .phase_g_artifacts import (
     ValidatedVideo,
     sha256_file,
     validate_video,
 )
+from .phase_g_diagnostics import PhaseGExecutionProgress
 from .phase_g_live_flow import GoogleFlowAgentOnlyGenerationPort
 from .phase_g_prod_reconciliation import (
     ProdAttemptIdentity,
@@ -393,6 +395,7 @@ async def execute_and_validate(
     retry_authorization: D2RetryAuthorization | None = None,
     test_session_id: str | None = None,
     test_session_credits_before: Decimal | None = None,
+    progress: PhaseGExecutionProgress | None = None,
 ) -> PhaseGD2Run:
     """Perform one request, recover only its media ID, and fully validate the MP4."""
     context = request.execution_context
@@ -422,7 +425,8 @@ async def execute_and_validate(
         request.provider_account_id,
         request.provider_project_id,
     )
-    port = await _open_generation_port(request, expected_email=expected_email)
+    progress = progress or PhaseGExecutionProgress()
+    port = await _open_generation_port(request, expected_email=expected_email, progress=progress)
     try:
         result = await GoogleFlowAgentOnlyGenerationExecutor(
             port, ledger, journal, production_credit_guard=credit_guard
@@ -431,6 +435,7 @@ async def execute_and_validate(
             retry_authorization=retry_authorization,
             test_session_id=test_session_id,
             test_session_credits_before=test_session_credits_before,
+            progress=progress,
         )
         if result.submission_state != "GENERATION_SUCCEEDED" or not result.provider_media_id:
             raise PhaseGError(
@@ -468,8 +473,38 @@ async def execute_and_validate(
         await port.close()
 
 
+async def diagnose_preclick(
+    request: PhaseGExecutionRequest,
+    *,
+    expected_email: str,
+    progress: PhaseGExecutionProgress,
+) -> PhaseGPreclickDiagnosticResult:
+    """Open the exact Phase G lane and stop after its read-only pre-journal checks."""
+    context = request.execution_context
+    if context is None or context.environment != "PROD":
+        raise PhaseGError(
+            "PHASE_G_DIAGNOSTIC_LANE_INVALID", "pre-click diagnosis requires a PROD request"
+        )
+    ledger = D2DailyCreditLedger(request.presubmit_request.runtime_state_root / "production")
+    journal = AgentSettingsRecoveryJournal(
+        request.presubmit_request.runtime_state_root,
+        request.provider_account_id,
+        request.provider_project_id,
+    )
+    port = await _open_generation_port(request, expected_email=expected_email, progress=progress)
+    try:
+        return await GoogleFlowAgentOnlyGenerationExecutor(port, ledger, journal).diagnose_preclick(
+            request, progress=progress
+        )
+    finally:
+        await port.close()
+
+
 async def _open_generation_port(
-    request: PhaseGExecutionRequest, *, expected_email: str
+    request: PhaseGExecutionRequest,
+    *,
+    expected_email: str,
+    progress: PhaseGExecutionProgress | None = None,
 ) -> GoogleFlowAgentOnlyGenerationPort:
     context = request.execution_context
     if context is None:
@@ -487,6 +522,7 @@ async def _open_generation_port(
         provider_project_id=context.provider_project_id,
         project_name=project_name,
         model_display_names=_MODEL_DISPLAY_NAMES,
+        progress=progress,
     )
 
 

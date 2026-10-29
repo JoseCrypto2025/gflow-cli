@@ -35,6 +35,7 @@ from .phase_g import (
     FlowSubmissionBaseline,
     PhaseGAttemptEvidence,
     PhaseGError,
+    PhaseGExecutionProgress,
     PhaseGExecutionRequest,
     PhaseGSubmitTransportEvidence,
 )
@@ -312,6 +313,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         provider_account_id: str,
         provider_project_id: str,
         project_name: str,
+        progress: PhaseGExecutionProgress | None = None,
     ) -> None:
         self._base = base
         self._lease = lease
@@ -319,6 +321,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._provider_account_id = provider_account_id
         self._provider_project_id = provider_project_id
         self._project_name = project_name
+        self._progress = progress
         self._request: PhaseGExecutionRequest | None = None
         self._baseline: FlowSubmissionBaseline | None = None
         self._records: dict[tuple[str, str, str], _ObservedRecord] = {}
@@ -361,6 +364,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         project_name: str = _TEST_PROJECT_NAME,
         model_display_names: Mapping[str, str] = _MODEL_DISPLAY_NAMES,
         block_service_workers: bool = False,
+        progress: PhaseGExecutionProgress | None = None,
     ) -> GoogleFlowAgentOnlyGenerationPort:
         """Open a repository-owned TEST or PROD profile, never personal Chrome."""
         if not expected_email.strip() or "@" not in expected_email:
@@ -377,8 +381,11 @@ class GoogleFlowAgentOnlyGenerationPort:
             expected_email=expected_email,
             headless=False,
             block_service_workers=block_service_workers,
+            phase_g_progress=progress,
         )
         lease = ProfileLease(base.profile_dir)
+        if progress is not None:
+            progress.start("PROFILE_LEASE")
         try:
             await lease.aacquire()
         except ProfileLockedError as exc:
@@ -386,6 +393,8 @@ class GoogleFlowAgentOnlyGenerationPort:
             raise FlowPresubmitError(
                 "FLOW_LANE_BUSY", "dedicated Flow profile is already in use"
             ) from exc
+        if progress is not None:
+            progress.complete("PROFILE_LEASE")
         return cls(
             base,
             lease,
@@ -393,6 +402,7 @@ class GoogleFlowAgentOnlyGenerationPort:
             provider_account_id=provider_account_id,
             provider_project_id=provider_project_id,
             project_name=project_name,
+            progress=progress,
         )
 
     async def close(self) -> None:
@@ -414,6 +424,8 @@ class GoogleFlowAgentOnlyGenerationPort:
 
     async def bind_request(self, request: PhaseGExecutionRequest) -> None:
         """Pin this live adapter to exactly the approved environment job identity."""
+        if self._progress is not None:
+            self._progress.start("REQUEST_BINDING")
         if self._request is not None or self._generate_clicked:
             raise PhaseGError("PHASE_G_PORT_ALREADY_BOUND", "Flow port is already bound")
         context = request.execution_context
@@ -452,7 +464,13 @@ class GoogleFlowAgentOnlyGenerationPort:
             raise PhaseGError(
                 "PHASE_G_EXECUTION_IDENTITY_MISMATCH", "request identity is not pinned"
             )
+        if self._progress is not None:
+            self._progress.complete("REQUEST_BINDING")
+            self._progress.start("FLOW_OPEN")
         session = await self._base.inspect_session()
+        if self._progress is not None:
+            self._progress.complete("FLOW_OPEN")
+            self._progress.start("ACCOUNT_VERIFY")
         if (
             session.status != "FLOW_SESSION_READY"
             or session.account_id != self._provider_account_id
@@ -460,11 +478,16 @@ class GoogleFlowAgentOnlyGenerationPort:
             raise FlowPresubmitError(
                 "FLOW_AUTH_NOT_READY", "selected profile readiness is unverified"
             )
+        if self._progress is not None:
+            self._progress.complete("ACCOUNT_VERIFY")
+            self._progress.start("PROJECT_VERIFY")
         project = await self._base.select_project(self._provider_project_id)
         if project.project_id != self._provider_project_id:
             raise PhaseGError("PHASE_G_PROJECT_MISMATCH", "dedicated V2 project is not selected")
         if await self._base.inspect_surface() != "AGENT_ONLY":
             raise PhaseGError("PHASE_G_SURFACE_MISMATCH", "Flow surface is not Agent-only")
+        if self._progress is not None:
+            self._progress.complete("PROJECT_VERIFY")
         self._request = request
         self._page = await self._base.active_page()
         self._page.on("response", self._on_response)
@@ -473,7 +496,7 @@ class GoogleFlowAgentOnlyGenerationPort:
         return await self._base.snapshot_settings()
 
     async def apply_settings(self, settings: Mapping[str, object]) -> Mapping[str, object]:
-        return await self._base.apply_settings(settings)
+        return await self._base.apply_settings(settings, phase_g_progress=self._progress)
 
     async def read_settings(self) -> Mapping[str, object]:
         return await self._base.snapshot_settings()

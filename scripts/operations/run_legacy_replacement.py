@@ -1,4 +1,4 @@
-"""Quote or execute one exact, authorized legacy PROD replacement through Phase G only."""
+"""Quote, diagnose, or execute one exact legacy PROD replacement through Phase G only."""
 
 from __future__ import annotations
 
@@ -54,6 +54,10 @@ from gflow_cli.v2_runtime.phase_g import (
     PhaseGExecutionRequest,
 )
 from gflow_cli.v2_runtime.phase_g_artifacts import ValidatedVideo, validate_video
+from gflow_cli.v2_runtime.phase_g_diagnostics import (
+    PhaseGDiagnosticRecorder,
+    PhaseGExecutionProgress,
+)
 from gflow_cli.v2_runtime.phase_g_prod_legacy_reconciliation import (
     LegacyProdReconciliationDecision,
     build_legacy_prod_attempt_envelope,
@@ -69,6 +73,7 @@ from gflow_cli.v2_runtime.phase_g_run import (
     PhaseGD2Run,
     _open_generation_port,
     build_phase_g_request,
+    diagnose_preclick,
     execute_and_validate,
     reconcile_prod_same_attempt,
 )
@@ -488,6 +493,270 @@ def _attempt_report(attempt: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _diagnose_existing_preclick(
+    *,
+    runtime_root: Path,
+    temp_root: Path,
+    tables: dict[str, list[dict[str, object]]],
+    quote: ReplacementQuote,
+    expected_email: str,
+    parent_attempt_id: str,
+    authorization_id: str,
+    attempt_id: str,
+    production_job_id: str,
+    scene_job_id: str,
+    credit_balance: Decimal,
+) -> dict[str, object]:
+    """Validate one existing replacement and run only Phase G's read-only prefix."""
+    expected_ids = (
+        parent_attempt_id == _PARENT_ATTEMPT_ID
+        and expected_email.casefold() == _EXPECTED_EMAIL.casefold()
+        and authorization_id == "LRA_18A2C0EE3248A7C93E6D1991"
+        and attempt_id == "D2_9c13df47d64c68de30cd036bcd1fec09"
+        and production_job_id == "PRD_000002"
+        and scene_job_id == "SJB_000002"
+    )
+    if not expected_ids:
+        raise LegacyReplacementOperatorError("exact existing diagnostic identity is required")
+    if quote.status is not ReplacementQuoteStatus.VALID or quote.amount is None:
+        raise LegacyReplacementOperatorError("fresh replacement quote is not valid")
+
+    ledger = D2DailyCreditLedger(runtime_root / "production")
+    attempts = list(ledger.attempts())
+    parent_rows = [row for row in attempts if row.get("d2_run_id") == parent_attempt_id]
+    if len(parent_rows) != 1:
+        raise LegacyReplacementOperatorError("legacy parent D2 attempt must resolve exactly once")
+    parent_production_job_id, parent_scene_job_id = _require_parent_job_linkage(parent_rows[0])
+    _assert_parent_quarantined(tables, parent_production_job_id, parent_scene_job_id)
+
+    shared_payload = _read_json(
+        runtime_root / "production-credit" / "shared-ledger.json", runtime_root
+    )
+    shared_rows_value = shared_payload.get("attempts")
+    if not isinstance(shared_rows_value, list) or any(
+        not isinstance(row, dict) for row in shared_rows_value
+    ):
+        raise LegacyReplacementOperatorError("shared credit ledger has an invalid attempts list")
+    shared_rows = cast(list[dict[str, object]], shared_rows_value)
+    if any(row.get("attempt_id") == attempt_id for row in shared_rows):
+        raise LegacyReplacementOperatorError(
+            "existing replacement already has a credit reservation"
+        )
+
+    payload = _read_json(ledger.path, runtime_root)
+    auth_value = payload.get("legacy_replacement_authorizations")
+    if not isinstance(auth_value, list) or any(not isinstance(row, dict) for row in auth_value):
+        raise LegacyReplacementOperatorError("replacement authorization ledger is invalid")
+    parent_authorizations = [
+        row
+        for row in cast(list[dict[str, object]], auth_value)
+        if row.get("parent_attempt_id") == parent_attempt_id
+    ]
+    if len(parent_authorizations) != 1:
+        raise LegacyReplacementOperatorError("one existing parent authorization is required")
+    authorization = parent_authorizations[0]
+    if (
+        authorization.get("authorization_id") != authorization_id
+        or authorization.get("authorization_status") != "CONSUMED"
+        or authorization.get("replacement_created") is not True
+        or authorization.get("replacement_attempt_id") != attempt_id
+        or authorization.get("production_job_id") != parent_production_job_id
+        or authorization.get("scene_job_id") != parent_scene_job_id
+        or authorization.get("replacement_production_job_id") != production_job_id
+        or authorization.get("replacement_scene_job_id") != scene_job_id
+        or authorization.get("replacement_quote") != str(quote.amount)
+        or authorization.get("replacement_quote_unit") != quote.unit
+        or authorization.get("replacement_quote_source") != quote.source
+        or authorization.get("replacement_quote_source_version") != quote.source_version
+        or authorization.get("replacement_quote_input_digest") != quote.input_digest
+    ):
+        raise LegacyReplacementOperatorError("consumed authorization differs from fresh lineage")
+
+    replacement_rows = [
+        row
+        for row in attempts
+        if isinstance(row.get("legacy_replacement"), Mapping)
+        and cast(Mapping[str, object], row["legacy_replacement"]).get("parent_attempt_id")
+        == parent_attempt_id
+    ]
+    matching_attempts = [row for row in attempts if row.get("d2_run_id") == attempt_id]
+    if (
+        len(replacement_rows) != 1
+        or len(matching_attempts) != 1
+        or replacement_rows[0].get("d2_run_id") != attempt_id
+    ):
+        raise LegacyReplacementOperatorError("one exact existing replacement attempt is required")
+    attempt = matching_attempts[0]
+    if (
+        attempt.get("submission_state") != "PREPARED"
+        or attempt.get("generate_action_count") != 0
+        or attempt.get("approval_action_count") != 0
+        or attempt.get("generate_action_at") is not None
+        or attempt.get("provider_submit_request_count") != 0
+        or attempt.get("provider_submit_rpc_observed") is not None
+        or attempt.get("provider_execution_id") is not None
+        or attempt.get("provider_media_id") is not None
+        or attempt.get("provider_media_ids") not in ([], None)
+        or attempt.get("confirmation_id") is not None
+        or attempt.get("accounted_credit_cost") != "0"
+    ):
+        raise LegacyReplacementOperatorError(
+            "existing replacement is not a zero-action PREPARED attempt"
+        )
+
+    production = _unique(
+        tables.get("PRODUCTION_JOBS", []),
+        "Production_Job_ID",
+        production_job_id,
+        "replacement Production Job",
+    )
+    scene_job_row = _unique(
+        tables.get("SCENE_JOBS", []), "Scene_Job_ID", scene_job_id, "replacement Scene Job"
+    )
+    lineage_value = attempt.get("legacy_replacement")
+    if not isinstance(lineage_value, Mapping):
+        raise LegacyReplacementOperatorError("replacement lineage is missing")
+    if (
+        production.get("Execution_Environment") != "PROD"
+        or production.get("Request_Idempotency_Key")
+        != authorization.get("replacement_request_idempotency_key")
+        or production.get("Job_Status") != "REQUESTED"
+        or scene_job_row.get("Production_Job_ID") != production_job_id
+        or scene_job_row.get("Scene_Prompt_ID") != attempt.get("scene_prompt_id")
+        or scene_job_row.get("Job_Status") != "PENDING"
+        or attempt.get("production_job_id") != production_job_id
+        or attempt.get("scene_job_id") != scene_job_id
+        or lineage_value.get("authorization_id") != authorization_id
+        or lineage_value.get("parent_attempt_id") != parent_attempt_id
+    ):
+        raise LegacyReplacementOperatorError("existing replacement job and attempt lineage differ")
+
+    parent_exposure, parent_credit_row, _ = _parent_credit_state(runtime_root, parent_attempt_id)
+    if (
+        parent_credit_row.get("state") != "UNKNOWN_SUBMISSION_STATE"
+        or parent_exposure != Decimal("50")
+        or parent_rows[0].get("submission_state") != "UNKNOWN_SUBMISSION_STATE"
+        or parent_rows[0].get("generate_action_count") != 1
+    ):
+        raise LegacyReplacementOperatorError("legacy parent reservation changed")
+
+    prompt_id = str(attempt.get("scene_prompt_id", ""))
+    prompt_sha = str(attempt.get("prompt_sha256", ""))
+    context = ProductionExecutionContext(
+        environment="PROD",
+        provider_id=_PROVIDER_ID,
+        provider_account_id=_ACCOUNT_ID,
+        provider_project_id=_PROJECT_ID,
+        auth_profile=_AUTH_PROFILE,
+        scene_id=_SCENE_ID,
+        generation_profile_id=_PROFILE_ID,
+        scene_prompt_id=prompt_id,
+        attempt_id=attempt_id,
+        credit_budget_context=CreditBudgetContext(provider_remaining_free=credit_balance),
+        production_job_id=production_job_id,
+        scene_job_id=scene_job_id,
+        legacy_replacement_authorization_id=authorization_id,
+        legacy_replacement_parent_attempt_id=parent_attempt_id,
+        legacy_replacement_quote_credits=quote.amount,
+        legacy_replacement_quote_input_digest=quote.input_digest,
+        legacy_replacement_quote_source_version=quote.source_version,
+    )
+    request = build_phase_g_request(
+        cast(dict[str, list[Row]], tables),
+        cast(list[Row], tables.get("SCENE_PROMPT_VERSION", [])),
+        d2_run_id=attempt_id,
+        runtime_state_root=runtime_root,
+        temp_root=temp_root / scene_job_id / "generated",
+        execution_context=context,
+    )
+    attempt_no_value = scene_job_row.get("Attempt_No")
+    if isinstance(attempt_no_value, bool):
+        raise LegacyReplacementOperatorError("replacement Scene Job attempt number is invalid")
+    if isinstance(attempt_no_value, int):
+        attempt_no = attempt_no_value
+    elif isinstance(attempt_no_value, str) and attempt_no_value.isdecimal():
+        attempt_no = int(attempt_no_value)
+    else:
+        raise LegacyReplacementOperatorError("replacement Scene Job attempt number is invalid")
+    exact_scene_job = SceneJob(
+        scene_job_id=scene_job_id,
+        production_job_id=production_job_id,
+        scene_prompt_id=prompt_id,
+        attempt_no=attempt_no,
+        job_status=str(scene_job_row.get("Job_Status", "")),
+    )
+    if (
+        scene_phase_g_run_id(exact_scene_job) != attempt_id
+        or request.scene_prompt_id != prompt_id
+        or request.prompt_sha256 != prompt_sha
+        or request.output_count != 1
+        or request.duration_sec != 8
+        or request.aspect_ratio != "9:16"
+        or request.model_id != _MODEL_ID
+        or request.generation_mode != "TEXT_TO_VIDEO"
+    ):
+        raise LegacyReplacementOperatorError("rebuilt diagnostic request differs from the attempt")
+
+    recorder = PhaseGDiagnosticRecorder(
+        runtime_root,
+        attempt_id=attempt_id,
+        authorization_id=authorization_id,
+        production_job_id=production_job_id,
+        scene_job_id=scene_job_id,
+    )
+    progress = PhaseGExecutionProgress(recorder=recorder, strict=True)
+    try:
+        diagnostic = asyncio.run(
+            diagnose_preclick(request, expected_email=expected_email, progress=progress)
+        )
+        recorder.record_diagnostic_complete(progress)
+    except Exception as exc:
+        try:
+            failure = recorder.record_failure(
+                exc,
+                progress,
+                repository_root=Path(__file__).resolve().parents[2],
+                sensitive_values=(request.compiled_prompt_text, request.compiled_negative_prompt),
+            )
+        except Exception as persist_exc:
+            failure = {
+                "diagnostics_persisted": False,
+                "diagnostic_write_error": type(persist_exc).__name__,
+            }
+        return {
+            "status": "HOLD",
+            "attempt_id": attempt_id,
+            "authorization_id": authorization_id,
+            "production_job_id": production_job_id,
+            "scene_job_id": scene_job_id,
+            "failed_stage": failure.get("failed_stage"),
+            "last_completed_stage": failure.get("last_completed_stage"),
+            "failure_class": "PHASE_G_EXECUTION_FAILED_BEFORE_CLICK",
+            "reason_code": "PHASE_G_EXECUTION_FAILED_BEFORE_CLICK",
+            "preclick_diagnostic": failure,
+            "diagnostic_path": str(recorder.path),
+            "generate_action_count": 0,
+            "provider_submit_request_count": 0,
+            "reservation_created": False,
+            "flow_state_changed": False,
+        }
+    return {
+        "status": "PRECLICK_DIAGNOSTIC_COMPLETE",
+        "attempt_id": diagnostic.attempt_id,
+        "authorization_id": authorization_id,
+        "production_job_id": production_job_id,
+        "scene_job_id": scene_job_id,
+        "failed_stage": None,
+        "last_completed_stage": diagnostic.last_completed_stage,
+        "stopped_before_stage": diagnostic.stopped_before_stage,
+        "diagnostic_path": str(recorder.path),
+        "generate_action_count": 0,
+        "provider_submit_request_count": 0,
+        "reservation_created": False,
+        "flow_state_changed": False,
+    }
+
+
 def _download_validated_existing(
     request: PhaseGExecutionRequest,
     *,
@@ -528,7 +797,14 @@ def run_once(
     expected_email: str,
     parent_attempt_id: str,
     execute: bool,
+    diagnose_preclick_mode: bool = False,
+    authorization_id: str | None = None,
+    replacement_attempt_id: str | None = None,
+    replacement_production_job_id: str | None = None,
+    replacement_scene_job_id: str | None = None,
 ) -> dict[str, object]:
+    if execute and diagnose_preclick_mode:
+        raise LegacyReplacementOperatorError("execution and pre-click diagnosis are exclusive")
     if (scene_id, profile_id, account_id, project_id, expected_email, parent_attempt_id) != (
         _SCENE_ID,
         _PROFILE_ID,
@@ -645,6 +921,37 @@ def run_once(
             "attempt_created": False,
             "reservation_created": False,
         }
+        if diagnose_preclick_mode:
+            if not all(
+                (
+                    authorization_id,
+                    replacement_attempt_id,
+                    replacement_production_job_id,
+                    replacement_scene_job_id,
+                )
+            ):
+                raise LegacyReplacementOperatorError(
+                    "diagnostic mode requires the exact existing authorization, attempt, and jobs"
+                )
+            assert authorization_id is not None
+            assert replacement_attempt_id is not None
+            assert replacement_production_job_id is not None
+            assert replacement_scene_job_id is not None
+            diagnostic_result = _diagnose_existing_preclick(
+                runtime_root=runtime_root,
+                temp_root=settings.temp_root,
+                tables=tables,
+                quote=quote,
+                expected_email=expected_email,
+                parent_attempt_id=parent_attempt_id,
+                authorization_id=authorization_id,
+                attempt_id=replacement_attempt_id,
+                production_job_id=replacement_production_job_id,
+                scene_job_id=replacement_scene_job_id,
+                credit_balance=credit_balance,
+            )
+            result.update(diagnostic_result)
+            return result
         if not execute:
             return result
         now = datetime.now(UTC)
@@ -1061,11 +1368,23 @@ def run_once(
             raise LegacyReplacementOperatorError(
                 "fresh provider free balance is below the exact quote"
             )
+        phase_g_recorder = PhaseGDiagnosticRecorder(
+            runtime_root,
+            attempt_id=attempt_id,
+            authorization_id=authorization_id,
+            production_job_id=child_prod_id,
+            scene_job_id=child_scene_id,
+        )
+        phase_g_progress = PhaseGExecutionProgress(recorder=phase_g_recorder, strict=False)
         try:
             generated: PhaseGD2Run = asyncio.run(
-                execute_and_validate(phase_g_request, expected_email=expected_email)
+                execute_and_validate(
+                    phase_g_request,
+                    expected_email=expected_email,
+                    progress=phase_g_progress,
+                )
             )
-        except Exception:
+        except Exception as exc:
             observed = _attempt(d2_ledger, attempt_id)
             clicks = _action_count(observed, "generate_action_count") if observed else 0
             if clicks == 1:
@@ -1141,12 +1460,31 @@ def run_once(
                     if clicks > 1
                     else "PHASE_G_EXECUTION_FAILED_BEFORE_CLICK"
                 )
+                diagnostic: dict[str, object] = {}
+                if clicks == 0:
+                    try:
+                        diagnostic = phase_g_recorder.record_failure(
+                            exc,
+                            phase_g_progress,
+                            repository_root=repository_root,
+                            sensitive_values=(
+                                phase_g_request.compiled_prompt_text,
+                                phase_g_request.compiled_negative_prompt,
+                            ),
+                        )
+                    except Exception:
+                        diagnostic = {"diagnostics_persisted": False}
                 result.update(
                     status="HOLD",
                     failure_class=failure_class,
+                    reason_code=(
+                        "PHASE_G_EXECUTION_FAILED_BEFORE_CLICK" if clicks == 0 else failure_class
+                    ),
                     generate_clicked=clicks > 0,
                     generate_action_count=clicks,
                     approval_action_count=0,
+                    preclick_diagnostic=diagnostic,
+                    diagnostic_path=str(phase_g_recorder.path),
                 )
             return result
         attempt_after = _attempt(d2_ledger, attempt_id)
@@ -1220,9 +1558,19 @@ def main() -> int:
     parser.add_argument("--provider-project-id", required=True)
     parser.add_argument("--expected-email", required=True)
     parser.add_argument("--parent-attempt-id", required=True)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--execute", action="store_true", help="run the approved one-shot Phase G path"
     )
+    mode.add_argument(
+        "--diagnose-preclick",
+        action="store_true",
+        help="run read-only Phase G checks for one exact existing PREPARED attempt",
+    )
+    parser.add_argument("--authorization-id")
+    parser.add_argument("--replacement-attempt-id")
+    parser.add_argument("--replacement-production-job-id")
+    parser.add_argument("--replacement-scene-job-id")
     args = parser.parse_args()
     try:
         result = run_once(
@@ -1233,6 +1581,11 @@ def main() -> int:
             expected_email=args.expected_email,
             parent_attempt_id=args.parent_attempt_id,
             execute=args.execute,
+            diagnose_preclick_mode=args.diagnose_preclick,
+            authorization_id=args.authorization_id,
+            replacement_attempt_id=args.replacement_attempt_id,
+            replacement_production_job_id=args.replacement_production_job_id,
+            replacement_scene_job_id=args.replacement_scene_job_id,
         )
     except Exception as exc:
         failure_class = type(exc).__name__
@@ -1245,7 +1598,15 @@ def main() -> int:
         return 2
     print(json.dumps(result, sort_keys=True))
     return (
-        0 if result.get("status") in {"QUOTE_VALID", "PASS", "RECONCILED_EXISTING_ATTEMPT"} else 2
+        0
+        if result.get("status")
+        in {
+            "QUOTE_VALID",
+            "PASS",
+            "RECONCILED_EXISTING_ATTEMPT",
+            "PRECLICK_DIAGNOSTIC_COMPLETE",
+        }
+        else 2
     )
 
 

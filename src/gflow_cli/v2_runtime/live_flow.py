@@ -32,6 +32,7 @@ from .google_flow import (
     GoogleFlowProviderAdapter,
     ProviderReferenceBinding,
 )
+from .phase_g_diagnostics import PhaseGExecutionProgress, PhaseGStage
 
 _FLOW_ORIGIN = "https://flow.google.com"
 _PROMPT_SELECTOR = "div.ProseMirror"
@@ -218,6 +219,7 @@ class GoogleFlowAgentOnlyPort:
         headless: bool = False,
         block_service_workers: bool = False,
         profile_lease: ProfileLease | None = None,
+        phase_g_progress: PhaseGExecutionProgress | None = None,
     ) -> GoogleFlowAgentOnlyPort:
         """Verify the existing profile session without starting a login flow."""
         port = cls(
@@ -230,6 +232,8 @@ class GoogleFlowAgentOnlyPort:
             headless=headless,
             block_service_workers=block_service_workers,
         )
+        if phase_g_progress is not None:
+            phase_g_progress.start("PROFILE_LEASE")
         if profile_lease is None:
             status = await verify_flow_profile(port.profile_dir, source="v2-agent-only")
         else:
@@ -238,6 +242,9 @@ class GoogleFlowAgentOnlyPort:
                 source="v2-agent-only",
                 profile_lease=profile_lease,
             )
+        if phase_g_progress is not None:
+            phase_g_progress.complete("PROFILE_LEASE")
+            phase_g_progress.start("ACCOUNT_VERIFY")
         if status.outcome is not FlowSessionOutcome.AUTHENTICATED:
             raise FlowPresubmitError(
                 "FLOW_AUTH_NOT_READY", "repository auth verification did not confirm a Flow session"
@@ -249,6 +256,8 @@ class GoogleFlowAgentOnlyPort:
             )
         port._session_email = email
         port._session_verified = True
+        if phase_g_progress is not None:
+            phase_g_progress.complete("ACCOUNT_VERIFY")
         return port
 
     async def close(self) -> None:
@@ -363,7 +372,12 @@ class GoogleFlowAgentOnlyPort:
         finally:
             await self._close_settings()
 
-    async def apply_settings(self, settings: Mapping[str, object]) -> Mapping[str, object]:
+    async def apply_settings(
+        self,
+        settings: Mapping[str, object],
+        *,
+        phase_g_progress: PhaseGExecutionProgress | None = None,
+    ) -> Mapping[str, object]:
         unsupported = set(settings) - _SETTING_KEYS
         if unsupported:
             raise FlowPresubmitError(
@@ -379,15 +393,25 @@ class GoogleFlowAgentOnlyPort:
         try:
             current = await self._read_video_settings()
             if "model_id" in settings and settings["model_id"] != current.get("model_id"):
+                if phase_g_progress is not None:
+                    phase_g_progress.start("MODEL_APPLY")
                 await self._select_model(str(settings["model_id"]))
-            if "aspect_ratio" in settings and settings["aspect_ratio"] != current.get(
-                "aspect_ratio"
-            ):
-                await self._select_video_radio(2, str(settings["aspect_ratio"]))
-            if "output_count" in settings and settings["output_count"] != current.get(
-                "output_count"
-            ):
-                await self._select_video_radio(3, f"x{settings['output_count']}")
+                if phase_g_progress is not None:
+                    phase_g_progress.complete("MODEL_APPLY")
+            if "aspect_ratio" in settings:
+                if phase_g_progress is not None:
+                    phase_g_progress.start("ASPECT_RATIO_APPLY")
+                if settings["aspect_ratio"] != current.get("aspect_ratio"):
+                    await self._select_video_radio(2, str(settings["aspect_ratio"]))
+                if phase_g_progress is not None:
+                    phase_g_progress.complete("ASPECT_RATIO_APPLY")
+            if "output_count" in settings:
+                if phase_g_progress is not None:
+                    phase_g_progress.start("OUTPUT_COUNT_APPLY")
+                if settings["output_count"] != current.get("output_count"):
+                    await self._select_video_radio(3, f"x{settings['output_count']}")
+                if phase_g_progress is not None:
+                    phase_g_progress.complete("OUTPUT_COUNT_APPLY")
             if "confirm_before_generating" in settings and settings[
                 "confirm_before_generating"
             ] != current.get("confirm_before_generating"):
@@ -399,12 +423,24 @@ class GoogleFlowAgentOnlyPort:
             # read-only navigation and does not alter persisted defaults.
             if await page.locator(_SETTINGS_VIEW).count():
                 await self._close_settings()
+        if phase_g_progress is not None:
+            phase_g_progress.start("MODEL_READBACK")
         actual = await self.snapshot_settings()
+        readback_stages: dict[str, PhaseGStage] = {
+            "model_id": "MODEL_READBACK",
+            "aspect_ratio": "ASPECT_RATIO_READBACK",
+            "output_count": "OUTPUT_COUNT_READBACK",
+        }
         for key, expected in settings.items():
+            stage = readback_stages.get(key)
+            if phase_g_progress is not None and stage and stage != "MODEL_READBACK":
+                phase_g_progress.start(stage)
             if actual.get(key) != expected:
                 raise FlowPresubmitError(
                     "FLOW_SETTING_VALUE_MISMATCH", "Agent setting did not match live readback"
                 )
+            if phase_g_progress is not None and stage:
+                phase_g_progress.complete(stage)
         return actual
 
     async def restore_settings(self, settings: Mapping[str, object]) -> None:
