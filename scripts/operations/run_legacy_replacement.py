@@ -7,7 +7,7 @@ import asyncio
 import json
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from datetime import UTC, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -423,26 +423,6 @@ def _action_count(attempt: Mapping[str, object], key: str) -> int:
     if type(value) is not int or value < 0:
         raise LegacyReplacementOperatorError("persisted action count is invalid")
     return value
-
-
-def _has_clicked_consumed_replacement(
-    authorization: Mapping[str, object] | None,
-    attempts: Sequence[Mapping[str, object]],
-) -> bool:
-    if authorization is None or authorization.get("authorization_status") != "CONSUMED":
-        return False
-    authorization_id = authorization.get("authorization_id")
-    attempt_id = authorization.get("replacement_attempt_id")
-    if not isinstance(authorization_id, str) or not isinstance(attempt_id, str):
-        return False
-    matches = [row for row in attempts if row.get("d2_run_id") == attempt_id]
-    lineage = matches[0].get("legacy_replacement") if len(matches) == 1 else None
-    return (
-        len(matches) == 1
-        and isinstance(lineage, Mapping)
-        and cast(Mapping[str, object], lineage).get("authorization_id") == authorization_id
-        and _action_count(matches[0], "generate_action_count") == 1
-    )
 
 
 def _replacement_reservation(
@@ -901,6 +881,7 @@ def run_once(
             "prompt_sha256": prompt_sha,
             "pricing_variant": "STANDARD_LITE",
             "account_pricing_class": "NON_ULTRA",
+            "peak_window_advisory": is_non_subscriber_peak_window(datetime.now(UTC)),
             "generation_mode": "TEXT_TO_VIDEO",
             "duration_intent_sec": 8,
             "aspect_ratio_intent": "9:16",
@@ -979,11 +960,6 @@ def run_once(
                 "multiple replacement authorizations exist for parent"
             )
         existing_auth = parent_authorizations[0] if parent_authorizations else None
-        if is_non_subscriber_peak_window(now) and not _has_clicked_consumed_replacement(
-            existing_auth, all_attempts
-        ):
-            result.update(status="HOLD", blocker="NON_SUBSCRIBER_PEAK_WINDOW_14_17_UTC")
-            return result
         parent_quarantined = (
             parent_production.get("Job_Status") == "QUARANTINED"
             and parent_scene_job.get("Job_Status") == "QUARANTINED"
@@ -1041,9 +1017,24 @@ def run_once(
                 raise LegacyReplacementOperatorError(
                     "existing authorization is not an exact replay"
                 )
+            replayed_late, replayed_policy, replayed_reconciliation, replayed_policy_link = (
+                _legacy_parent(
+                    snapshot, runtime_root, parent_attempt_id, software_commit=software_commit
+                )
+            )
+            if (
+                replayed_late.result.value != "AMBIGUOUS_AFTER_RECONCILIATION"
+                or replayed_reconciliation.get("result") != "AMBIGUOUS_AFTER_RECONCILIATION"
+                or replayed_policy.get("attempt_id") != parent_attempt_id
+                or replayed_policy_link != policy_link
+            ):
+                raise LegacyReplacementOperatorError(
+                    "fresh parent evidence or policy linkage changed during replay"
+                )
             idem_key = expected_key
             result.update(
-                late_parent_evidence="NO (PERSISTED AUTHORIZATION PREREQUISITE)",
+                late_parent_evidence=replayed_late.result.value,
+                late_parent_check_sha256=replayed_late.audit_event.get("event_sha256"),
                 gate_a="PASS",
                 gate_b="PASS",
                 gate_c="PASS",
@@ -1233,6 +1224,28 @@ def run_once(
             raise LegacyReplacementOperatorError(
                 "fresh quote changed before authorization consumption"
             )
+        (
+            refreshed_late,
+            refreshed_policy,
+            refreshed_reconciliation,
+            refreshed_policy_link,
+        ) = _legacy_parent(
+            refreshed, runtime_root, parent_attempt_id, software_commit=software_commit
+        )
+        if (
+            refreshed_late.result.value != "AMBIGUOUS_AFTER_RECONCILIATION"
+            or refreshed_reconciliation.get("result") != "AMBIGUOUS_AFTER_RECONCILIATION"
+            or refreshed_policy.get("attempt_id") != parent_attempt_id
+            or refreshed_policy_link != policy_link
+        ):
+            raise LegacyReplacementOperatorError(
+                "fresh parent evidence or policy linkage changed before authorization consumption"
+            )
+        result.update(
+            late_parent_evidence=refreshed_late.result.value,
+            late_parent_check_sha256=refreshed_late.audit_event.get("event_sha256"),
+            gate_b="PASS",
+        )
         refreshed_exposure, refreshed_parent_credit, _ = _parent_credit_state(
             runtime_root, parent_attempt_id
         )
@@ -1361,9 +1374,7 @@ def run_once(
                     )
             return result
         # Require a fresh identity/balance checkpoint immediately before the sole Phase G run.
-        if is_non_subscriber_peak_window(datetime.now(UTC)):
-            result.update(status="HOLD", blocker="NON_SUBSCRIBER_PEAK_WINDOW_14_17_UTC")
-            return result
+        result["peak_window_advisory"] = is_non_subscriber_peak_window(datetime.now(UTC))
         if _read_balance(expected_email) < quote.amount:
             raise LegacyReplacementOperatorError(
                 "fresh provider free balance is below the exact quote"

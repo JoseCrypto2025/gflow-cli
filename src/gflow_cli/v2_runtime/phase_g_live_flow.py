@@ -1072,11 +1072,19 @@ class GoogleFlowAgentOnlyGenerationPort:
         except Exception:
             return
         for error in rpc_errors(body):
+            if not is_submit_response or error.rpcid != TEXT_TO_VIDEO_SUBMIT_RPC:
+                continue
+            if not error.reasons:
+                continue
+            self._submit_refusal_detected = True
+            safe_reasons = [
+                reason for reason in error.reasons if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason)
+            ]
             if "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in error.reasons:
-                self._waf_rejected = True
-                if is_submit_response:
-                    self._submit_refusal_detected = True
-                    self._submit_refusal_code = "PUBLIC_ERROR_UNUSUAL_ACTIVITY"
+                self._submit_refusal_code = "PUBLIC_ERROR_UNUSUAL_ACTIVITY"
+                self._waf_rejected = int(response.status) == 403
+            elif len(safe_reasons) == 1:
+                self._submit_refusal_code = safe_reasons[0]
         request = self._request
         if request is None:
             return
@@ -1113,6 +1121,11 @@ class GoogleFlowAgentOnlyGenerationPort:
                 remediation_hint=(
                     "Stop Phase G live testing for this task/day; do not retry or rotate profiles."
                 ),
+            )
+        if self._submit_refusal_detected:
+            raise PhaseGError(
+                "PHASE_G_PROVIDER_SUBMIT_REFUSED",
+                "Flow returned a correlated submit RPC error; submission state remains unknown",
             )
 
     async def _capture_progress(self, baseline: FlowSubmissionBaseline) -> None:

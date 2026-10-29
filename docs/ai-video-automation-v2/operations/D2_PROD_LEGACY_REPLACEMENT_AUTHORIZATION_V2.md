@@ -47,6 +47,9 @@ The authorization alone never enables Generate. Consumption atomically creates t
 replacement D2 row and permanently links it to the authorization, parent attempt, quote, and child
 jobs. Exact replay may return only that same row after digest and lineage verification. It may not
 create a new authorization, job pair, or attempt.
+The supported operator also requires fresh parent reconciliation to remain ambiguous and the
+policy/reconciliation link to match the consumed authorization, both on replay and again against
+the refreshed pre-consumption snapshot. A changed parent result or link blocks Phase G.
 
 ## Reservation and Phase G
 
@@ -88,6 +91,11 @@ digest of the raw traceback.
 The operator stops after exact local media validation. It does not upload, persist `FINAL_OUTPUT`,
 or enter D7/D8.
 
-The operator also holds a new Generate action during Google's published 14:00–17:00 UTC window
-where non-subscribers may be unable to generate. Exact same-attempt reconciliation for a persisted
-single click remains permitted during that window.
+The operator reports Google's published 14:00–17:00 UTC non-subscriber availability warning as
+an advisory; Flow decides whether a request can proceed. A correlated `YhhmEf` submit response
+with parsed reasons records sanitized refusal facts. A reason code is retained when exactly one
+safe token exists, with `PUBLIC_ERROR_UNUSUAL_ACTIVITY` retained as the WAF code whenever that
+exact reason appears. Response bodies and arbitrary reason text are never stored. This does not
+prove non-submission or authorize a retry: the exact same attempt is reconciled, and unresolved
+exposure remains reserved. Only the complete correlated WAF HTTP 403 proof contract establishes
+non-submission.

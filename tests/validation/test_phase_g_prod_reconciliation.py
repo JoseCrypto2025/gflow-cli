@@ -167,6 +167,48 @@ def test_only_correlated_provider_waf_refusal_proves_no_submission() -> None:
 
 
 @pytest.mark.parametrize(
+    "refusal_code",
+    ["TEST_ONLY_REASON_TOKEN", "PUBLIC_ERROR_UNUSUAL_ACTIVITY"],
+)
+def test_non_proof_submit_rpc_reason_stays_ambiguous_and_does_not_prove_no_charge(
+    refusal_code: str,
+) -> None:
+    identity = _identity()
+    evidence = _evidence(
+        submission_state="UNKNOWN_SUBMISSION_STATE",
+        provider_submit_request_count=1,
+        provider_submit_dispatch_window_completed=True,
+        provider_submit_project_id=identity.provider_project_id,
+        provider_submit_response_observed=True,
+        provider_submit_response_status=200,
+        provider_submit_generation_record_observed=False,
+        provider_submit_refusal_code=refusal_code,
+        provider_submit_request_failed=False,
+    )
+    attempt = _attempt(
+        identity,
+        provider_submit_rpc_observed=True,
+        provider_submit_rpc_id="YhhmEf",
+        provider_submit_http_method="POST",
+        provider_submit_observed_at="2026-10-25T12:00:30Z",
+        provider_submit_request_count=1,
+        provider_submit_dispatch_window_completed=True,
+        provider_submit_project_id=identity.provider_project_id,
+        provider_submit_response_observed=True,
+        provider_submit_response_status=200,
+        provider_submit_generation_record_observed=False,
+        provider_submit_refusal_detected=True,
+        provider_submit_refusal_code=refusal_code,
+        provider_submit_request_failed=False,
+    )
+
+    assert (
+        classify_prod_reconciliation(identity, evidence, persisted_attempt=attempt)
+        is ProdReconciliationResult.AMBIGUOUS_AFTER_RECONCILIATION
+    )
+
+
+@pytest.mark.parametrize(
     "mismatch",
     [
         {"provider_project_id": "other-project"},

@@ -232,6 +232,69 @@ def test_submit_transport_evidence_is_sanitized_and_explicit(tmp_path: Path) -> 
     assert "headers" not in attempt
 
 
+def test_correlated_submit_rpc_reason_is_allowlisted_without_terminalizing_attempt(
+    tmp_path: Path,
+) -> None:
+    request = phase_g_request(tmp_path)
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(request)
+    _capture_ledger_baseline(ledger)
+    ledger.mark_generate_action(request.d2_run_id)
+
+    attempt = ledger.record_submit_transport_evidence(
+        request.d2_run_id,
+        PhaseGSubmitTransportEvidence(
+            generate_click_dispatched=True,
+            provider_submit_rpc_observed=True,
+            provider_submit_rpc_id="YhhmEf",
+            provider_submit_observed_at="2026-10-23T00:00:00.000Z",
+            provider_submit_http_method="POST",
+            provider_submit_project_id=request.provider_project_id,
+            provider_submit_request_count=1,
+            provider_submit_dispatch_window_completed=True,
+            provider_submit_response_observed=True,
+            provider_submit_response_status=200,
+            provider_submit_generation_record_observed=False,
+            provider_submit_refusal_detected=True,
+            provider_submit_refusal_code="TEST_ONLY_REASON_TOKEN",
+            provider_submit_request_failed=False,
+        ),
+    )
+
+    assert attempt["submission_state"] == "GENERATE_ACTION_RECORDED"
+    assert attempt["provider_submit_refusal_detected"] is True
+    assert attempt["provider_submit_transport_classification"] == "SUBMIT_RESPONSE_PROVIDER_REFUSAL"
+
+
+def test_submit_rpc_reason_rejects_unstructured_provider_text(tmp_path: Path) -> None:
+    request = phase_g_request(tmp_path)
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(request)
+    _capture_ledger_baseline(ledger)
+    ledger.mark_generate_action(request.d2_run_id)
+
+    with pytest.raises(PhaseGError, match="refusal code is invalid"):
+        ledger.record_submit_transport_evidence(
+            request.d2_run_id,
+            PhaseGSubmitTransportEvidence(
+                generate_click_dispatched=True,
+                provider_submit_rpc_observed=True,
+                provider_submit_rpc_id="YhhmEf",
+                provider_submit_observed_at="2026-10-23T00:00:00.000Z",
+                provider_submit_http_method="POST",
+                provider_submit_project_id=request.provider_project_id,
+                provider_submit_request_count=1,
+                provider_submit_dispatch_window_completed=True,
+                provider_submit_response_observed=True,
+                provider_submit_response_status=200,
+                provider_submit_generation_record_observed=False,
+                provider_submit_refusal_detected=True,
+                provider_submit_refusal_code="capacity unavailable; retry later",
+                provider_submit_request_failed=False,
+            ),
+        )
+
+
 def test_late_gate_reconciles_unknown_reservation_without_claiming_provider_charge(
     tmp_path: Path,
 ) -> None:
@@ -496,6 +559,7 @@ class FakeGenerationPort:
         self.fail_restore = False
         self.prompt = ""
         self.raise_waf_on_observe = False
+        self.raise_submit_refusal = False
         self.submit_evidence = PhaseGSubmitTransportEvidence(
             generate_click_dispatched=True,
             provider_submit_rpc_observed=True,
@@ -575,6 +639,10 @@ class FakeGenerationPort:
         self, baseline: FlowSubmissionBaseline, *, observation_deadline: float
     ) -> FlowConfirmationGate | None:
         self.calls.append("gate")
+        if self.raise_submit_refusal:
+            raise PhaseGError(
+                "PHASE_G_PROVIDER_SUBMIT_REFUSED", "synthetic correlated submit RPC error"
+            )
         return self.gate
 
     async def approve_confirmation(self, confirmation_id: str) -> None:
@@ -667,6 +735,35 @@ async def test_phase_g_executes_single_approved_gate_and_restores_original_setti
     attempt = ledger.attempts()[0]
     assert attempt["approved_prompt_sha256"] == request.prompt_sha256
     assert attempt["provider_directive_sha256"] == hashlib.sha256(port.prompt.encode()).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_submit_rpc_refusal_keeps_attempt_unknown_and_budget_reserved(
+    tmp_path: Path,
+) -> None:
+    port = FakeGenerationPort()
+    port.raise_submit_refusal = True
+    port.submit_evidence = replace(
+        port.submit_evidence,
+        provider_submit_response_observed=True,
+        provider_submit_response_status=200,
+        provider_submit_generation_record_observed=False,
+        provider_submit_refusal_detected=True,
+        provider_submit_refusal_code="TEST_ONLY_REASON_TOKEN",
+    )
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    with pytest.raises(PhaseGError, match="synthetic correlated submit RPC error"):
+        await executor.execute(request)
+
+    attempt = ledger.attempts()[0]
+    assert attempt["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
+    assert attempt["generate_action_count"] == 1
+    assert attempt["approval_action_count"] == 0
+    assert attempt["provider_submit_refusal_detected"] is True
+    assert port.calls.count("generate") == 1
+    assert "approve" not in port.calls
+    assert ledger.accounted_today() == Decimal("50")
 
 
 @pytest.mark.asyncio

@@ -2760,14 +2760,12 @@ class D2DailyCreditLedger:
             raise PhaseGError(
                 "PHASE_G_SUBMIT_EVIDENCE_INVALID", "response facts require an observed response"
             )
-        if evidence.provider_submit_refusal_code not in {
-            None,
-            "PUBLIC_ERROR_UNUSUAL_ACTIVITY",
-        }:
+        refusal_code = evidence.provider_submit_refusal_code
+        if refusal_code is not None and (not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", refusal_code)):
             raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "refusal code is invalid")
-        if evidence.provider_submit_refusal_code is not None and (
+        if refusal_code is not None and (
             evidence.provider_submit_response_observed is not True
-            or evidence.provider_submit_response_status != 403
+            or evidence.provider_submit_response_status is None
             or evidence.provider_submit_refusal_detected is not True
         ):
             raise PhaseGError(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 
 import gflow_cli.v2_runtime.phase_g_live_flow as live_flow
 from gflow_cli.api.transports.batchexecute import TEXT_TO_VIDEO_SUBMIT_RPC
+from gflow_cli.errors import WafRejectionError
 from gflow_cli.v2_runtime.phase_g import FlowSubmissionBaseline, PhaseGError
 from gflow_cli.v2_runtime.phase_g_live_flow import (
     GoogleFlowAgentOnlyGenerationPort,
@@ -452,7 +454,7 @@ async def test_submit_response_generation_record_is_correlated_to_exact_request(
         ),
     )
 
-    await port._capture_response(Response())  # type: ignore[arg-type]
+    await asyncio.wait_for(port._capture_response(Response()), timeout=2)  # type: ignore[arg-type]
 
     evidence = port.read_submit_transport_evidence()
     assert evidence.provider_submit_response_observed is True
@@ -519,7 +521,53 @@ async def test_unreadable_submit_reply_remains_observation_only_and_nonretryable
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("response_status", "waf_rejected"), [(403, True), (200, False)])
 async def test_submit_waf_response_keeps_existing_refusal_signal(
+    monkeypatch: pytest.MonkeyPatch, response_status: int, waf_rejected: bool
+) -> None:
+    port = _port(None)
+    request = SimpleNamespace(url="request", method="POST")
+    port._submit_requests = [request]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+
+    class Response:
+        url = "https://flow.google.com/data/batchexecute?rpcids=YhhmEf"
+        status = response_status
+
+        def __init__(self) -> None:
+            self.request = request
+
+        async def text(self) -> str:
+            return "sanitized fixture"
+
+    monkeypatch.setattr(
+        live_flow,
+        "rpc_errors",
+        lambda _body: [
+            SimpleNamespace(
+                rpcid=TEXT_TO_VIDEO_SUBMIT_RPC,
+                reasons=("PUBLIC_ERROR_UNUSUAL_ACTIVITY",),
+            )
+        ],
+    )
+    monkeypatch.setattr(live_flow, "parse_frames", lambda _body: [])
+
+    await port._capture_response(Response())  # type: ignore[arg-type]
+
+    evidence = port.read_submit_transport_evidence()
+    assert port._waf_rejected is waf_rejected
+    assert evidence.provider_submit_refusal_detected is True
+    assert evidence.provider_submit_refusal_code == "PUBLIC_ERROR_UNUSUAL_ACTIVITY"
+    if waf_rejected:
+        with pytest.raises(WafRejectionError):
+            await asyncio.wait_for(port._raise_wire_refusal(), timeout=2)
+    else:
+        with pytest.raises(PhaseGError):
+            await asyncio.wait_for(port._raise_wire_refusal(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_submit_rpc_refusal_persists_observed_reason_and_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     port = _port(None)
@@ -535,19 +583,30 @@ async def test_submit_waf_response_keeps_existing_refusal_signal(
             self.request = request
 
         async def text(self) -> str:
-            return "sanitized fixture"
+            return "provider refusal fixture"
 
     monkeypatch.setattr(
         live_flow,
         "rpc_errors",
-        lambda _body: [SimpleNamespace(reasons=("PUBLIC_ERROR_UNUSUAL_ACTIVITY",))],
+        lambda _body: [
+            SimpleNamespace(
+                rpcid=TEXT_TO_VIDEO_SUBMIT_RPC,
+                reasons=("TEST_ONLY_REASON_TOKEN",),
+            )
+        ],
     )
     monkeypatch.setattr(live_flow, "parse_frames", lambda _body: [])
 
     await port._capture_response(Response())  # type: ignore[arg-type]
 
-    assert port._waf_rejected is True
-    assert port.read_submit_transport_evidence().provider_submit_refusal_detected is True
+    evidence = port.read_submit_transport_evidence()
+    assert evidence.provider_submit_response_observed is True
+    assert evidence.provider_submit_response_status == 200
+    assert evidence.provider_submit_refusal_detected is True
+    assert evidence.provider_submit_refusal_code == "TEST_ONLY_REASON_TOKEN"
+    with pytest.raises(PhaseGError) as refusal:
+        await asyncio.wait_for(port._raise_wire_refusal(), timeout=2)
+    assert refusal.value.code == "PHASE_G_PROVIDER_SUBMIT_REFUSED"
 
 
 def _wire_record(

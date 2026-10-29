@@ -24,9 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model-aware Standard Veo 3.1 Lite NON_ULTRA per-generation provider-cost quote,
   replacement decision gate, and V2 D2-ledger authorization consumed atomically
   with one explicit parent-linked `PREPARED` row. Its dedicated operator reserves
-  the exact quote before Phase G, gates non-subscriber Generate during Google's
-  published peak window, and stops after exact local output validation without
-  entering D7.
+  the exact quote before Phase G, reports Google's published non-subscriber peak
+  window as an availability advisory, and records sanitized facts for correlated
+  `YhhmEf` submit responses with reasons. It retains a reason code only when
+  exactly one safe token is present, except the exact
+  `PUBLIC_ERROR_UNUSUAL_ACTIVITY` reason is retained as the WAF code. Only the
+  complete correlated WAF HTTP 403 evidence proves non-submission; unresolved
+  attempts retain their reserved exposure. It stops after exact local output
+  validation without entering D7.
 
 - **Ambiguous legacy PROD quarantine policy.** Adds a terminal `QUARANTINED` state for both job
   tables, blocks orchestrator resume/recovery/generation for that state, and provides a scoped

@@ -127,6 +127,13 @@ and its internal `scripts/operations/run_legacy_replacement.py` operator. It
 binds one new Production Job, Scene Job, and D2 attempt to a current official
 credit quote, reserves the exact quote before Generate, and stops after local
 output validation without entering D7. Standard Veo 3.1 Lite uses the official
-NON_ULTRA per-generation credit rate. The operator holds fresh Generate
-execution during Google's published 14:00–17:00 UTC non-subscriber window;
-same-attempt reconciliation remains available while held.
+NON_ULTRA per-generation credit rate. Google's published 14:00–17:00 UTC
+non-subscriber availability warning is reported as an advisory; Flow decides
+whether a request can proceed. A correlated `YhhmEf` submit response with
+parsed RPC reasons records sanitized refusal facts; a reason code is retained
+only when exactly one safe token is present, except the exact
+`PUBLIC_ERROR_UNUSUAL_ACTIVITY` reason is retained as the WAF code whenever it
+appears. Response bodies are never stored. Only the complete correlated WAF
+HTTP 403 proof contract establishes non-submission; all other cases reconcile
+the same attempt without retry. See the
+[VPS browser runtime runbook](operations/VPS_BROWSER_RUNTIME.md) for operation.

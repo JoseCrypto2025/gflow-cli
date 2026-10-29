@@ -189,18 +189,27 @@ control without clicking it, and a `CLEAN` recovery journal. It recorded
 
 The internal `run_legacy_replacement.py` operator is also included in the
 deployment allowlist. Quote mode is read-only. Execute mode requires the exact
-quarantined parent, one official Standard Veo 3.1 Lite NON_ULTRA quote, a
-fresh formal decision, and a parent-linked V2 authorization. It reserves the
-exact quote before Phase G, permits one Generate click and at most one exact
-confirmation approval, then stops after same-attempt reconciliation and local
-output validation. For non-subscribers it holds fresh Generate execution during
-Google's published 14:00–17:00 UTC availability window; an already-clicked
-attempt may still be reconciled during that window. It never enters D7.
+quarantined parent and one official Standard Veo 3.1 Lite NON_ULTRA quote. A
+new authorization requires a fresh formal decision; exact replay validates the
+persisted decision digest and lineage, then rechecks fresh parent evidence and
+the same policy/reconciliation link. It reserves the exact quote before Phase
+G, permits one Generate click and at most one exact confirmation approval, then
+stops after same-attempt reconciliation and local output validation. For
+non-subscribers it reports Google's published
+14:00–17:00 UTC availability warning as an advisory; Flow decides whether the
+request can proceed. A correlated `YhhmEf` submit response with parsed RPC
+reasons records sanitized refusal facts; a reason code is retained only when
+exactly one safe token is present, except the exact
+`PUBLIC_ERROR_UNUSUAL_ACTIVITY` reason is retained as the WAF code whenever it
+appears. Response bodies are never stored. The same attempt is reconciled
+without retry. Only the complete correlated WAF HTTP 403 proof contract proves
+non-submission. It never enters D7.
 
 Run it from the deployed application source path with the existing V2 roots,
 Google Workspace credential, and `gflow-prod` profile. Omit `--execute` for a
 quote-only read. Add `--execute` only for the exact approved one-shot lifecycle;
-the operator itself holds new Generate actions during the published peak window.
+the operator reports the published peak window in `peak_window_advisory` and
+leaves request availability to Flow.
 
 ```sh
 cd /opt/gflow-v2
@@ -219,8 +228,10 @@ PYTHONUTF8=1 xvfb-run -a python scripts/operations/run_legacy_replacement.py \
 ```
 
 For the authorized execution, append `--execute` after confirming the latest
-quote and wait until after 17:00 UTC for this non-subscriber account. Never
-invoke the operator with another parent or account identity.
+quote. A peak-window refusal remains an unknown submission state unless the
+correlated WAF HTTP 403 evidence meets the existing proof contract; reconcile
+the same attempt and never retry it. Never invoke the operator with another
+parent or account identity.
 
 ## D7 transaction coordinator — backend integration (offline-tested)
 

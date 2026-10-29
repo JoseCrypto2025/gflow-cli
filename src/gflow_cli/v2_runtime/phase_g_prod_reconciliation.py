@@ -112,8 +112,14 @@ class ProdReconciliationEvidence:
             and type(self.provider_submit_request_failed) is not bool
         ):
             raise ValueError("provider request failure flag is invalid")
-        if self.provider_submit_refusal_code not in {None, "PUBLIC_ERROR_UNUSUAL_ACTIVITY"}:
+        refusal_code = self.provider_submit_refusal_code
+        if refusal_code is not None and (not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", refusal_code)):
             raise ValueError("provider refusal code is invalid")
+        if refusal_code is not None and (
+            not self.provider_submit_response_observed
+            or self.provider_submit_response_status is None
+        ):
+            raise ValueError("provider refusal code requires an observed response")
 
     def digest(self) -> str:
         value = asdict(self)
