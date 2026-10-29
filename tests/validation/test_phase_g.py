@@ -1225,12 +1225,13 @@ def test_test_session_migrates_v1_without_changing_historical_attempts(tmp_path:
     _open_test_budget_session(ledger)
 
     migrated = json.loads(ledger.path.read_text(encoding="utf-8"))
-    assert migrated["schema_version"] == 3
+    assert migrated["schema_version"] == 4
     assert migrated["daily_budget"] == 50
     assert migrated["attempts"] == before
     assert migrated["attempts"][0]["accounted_credit_cost"] == "50"
     assert len(migrated["test_sessions"]) == 1
     assert migrated["legacy_replacement_authorizations"] == []
+    assert migrated["legacy_job_linkage_repairs"] == []
 
 
 def test_test_session_migrates_schema_two_without_changing_existing_rows(tmp_path: Path) -> None:
@@ -1247,10 +1248,11 @@ def test_test_session_migrates_schema_two_without_changing_existing_rows(tmp_pat
     ledger._mutate(lambda payload: payload)  # noqa: SLF001
     migrated = json.loads(ledger.path.read_text(encoding="utf-8"))
 
-    assert migrated["schema_version"] == 3
+    assert migrated["schema_version"] == 4
     assert migrated["attempts"] == old["attempts"]
     assert migrated["test_sessions"] == old["test_sessions"]
     assert migrated["legacy_replacement_authorizations"] == []
+    assert migrated["legacy_job_linkage_repairs"] == []
 
 
 def test_test_session_authorizes_exact_lane_over_historical_daily_reservation(

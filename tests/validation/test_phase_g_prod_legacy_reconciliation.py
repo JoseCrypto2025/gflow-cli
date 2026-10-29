@@ -9,10 +9,19 @@ from pathlib import Path
 
 import pytest
 
+from gflow_cli.v2_runtime.ambiguous_legacy_recovery_policy import (
+    append_policy_event,
+    build_policy_record,
+    find_policy_event,
+)
 from gflow_cli.v2_runtime.google_sheets import (
     APPROVED_SPREADSHEET_ID,
     SOURCE_LIVE_GOOGLE_SHEETS,
     GoogleSheetsSnapshot,
+)
+from gflow_cli.v2_runtime.phase_g_prod_legacy_job_linkage import (
+    LegacyJobLinkageProofError,
+    build_legacy_job_linkage_repair_proof,
 )
 from gflow_cli.v2_runtime.phase_g_prod_legacy_reconciliation import (
     LEGACY_PROD_CONTRACT_VERSION,
@@ -197,6 +206,156 @@ def _write_operator_ledgers(runtime_root, sources: LegacyProdAttemptSources) -> 
         encoding="utf-8",
     )
     return d2_path, credit_path
+
+
+def _linkage_proof_fixture(tmp_path: Path, *, repair_target: bool = False):
+    sources = _sources()
+    scene_job_id = "SJB_000001" if repair_target else _SCENE_JOB_ID
+    production_job_id = "PRD_000001" if repair_target else _PRODUCTION_JOB_ID
+    d2_run_id = (
+        "D2_" + hashlib.sha256(f"PRODUCTION_SCENE_D2_V1:{scene_job_id}:1".encode()).hexdigest()[:32]
+        if repair_target
+        else _D2_RUN_ID
+    )
+    if repair_target:
+        assert d2_run_id == "D2_13c62112d9881710019049d95cb6da57"
+    production = {
+        **dict(sources.production_jobs[0]),
+        "Production_Job_ID": production_job_id,
+        "Execution_Environment": "PROD",
+        "Job_Status": "QUARANTINED",
+        "Requested_At": "2026-10-25T11:04:31.854681Z",
+        "Created_At": "2026-10-25T11:04:31.854681Z",
+    }
+    scene_job = {
+        **dict(sources.scene_jobs[0]),
+        "Scene_Job_ID": scene_job_id,
+        "Production_Job_ID": production_job_id,
+        "Job_Status": "QUARANTINED",
+        "Created_At": "2026-10-25T11:04:31.854681Z",
+        "Started_At": "2026-10-25T11:04:34Z",
+    }
+    attempt = {
+        **dict(sources.d2_attempts[0]),
+        "d2_run_id": d2_run_id,
+        "started_at": "2026-10-25T11:04:53Z",
+        "updated_at": "2026-10-25T11:05:09Z",
+    }
+    reservation = {
+        **dict(sources.credit_reservations[0]),
+        "attempt_id": d2_run_id,
+        "generate_click_count": 1,
+    }
+    sources = sources.with_rows("production_jobs", (production,))
+    sources = sources.with_rows("scene_jobs", (scene_job,))
+    sources = sources.with_rows("d2_attempts", (attempt,))
+    sources = sources.with_rows("credit_reservations", (reservation,))
+    reconciliation = reconcile_legacy_prod_same_attempt(
+        sources,
+        d2_run_id,
+        observed_at=_OBSERVED_AT,
+        software_commit="a" * 40,
+    ).audit_event
+    policy = build_policy_record(
+        attempt_id=d2_run_id,
+        production_job_id=production_job_id,
+        scene_job_id=scene_job_id,
+        reservation_id=d2_run_id,
+        reconciliation_audit_sha256=str(reconciliation["event_sha256"]),
+        observed_at=_OBSERVED_AT,
+    )
+    policy_path = tmp_path / "ambiguous-legacy-recovery-policy-audit.json"
+    append_policy_event(policy_path, event_type="POLICY_APPLIED", policy=policy)
+    policy_event = find_policy_event(
+        policy_path,
+        event_type="POLICY_APPLIED",
+        policy_id=str(policy["policy_id"]),
+    )
+    assert policy_event is not None
+    return sources, policy_event, reconciliation
+
+
+def test_linkage_proof_requires_unique_correlated_rows_and_prior_audits(tmp_path: Path) -> None:
+    sources, policy_event, reconciliation = _linkage_proof_fixture(tmp_path)
+
+    proof = build_legacy_job_linkage_repair_proof(
+        sources,
+        attempt_id=_D2_RUN_ID,
+        production_job_id=_PRODUCTION_JOB_ID,
+        scene_job_id=_SCENE_JOB_ID,
+        policy_event=policy_event,
+        reconciliation_event=reconciliation,
+        verified_at=_OBSERVED_AT,
+        software_commit="a" * 40,
+    )
+
+    assert proof["linkage_confidence"] == "PROVEN"
+    assert proof["unique_match_counts"] == {
+        "d2_attempt": 1,
+        "production_job": 1,
+        "scene_job": 1,
+        "credit_reservation": 1,
+    }
+    assert all(proof["correlations"].values())
+
+
+def test_linkage_proof_rejects_duplicate_scene_job_candidate(tmp_path: Path) -> None:
+    sources, policy_event, reconciliation = _linkage_proof_fixture(tmp_path)
+    sources = sources.with_rows("scene_jobs", (*sources.scene_jobs, dict(sources.scene_jobs[0])))
+
+    with pytest.raises(LegacyJobLinkageProofError, match="not unique") as error:
+        build_legacy_job_linkage_repair_proof(
+            sources,
+            attempt_id=_D2_RUN_ID,
+            production_job_id=_PRODUCTION_JOB_ID,
+            scene_job_id=_SCENE_JOB_ID,
+            policy_event=policy_event,
+            reconciliation_event=reconciliation,
+            verified_at=_OBSERVED_AT,
+            software_commit="a" * 40,
+        )
+
+    assert error.value.code == "AMBIGUOUS"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changes"),
+    [
+        ("scene_prompt_versions", {"Prompt_SHA256": "f" * 64}),
+        (
+            "generation_profiles",
+            {"Provider_Account_ID": "PVA_9999"},
+        ),
+        (
+            "provider_accounts",
+            {"Provider_Project_ID": "00000000-0000-4000-8000-000000000099"},
+        ),
+        ("production_jobs", {"Execution_Environment": "TEST"}),
+    ],
+)
+def test_linkage_proof_rejects_authoritative_source_mismatch(
+    tmp_path: Path,
+    field_name: str,
+    changes: dict[str, object],
+) -> None:
+    sources, policy_event, reconciliation = _linkage_proof_fixture(tmp_path)
+    rows = list(getattr(sources, field_name))
+    rows[0] = {**dict(rows[0]), **changes}
+    sources = sources.with_rows(field_name, tuple(rows))
+
+    with pytest.raises(LegacyJobLinkageProofError) as error:
+        build_legacy_job_linkage_repair_proof(
+            sources,
+            attempt_id=_D2_RUN_ID,
+            production_job_id=_PRODUCTION_JOB_ID,
+            scene_job_id=_SCENE_JOB_ID,
+            policy_event=policy_event,
+            reconciliation_event=reconciliation,
+            verified_at=_OBSERVED_AT,
+            software_commit="a" * 40,
+        )
+
+    assert error.value.code == "CONFLICTING"
 
 
 def test_supported_operator_builds_sources_and_classifies_without_report_or_mutation(

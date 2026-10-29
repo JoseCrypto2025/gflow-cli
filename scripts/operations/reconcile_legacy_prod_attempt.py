@@ -112,7 +112,27 @@ def _read_ledger(path: Path, *, kind: str) -> tuple[tuple[Mapping[str, object], 
                 for row in cast(list[object], payload["legacy_replacement_authorizations"])
             )
         )
-        if not (valid_v1 or valid_v2 or valid_v3) or payload.get("daily_budget") != 50:
+        valid_v4 = (
+            schema_version == 4
+            and set(payload)
+            == {
+                "schema_version",
+                "daily_budget",
+                "attempts",
+                "test_sessions",
+                "legacy_replacement_authorizations",
+                "legacy_job_linkage_repairs",
+            }
+            and isinstance(payload.get("test_sessions"), list)
+            and isinstance(payload.get("legacy_replacement_authorizations"), list)
+            and isinstance(payload.get("legacy_job_linkage_repairs"), list)
+            and all(
+                isinstance(row, dict)
+                for key in ("legacy_replacement_authorizations", "legacy_job_linkage_repairs")
+                for row in cast(list[object], payload[key])
+            )
+        )
+        if not (valid_v1 or valid_v2 or valid_v3 or valid_v4) or payload.get("daily_budget") != 50:
             raise LegacyProdOperatorError("D2 ledger version or budget is invalid")
     if kind == "CREDIT" and payload.get("schema_version") != 1:
         raise LegacyProdOperatorError("shared credit ledger version is invalid")

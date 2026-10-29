@@ -42,6 +42,10 @@ and leaves source rows untouched. Missing provider evidence remains ambiguous an
 assessment. Use `scripts/operations/reconcile_legacy_prod_attempt.py --d2-run-id <exact-id>` for
 the supported legacy classification path. It loads fresh canonical sources and does not release a
 reservation; `--persist-audit` is an explicit separate-audit option.
+For the separately versioned, exact-target compatibility repair of missing legacy parent job
+fields, see [`D2_PROD_LEGACY_JOB_LINKAGE_REPAIR_V1.md`](D2_PROD_LEGACY_JOB_LINKAGE_REPAIR_V1.md).
+The repair records canonical linkage only; it does not supply provider evidence or authorize a
+replacement attempt.
 
 Example invocation after the operator has independently verified current
 identity:

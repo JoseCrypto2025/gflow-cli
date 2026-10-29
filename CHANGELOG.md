@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Proof-bound legacy PROD job-linkage repair.** Adds a separate V1 repair contract and an
+  exact-target operator that requires unique canonical D2/Scene Job/Production Job/reservation
+  joins plus the durable policy and reconciliation audits. The D2 ledger migrates to schema v4
+  with an atomic, idempotent repair audit; legacy V1 reconciliation stays read-only and keeps
+  `DERIVED_CANONICAL_JOIN` provenance.
+
 - **Legacy PROD replacement quote and one-time authorization.** Adds a read-only
   model-aware Standard Veo 3.1 Lite NON_ULTRA per-generation provider-cost quote,
   replacement decision gate, and V2 D2-ledger authorization consumed atomically

@@ -108,6 +108,10 @@ class LegacyReplacementOperatorError(ValueError):
     """Safe, fail-closed precondition failure from this one-shot operator."""
 
 
+class LegacyParentJobLinkageError(LegacyReplacementOperatorError):
+    """The legacy parent does not have both persisted canonical job IDs."""
+
+
 def is_non_subscriber_peak_window(now: datetime) -> bool:
     """Google warns non-subscribers may be unable to generate videos from 14–17 UTC."""
     if now.tzinfo is None or now.utcoffset() is None:
@@ -121,6 +125,20 @@ def _unique(rows: list[dict[str, object]], key: str, value: str, label: str) -> 
     if len(matches) != 1:
         raise LegacyReplacementOperatorError(f"{label} must resolve exactly once")
     return matches[0]
+
+
+def _require_parent_job_linkage(attempt: Mapping[str, object]) -> tuple[str, str]:
+    """Require both persisted linkage fields before authorizing any replacement work."""
+    production_job_id = attempt.get("production_job_id")
+    scene_job_id = attempt.get("scene_job_id")
+    if (
+        not isinstance(production_job_id, str)
+        or not re.fullmatch(r"PRD_[0-9]{6}", production_job_id)
+        or not isinstance(scene_job_id, str)
+        or not re.fullmatch(r"SJB_[0-9]{6}", scene_job_id)
+    ):
+        raise LegacyParentJobLinkageError("legacy D2 parent job linkage is incomplete")
+    return production_job_id, scene_job_id
 
 
 def _snapshot_tables(snapshot: GoogleSheetsSnapshot) -> dict[str, list[dict[str, object]]]:
@@ -636,10 +654,7 @@ def run_once(
         if len(parent_attempts) != 1:
             raise LegacyReplacementOperatorError("legacy D2 parent must resolve exactly once")
         parent_d2 = parent_attempts[0]
-        parent_prod_id = str(parent_d2.get("production_job_id", ""))
-        parent_scene_id = str(parent_d2.get("scene_job_id", ""))
-        if not parent_prod_id or not parent_scene_id:
-            raise LegacyReplacementOperatorError("legacy D2 parent job linkage is incomplete")
+        parent_prod_id, parent_scene_id = _require_parent_job_linkage(parent_d2)
         parent_production, parent_scene_job = _assert_parent_quarantined(
             tables, parent_prod_id, parent_scene_id
         )
@@ -1070,7 +1085,9 @@ def run_once(
                 )
                 observed_after = _attempt(d2_ledger, attempt_id)
                 if observed_after is None:
-                    raise LegacyReplacementOperatorError("replacement D2 evidence disappeared")
+                    raise LegacyReplacementOperatorError(
+                        "replacement D2 evidence disappeared"
+                    ) from None
                 reservation = _replacement_reservation(
                     runtime_root, attempt_id, authorization_id, quote.amount
                 )
@@ -1221,7 +1238,10 @@ def main() -> int:
         failure_class = type(exc).__name__
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", failure_class):
             failure_class = "LegacyReplacementOperatorError"
-        print(json.dumps({"status": "HOLD", "failure_class": failure_class}, sort_keys=True))
+        report: dict[str, str] = {"status": "HOLD", "failure_class": failure_class}
+        if isinstance(exc, LegacyParentJobLinkageError):
+            report["failed_gate"] = "LEGACY_PARENT_JOB_LINKAGE_INCOMPLETE"
+        print(json.dumps(report, sort_keys=True))
         return 2
     print(json.dumps(result, sort_keys=True))
     return (

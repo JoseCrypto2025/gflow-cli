@@ -38,7 +38,52 @@ _RUN_ID_RE = re.compile(r"^(?:D2|D6)_[A-Za-z0-9_-]{8,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _D6_RELEASE_CONTRACT_VERSION = 1
-_LEDGER_SCHEMA = 3
+_LEDGER_SCHEMA = 4
+_LEGACY_LINKAGE_REPAIR_CONTRACT = "D2_PROD_LEGACY_JOB_LINKAGE_REPAIR_V1"
+_LEGACY_LINKAGE_REPAIR_TARGET = (
+    "D2_13c62112d9881710019049d95cb6da57",
+    "PRD_000001",
+    "SJB_000001",
+)
+_LEGACY_LINKAGE_CORRELATIONS = frozenset(
+    {
+        "SCENE_ID_MATCH",
+        "PROMPT_ID_MATCH",
+        "PROMPT_HASH_MATCH",
+        "GENERATION_PROFILE_MATCH",
+        "PROVIDER_ACCOUNT_MATCH",
+        "FLOW_PROJECT_MATCH",
+        "ENVIRONMENT_MATCH",
+        "RESERVATION_LINK_MATCH",
+        "TIMESTAMP_COMPATIBLE",
+        "POLICY_AUDIT_MATCH",
+        "RECONCILIATION_AUDIT_MATCH",
+    }
+)
+_LEGACY_LINKAGE_SNAPSHOT_SOURCES = frozenset(
+    {
+        "D2_LEDGER",
+        "CREDIT_LEDGER",
+        "PRODUCTION_JOBS",
+        "SCENE_JOBS",
+        "SCENES",
+        "SCENE_PROMPT_VERSION",
+        "GENERATION_PROFILE_MASTER",
+        "PROVIDER_ACCOUNT_MASTER",
+    }
+)
+_LEGACY_LINKAGE_RELEVANT_SOURCES = frozenset(
+    {
+        "D2_ATTEMPT",
+        "CREDIT_RESERVATION",
+        "PRODUCTION_JOB",
+        "SCENE_JOB",
+        "SCENE",
+        "PROMPT_VERSION",
+        "GENERATION_PROFILE",
+        "PROVIDER_ACCOUNT",
+    }
+)
 _TEST_SESSION_CONTRACT = "D2_TEST_SESSION_BUDGET_V1"
 _TEST_SESSION_CREDIT_LIMIT = Decimal("40")
 _TEST_SESSION_MAX_ATTEMPTS = 40
@@ -1211,6 +1256,279 @@ class D2DailyCreditLedger:
         return self._mutate(
             lambda payload: self._create(payload, request, retry_authorization=authorization)
         )
+
+    def repair_legacy_job_linkage(self, proof: Mapping[str, object]) -> dict[str, object]:
+        """Apply one proof-bound repair to the two legacy parent-job linkage fields."""
+        required = {
+            "contract_version",
+            "linkage_confidence",
+            "attempt_id",
+            "production_job_id",
+            "scene_job_id",
+            "unique_match_counts",
+            "correlations",
+            "source_snapshot_sha256",
+            "source_snapshot_observed_at",
+            "relevant_source_sha256",
+            "policy_audit_sha256",
+            "reconciliation_audit_sha256",
+            "target_attempt_sha256",
+            "verified_at",
+            "software_commit",
+        }
+        record = dict(proof)
+        if set(record) != required:
+            raise PhaseGError(
+                "PHASE_G_LEGACY_LINKAGE_REPAIR_PROOF_INVALID",
+                "legacy linkage repair proof fields are invalid",
+            )
+        attempt_id = record.get("attempt_id")
+        production_job_id = record.get("production_job_id")
+        scene_job_id = record.get("scene_job_id")
+        counts = record.get("unique_match_counts")
+        counts_value = cast(dict[str, object], counts) if isinstance(counts, dict) else {}
+        if isinstance(counts, dict) and any(
+            isinstance(value, bool) or value != 1 for value in counts_value.values()
+        ):
+            raise PhaseGError(
+                "PHASE_G_LEGACY_LINKAGE_REPAIR_AMBIGUOUS",
+                "legacy linkage candidates are ambiguous and do not resolve uniquely",
+            )
+        if (
+            record.get("contract_version") != _LEGACY_LINKAGE_REPAIR_CONTRACT
+            or record.get("linkage_confidence") != "PROVEN"
+            or not isinstance(attempt_id, str)
+            or not _RUN_ID_RE.fullmatch(attempt_id)
+            or attempt_id != _LEGACY_LINKAGE_REPAIR_TARGET[0]
+            or not isinstance(production_job_id, str)
+            or production_job_id != _LEGACY_LINKAGE_REPAIR_TARGET[1]
+            or not isinstance(scene_job_id, str)
+            or scene_job_id != _LEGACY_LINKAGE_REPAIR_TARGET[2]
+            or not self._valid_legacy_linkage_proof_maps(record)
+            or not _SHA256_RE.fullmatch(str(record.get("policy_audit_sha256", "")))
+            or not _SHA256_RE.fullmatch(str(record.get("reconciliation_audit_sha256", "")))
+            or not _SHA256_RE.fullmatch(str(record.get("target_attempt_sha256", "")))
+            or not re.fullmatch(r"[0-9a-f]{40,64}", str(record.get("software_commit", "")))
+        ):
+            raise PhaseGError(
+                "PHASE_G_LEGACY_LINKAGE_REPAIR_PROOF_INVALID",
+                "legacy linkage repair proof identity or evidence is invalid",
+            )
+        try:
+            verified_at = datetime.fromisoformat(str(record["verified_at"]).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PhaseGError(
+                "PHASE_G_LEGACY_LINKAGE_REPAIR_PROOF_INVALID",
+                "legacy linkage repair proof timestamp is invalid",
+            ) from exc
+        if verified_at.tzinfo is None or verified_at.utcoffset() is None:
+            raise PhaseGError(
+                "PHASE_G_LEGACY_LINKAGE_REPAIR_PROOF_INVALID",
+                "legacy linkage repair proof timestamp must be timezone-aware",
+            )
+
+        correlations = cast(dict[str, object], record["correlations"])
+        unique_counts = cast(dict[str, object], record["unique_match_counts"])
+        source_snapshots = cast(dict[str, object], record["source_snapshot_sha256"])
+        relevant_sources = cast(dict[str, object], record["relevant_source_sha256"])
+        proof_sha256 = self._legacy_job_linkage_proof_digest(
+            {
+                "contract_version": _LEGACY_LINKAGE_REPAIR_CONTRACT,
+                "attempt_id": attempt_id,
+                "production_job_id": production_job_id,
+                "scene_job_id": scene_job_id,
+                "unique_match_counts": unique_counts,
+                "correlations": correlations,
+                "relevant_source_sha256": relevant_sources,
+                "policy_audit_sha256": record["policy_audit_sha256"],
+                "reconciliation_audit_sha256": record["reconciliation_audit_sha256"],
+            }
+        )
+        repair_id = f"LJR_{proof_sha256[:24].upper()}"
+
+        with self._locked_file():
+            payload = self._read()
+            attempts = cast(list[dict[str, object]], payload["attempts"])
+            attempt_rows = [row for row in attempts if row.get("d2_run_id") == attempt_id]
+            if len(attempt_rows) != 1:
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_LINKAGE_REPAIR_ATTEMPT_INVALID",
+                    "exact legacy D2 attempt must resolve once",
+                )
+            attempt = attempt_rows[0]
+            audits = cast(list[dict[str, object]], payload["legacy_job_linkage_repairs"])
+            audit_matches = [row for row in audits if row.get("attempt_id") == attempt_id]
+            if len(audit_matches) > 1:
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_LINKAGE_REPAIR_AUDIT_CONFLICT",
+                    "legacy linkage repair audit is duplicated",
+                )
+            if audit_matches:
+                prior = audit_matches[0]
+                prior_hash = prior.get("audit_sha256")
+                expected_hash = self._legacy_job_linkage_record_digest(prior)
+                if (
+                    prior.get("contract_version") != _LEGACY_LINKAGE_REPAIR_CONTRACT
+                    or prior.get("linkage_audit_id") != repair_id
+                    or prior.get("proof_sha256") != proof_sha256
+                    or prior_hash != expected_hash
+                    or attempt.get("production_job_id") != production_job_id
+                    or attempt.get("scene_job_id") != scene_job_id
+                    or prior.get("after_attempt_sha256")
+                    != self._legacy_job_linkage_row_digest(attempt)
+                ):
+                    raise PhaseGError(
+                        "PHASE_G_LEGACY_LINKAGE_REPAIR_AUDIT_CONFLICT",
+                        "existing legacy linkage repair conflicts with the proven replay",
+                    )
+                return dict(prior)
+
+            source_hashes = cast(dict[str, object], record["source_snapshot_sha256"])
+            current_d2_hash = hashlib.sha256(self.path.read_bytes()).hexdigest()
+            if current_d2_hash != source_hashes["D2_LEDGER"]:
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_LINKAGE_REPAIR_STALE",
+                    "D2 ledger changed after canonical proof capture",
+                )
+
+            for field, expected_value in (
+                ("production_job_id", production_job_id),
+                ("scene_job_id", scene_job_id),
+            ):
+                if attempt.get(field) not in (None, "", expected_value):
+                    raise PhaseGError(
+                        "PHASE_G_LEGACY_LINKAGE_REPAIR_CONFLICT",
+                        "existing legacy parent job linkage conflicts with proof",
+                    )
+            before_hash = self._legacy_job_linkage_row_digest(attempt)
+            target_identity = {
+                key: value
+                for key, value in attempt.items()
+                if key not in {"production_job_id", "scene_job_id"}
+            }
+            if (
+                self._legacy_job_linkage_row_digest(target_identity)
+                != record["target_attempt_sha256"]
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEGACY_LINKAGE_REPAIR_STALE",
+                    "legacy linkage repair proof is stale for the target attempt",
+                )
+            before_production = {
+                "present": "production_job_id" in attempt,
+                "value": attempt.get("production_job_id"),
+            }
+            before_scene = {
+                "present": "scene_job_id" in attempt,
+                "value": attempt.get("scene_job_id"),
+            }
+            attempt["production_job_id"] = production_job_id
+            attempt["scene_job_id"] = scene_job_id
+            after_hash = self._legacy_job_linkage_row_digest(attempt)
+            audit: dict[str, object] = {
+                "contract_version": _LEGACY_LINKAGE_REPAIR_CONTRACT,
+                "linkage_audit_id": repair_id,
+                "attempt_id": attempt_id,
+                "production_job_id": production_job_id,
+                "scene_job_id": scene_job_id,
+                "provenance_class": "DERIVED_CANONICAL_JOIN",
+                "before_production_job_id": before_production,
+                "after_production_job_id": production_job_id,
+                "before_scene_job_id": before_scene,
+                "after_scene_job_id": scene_job_id,
+                "before_attempt_sha256": before_hash,
+                "after_attempt_sha256": after_hash,
+                "proof_sha256": proof_sha256,
+                "correlations": correlations,
+                "unique_match_counts": unique_counts,
+                "source_snapshot_sha256": source_snapshots,
+                "source_snapshot_observed_at": record["source_snapshot_observed_at"],
+                "relevant_source_sha256": relevant_sources,
+                "policy_audit_sha256": record["policy_audit_sha256"],
+                "reconciliation_audit_sha256": record["reconciliation_audit_sha256"],
+                "verified_at": record["verified_at"],
+                "software_commit": record["software_commit"],
+                "previous_audit_sha256": (str(audits[-1]["audit_sha256"]) if audits else "0" * 64),
+            }
+            audit["audit_sha256"] = self._legacy_job_linkage_record_digest(audit)
+            audits.append(audit)
+            self._write(payload)
+            return dict(audit)
+
+    @staticmethod
+    def _valid_legacy_linkage_proof_maps(proof: Mapping[str, object]) -> bool:
+        counts = proof.get("unique_match_counts")
+        correlations = proof.get("correlations")
+        source_hashes = proof.get("source_snapshot_sha256")
+        source_times = proof.get("source_snapshot_observed_at")
+        relevant_hashes = proof.get("relevant_source_sha256")
+        if not all(
+            isinstance(value, dict)
+            for value in (counts, correlations, source_hashes, source_times, relevant_hashes)
+        ):
+            return False
+        counts_value = cast(dict[str, object], counts)
+        if set(counts_value) != {"d2_attempt", "production_job", "scene_job", "credit_reservation"}:
+            return False
+        if any(isinstance(value, bool) or value != 1 for value in counts_value.values()):
+            return False
+        correlations_value = cast(dict[str, object], correlations)
+        if frozenset(correlations_value) != _LEGACY_LINKAGE_CORRELATIONS or any(
+            value is not True for value in correlations_value.values()
+        ):
+            return False
+        source_hashes_value = cast(dict[str, object], source_hashes)
+        source_times_value = cast(dict[str, object], source_times)
+        relevant_hashes_value = cast(dict[str, object], relevant_hashes)
+        if (
+            frozenset(source_hashes_value) != _LEGACY_LINKAGE_SNAPSHOT_SOURCES
+            or frozenset(source_times_value) != _LEGACY_LINKAGE_SNAPSHOT_SOURCES
+            or frozenset(relevant_hashes_value) != _LEGACY_LINKAGE_RELEVANT_SOURCES
+            or any(
+                not isinstance(value, str) or not _SHA256_RE.fullmatch(value)
+                for value in source_hashes_value.values()
+            )
+            or any(
+                not isinstance(value, str) or not _SHA256_RE.fullmatch(value)
+                for value in relevant_hashes_value.values()
+            )
+        ):
+            return False
+        try:
+            for value in source_times_value.values():
+                timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                    return False
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _legacy_job_linkage_proof_digest(proof: Mapping[str, object]) -> str:
+        encoded = json.dumps(
+            proof,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _legacy_job_linkage_record_digest(record: Mapping[str, object]) -> str:
+        immutable = {key: value for key, value in record.items() if key != "audit_sha256"}
+        return D2DailyCreditLedger._legacy_job_linkage_row_digest(immutable)
+
+    @staticmethod
+    def _legacy_job_linkage_row_digest(record: Mapping[str, object]) -> str:
+        encoded = json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def get_legacy_replacement_authorization(self, authorization_id: str) -> dict[str, object]:
         """Read one exact authorization under the ledger lock for external audit revalidation."""
@@ -4321,6 +4639,7 @@ class D2DailyCreditLedger:
                 "attempts": [],
                 "test_sessions": [],
                 "legacy_replacement_authorizations": [],
+                "legacy_job_linkage_repairs": [],
             }
         if self.path.is_symlink():
             raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "ledger may not be a symlink")
@@ -4349,6 +4668,7 @@ class D2DailyCreditLedger:
                 "attempts": payload["attempts"],
                 "test_sessions": [],
                 "legacy_replacement_authorizations": [],
+                "legacy_job_linkage_repairs": [],
             }
         v2_keys = {"schema_version", "daily_budget", "attempts", "test_sessions"}
         v3_keys = v2_keys | {"legacy_replacement_authorizations"}
@@ -4367,8 +4687,32 @@ class D2DailyCreditLedger:
                 "attempts": payload["attempts"],
                 "test_sessions": payload["test_sessions"],
                 "legacy_replacement_authorizations": [],
+                "legacy_job_linkage_repairs": [],
             }
-        if set(payload) != v3_keys:
+        if schema_version == 3 and set(payload) == v3_keys:
+            if (
+                payload.get("daily_budget") != self.daily_budget
+                or not isinstance(payload.get("attempts"), list)
+                or not isinstance(payload.get("test_sessions"), list)
+                or not isinstance(payload.get("legacy_replacement_authorizations"), list)
+                or any(
+                    not isinstance(row, dict)
+                    for row in cast(list[object], payload["legacy_replacement_authorizations"])
+                )
+            ):
+                raise PhaseGError(
+                    "PHASE_G_LEDGER_CORRUPT", "legacy D2 credit ledger version or budget is invalid"
+                )
+            return {
+                "schema_version": _LEDGER_SCHEMA,
+                "daily_budget": self.daily_budget,
+                "attempts": payload["attempts"],
+                "test_sessions": payload["test_sessions"],
+                "legacy_replacement_authorizations": payload["legacy_replacement_authorizations"],
+                "legacy_job_linkage_repairs": [],
+            }
+        v4_keys = v3_keys | {"legacy_job_linkage_repairs"}
+        if set(payload) != v4_keys:
             raise PhaseGError("PHASE_G_LEDGER_CORRUPT", "D2 credit ledger has an invalid shape")
         if (
             schema_version != _LEDGER_SCHEMA
@@ -4376,15 +4720,37 @@ class D2DailyCreditLedger:
             or not isinstance(payload["attempts"], list)
             or not isinstance(payload["test_sessions"], list)
             or not isinstance(payload["legacy_replacement_authorizations"], list)
+            or not isinstance(payload["legacy_job_linkage_repairs"], list)
             or any(
                 not isinstance(row, dict)
-                for row in cast(list[object], payload["legacy_replacement_authorizations"])
+                for key in ("legacy_replacement_authorizations", "legacy_job_linkage_repairs")
+                for row in cast(list[object], payload[key])
             )
         ):
             raise PhaseGError(
                 "PHASE_G_LEDGER_CORRUPT", "D2 credit ledger version or budget is invalid"
             )
+        if not self._valid_legacy_job_linkage_audit_chain(
+            cast(list[dict[str, object]], payload["legacy_job_linkage_repairs"])
+        ):
+            raise PhaseGError(
+                "PHASE_G_LEDGER_CORRUPT", "legacy job-linkage repair audit chain is invalid"
+            )
         return payload
+
+    def _valid_legacy_job_linkage_audit_chain(self, audits: list[dict[str, object]]) -> bool:
+        previous = "0" * 64
+        for audit in audits:
+            digest = audit.get("audit_sha256")
+            if (
+                audit.get("previous_audit_sha256") != previous
+                or not isinstance(digest, str)
+                or not _SHA256_RE.fullmatch(digest)
+                or digest != self._legacy_job_linkage_record_digest(audit)
+            ):
+                return False
+            previous = digest
+        return True
 
     def _write(self, payload: dict[str, object]) -> None:
         try:

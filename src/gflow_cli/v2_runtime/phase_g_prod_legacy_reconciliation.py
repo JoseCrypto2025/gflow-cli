@@ -208,7 +208,7 @@ def build_legacy_prod_attempt_envelope(
     else:
         attempt = dict(d2_rows[0])
 
-    scene_candidates = [row for row in sources.scene_jobs if _scene_job_run_id(row) == d2_run_id]
+    scene_candidates = [row for row in sources.scene_jobs if scene_job_run_id(row) == d2_run_id]
     if len(scene_candidates) != 1:
         reasons.append("SCENE_JOB_ATTEMPT_LINK_MISSING_OR_DUPLICATE")
         scene_job: Mapping[str, object] = {}
@@ -982,7 +982,7 @@ def _modern_view(envelope: LegacyProdAttemptEnvelope) -> dict[str, object]:
     return attempt
 
 
-def _scene_job_run_id(row: Mapping[str, object]) -> str | None:
+def scene_job_run_id(row: Mapping[str, object]) -> str | None:
     scene_job_id = _nonempty(row.get("Scene_Job_ID"))
     attempt_no = row.get("Attempt_No")
     if not re.fullmatch(r"SJB_[0-9]{6}", scene_job_id):

@@ -220,6 +220,17 @@ def existing_policy_event(
     path: Path, *, event_type: str, policy_id: str
 ) -> dict[str, object] | None:
     """Return the validated exact policy payload for safe partial-apply replay."""
+    event = find_policy_event(path, event_type=event_type, policy_id=policy_id)
+    if event is None:
+        return None
+    policy = event.get("policy")
+    if not isinstance(policy, dict):
+        raise RecoveryPolicyError("policy audit event has an invalid policy payload")
+    return cast(dict[str, object], policy)
+
+
+def find_policy_event(path: Path, *, event_type: str, policy_id: str) -> dict[str, object] | None:
+    """Return one exact hash-chain-validated event from the append-only policy audit."""
     audit = _load_audit(path)
     events = cast(list[dict[str, object]], audit["events"])
     matches = [
@@ -229,12 +240,7 @@ def existing_policy_event(
     ]
     if len(matches) > 1:
         raise RecoveryPolicyError("policy audit contains duplicate policy events")
-    if not matches:
-        return None
-    policy = matches[0].get("policy")
-    if not isinstance(policy, dict):
-        raise RecoveryPolicyError("policy audit event has an invalid policy payload")
-    return cast(dict[str, object], policy)
+    return dict(matches[0]) if matches else None
 
 
 def validate_policy_preconditions(

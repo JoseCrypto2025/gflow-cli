@@ -42,6 +42,7 @@ def _required_entries() -> list[tuple[str, bytes, str]]:
         "scripts/operations/apply_ambiguous_legacy_recovery_policy.py",
         "scripts/operations/inspect_flow_pricing_read_only.py",
         "scripts/operations/run_legacy_replacement.py",
+        "scripts/operations/repair_legacy_parent_job_linkage.py",
         "scripts/validation/v2_runtime_doctor.py",
         "scripts/validation/validate_v2_data_architecture.py",
         "pyproject.toml",

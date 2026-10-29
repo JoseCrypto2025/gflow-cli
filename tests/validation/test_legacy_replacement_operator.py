@@ -6,6 +6,7 @@ import pytest
 
 from scripts.operations.run_legacy_replacement import (
     _has_clicked_consumed_replacement,
+    _require_parent_job_linkage,
     is_non_subscriber_peak_window,
 )
 
@@ -27,6 +28,26 @@ def test_non_subscriber_peak_window_uses_utc_edges(now: datetime, expected: bool
 def test_peak_window_requires_timezone_aware_timestamp() -> None:
     with pytest.raises(ValueError, match="aware"):
         is_non_subscriber_peak_window(datetime(2026, 10, 28, 14))
+
+
+def test_replacement_operator_accepts_both_repaired_parent_linkage_fields() -> None:
+    assert _require_parent_job_linkage(
+        {"production_job_id": "PRD_000001", "scene_job_id": "SJB_000001"}
+    ) == ("PRD_000001", "SJB_000001")
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        {"scene_job_id": "SJB_000001"},
+        {"production_job_id": "PRD_000001"},
+    ],
+)
+def test_replacement_operator_still_blocks_if_either_parent_linkage_is_missing(
+    attempt: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="linkage is incomplete"):
+        _require_parent_job_linkage(attempt)
 
 
 def test_only_exact_consumed_single_clicked_attempt_can_reconcile_during_peak() -> None:
