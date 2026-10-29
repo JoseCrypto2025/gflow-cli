@@ -19,17 +19,41 @@ _ATTEMPT_ID = "D2_9c13df47d64c68de30cd036bcd1fec09"
 _AUTHORIZATION_ID = "LRA_18A2C0EE3248A7C93E6D1991"
 _PRODUCTION_JOB_ID = "PRD_000002"
 _SCENE_JOB_ID = "SJB_000002"
+_CONFIGURED_PROFILE_HOME = os.environ.get("GFLOW_CLI_HOME", "").strip()
+_PRODUCTION_PROFILE_HOME = Path("/var/lib/gflow/browser-state")
 
 
 def _file_bytes(path: Path) -> bytes:
     return path.read_bytes() if path.is_file() else b""
 
 
-def test_read_only_diagnostic_reuses_the_exact_prepared_attempt() -> None:
+def test_read_only_diagnostic_reuses_the_exact_prepared_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if os.environ.get(_OPT_IN) != "I_CONFIRM_READ_ONLY_PRECLICK_DIAGNOSTIC":
         pytest.skip(f"set {_OPT_IN}=I_CONFIRM_READ_ONLY_PRECLICK_DIAGNOSTIC to opt in")
     if os.environ.get("GFLOW_CLI_E2E_PROFILE", "").strip() != "gflow-prod":
         pytest.fail("Phase G replacement diagnosis accepts only the existing gflow-prod profile")
+    if not _CONFIGURED_PROFILE_HOME:
+        pytest.fail("set GFLOW_CLI_HOME before pytest starts to the authenticated profile root")
+    if Path(_CONFIGURED_PROFILE_HOME).resolve(strict=True) != _PRODUCTION_PROFILE_HOME.resolve(
+        strict=True
+    ):
+        pytest.fail("Phase G replacement diagnosis requires the canonical production profile root")
+
+    # tests/conftest.py isolates settings by replacing GFLOW_CLI_HOME with a
+    # temporary directory. Restore the explicitly configured production root;
+    # GFLOW_CLI_DB_PATH remains isolated by the fixture.
+    monkeypatch.setenv("GFLOW_CLI_HOME", str(_PRODUCTION_PROFILE_HOME))
+    from gflow_cli.auth import profile_dir
+    from gflow_cli.config import reset_settings
+
+    reset_settings()
+    profile_path = profile_dir("gflow-prod")
+    if profile_path.is_symlink() or not profile_path.is_dir():
+        pytest.fail("configured authenticated gflow-prod profile is unavailable")
+    expected_profile_path = _PRODUCTION_PROFILE_HOME / "profile_gflow-prod"
+    assert profile_path.resolve(strict=True) == expected_profile_path.resolve(strict=True)
 
     runtime_root = load_runtime_settings().runtime_state_root
     d2_ledger_path = runtime_root / "production" / "phase-g" / "d2-credit-ledger.json"
