@@ -144,6 +144,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   15-second permission-DOM hydration window; it rejects multiple live gates immediately and
   fails closed when no gate appears.
 
+### Fixed
+
+- **Phase G journals and restores only semantic Flow settings.** The live settings snapshot
+  includes display-only model metadata; Phase G now keeps that metadata out of the durable
+  recovery journal and compares restoration readback only for fields it changes.
+
 
 ## [0.85.0] — 2026-10-14
 

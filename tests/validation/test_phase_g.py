@@ -597,7 +597,7 @@ class FakeGenerationPort:
         self.calls.append("restore")
         if self.fail_restore:
             raise OSError("simulated restore failure")
-        self.settings = dict(settings)
+        self.settings.update(settings)
 
     async def fill_prompt(self, prompt: str, negative_prompt: str) -> None:
         self.calls.append("prompt")
@@ -735,6 +735,34 @@ async def test_phase_g_executes_single_approved_gate_and_restores_original_setti
     attempt = ledger.attempts()[0]
     assert attempt["approved_prompt_sha256"] == request.prompt_sha256
     assert attempt["provider_directive_sha256"] == hashlib.sha256(port.prompt.encode()).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_phase_g_journals_and_restores_semantic_settings_only(tmp_path: Path) -> None:
+    port = FakeGenerationPort()
+    port.settings.update({"model_name": "Veo 3.1 Lite", "model_priority": "STANDARD"})
+    port.original = dict(port.settings)
+
+    async def restore_semantic_settings(settings: Mapping[str, object]) -> None:
+        port.calls.append("restore")
+        if port.fail_restore:
+            raise OSError("simulated restore failure")
+        port.settings.update(settings)
+
+    port.restore_settings = restore_semantic_settings  # type: ignore[method-assign]
+    request, ledger, journal, executor = make_executor(tmp_path, port)
+
+    result = await executor.execute(request)
+
+    assert result.submission_state == "GENERATION_SUCCEEDED"
+    assert journal.read().original_settings == {
+        "model_id": "MDL_0001",
+        "generation_mode": "TEXT_TO_VIDEO",
+        "aspect_ratio": "16:9",
+        "output_count": 1,
+        "confirm_before_generating": "Always",
+    }
+    assert port.settings == port.original
 
 
 @pytest.mark.asyncio

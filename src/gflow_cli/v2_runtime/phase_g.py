@@ -509,8 +509,8 @@ class GoogleFlowAgentOnlyGenerationExecutor:
 
         # Snapshot all relevant defaults before the journal or first mutation.
         progress.start("SETTINGS_SNAPSHOT")
-        original = dict(await self.port.snapshot_settings())
-        if not original:
+        original_snapshot = dict(await self.port.snapshot_settings())
+        if not original_snapshot:
             raise PhaseGError(
                 "PHASE_G_SETTINGS_SNAPSHOT_INVALID", "original settings snapshot is empty"
             )
@@ -521,11 +521,15 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             "output_count": request.output_count,
             "confirm_before_generating": "Always",
         }
-        if not set(target).issubset(original):
+        if not set(target).issubset(original_snapshot):
             raise PhaseGError(
                 "PHASE_G_SETTINGS_SNAPSHOT_INVALID",
                 "original settings snapshot omits a setting Phase G will change",
             )
+        # Settings adapters may include display-only metadata (for example model
+        # label and priority). Persist and restore only the semantic fields this
+        # execution changes; the recovery journal intentionally rejects metadata.
+        original = {key: original_snapshot[key] for key in target}
         progress.complete("SETTINGS_SNAPSHOT")
         progress.start("JOURNAL_BEGIN")
         self.recovery_journal.begin(
@@ -924,7 +928,9 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 restoring_error = exc
             try:
                 await self.port.restore_settings(original)
-                if dict(await self.port.read_settings()) != original:
+                restored = dict(await self.port.read_settings())
+                restored_semantic = {key: restored.get(key) for key in original}
+                if restored_semantic != original:
                     raise PhaseGError(
                         "PHASE_G_SETTINGS_RESTORE_FAILED", "original settings readback differs"
                     )

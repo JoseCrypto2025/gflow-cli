@@ -64,6 +64,10 @@ confirmation must identify one video and the exact pre-reserved amount before Ph
 approval and clicks confirmation. Any amount, count, identity, or balance mismatch stops before
 approval.
 
+The Flow settings snapshot may include display-only model metadata. The recovery journal persists
+and restores only the semantic settings that Phase G changes, and restoration readback compares
+those same fields.
+
 Before a click, a failure may release only this new replacement quote after the shared ledger proves
 zero clicks. After a click, all failures remain on the same attempt and preserve the quote reservation
 for reconciliation. Ambiguity never proves non-submission, never authorizes a retry, and never
