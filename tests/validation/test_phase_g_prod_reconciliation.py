@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from gflow_cli.v2_runtime import phase_g_run
-from gflow_cli.v2_runtime.phase_g import D2DailyCreditLedger
+from gflow_cli.v2_runtime.phase_g import D2DailyCreditLedger, PhaseGError
 from gflow_cli.v2_runtime.phase_g_prod_reconciliation import (
     ProdAttemptIdentity,
     ProdReconciliationEvidence,
@@ -48,6 +48,7 @@ def _attempt(identity: ProdAttemptIdentity | None = None, **updates: object) -> 
         "prompt_sha256": expected.prompt_sha256,
         "submission_state": "UNKNOWN_SUBMISSION_STATE",
         "generate_action_count": 1,
+        "approval_action_count": 0,
         "updated_at": "2026-10-25T12:00:00Z",
         "generate_action_at": "2026-10-25T12:00:00Z",
         "baseline_captured": True,
@@ -360,10 +361,13 @@ def test_prod_entrypoint_audits_without_releasing_or_generating(
     identity = _identity()
     attempt = _attempt(identity, execution_environment="PROD")
     audits: list[dict[str, object]] = []
+    release_calls: list[tuple[object, ...]] = []
+
+    ledger_roots: list[Path] = []
 
     class Ledger:
-        def __init__(self, _root) -> None:
-            pass
+        def __init__(self, root: Path) -> None:
+            ledger_roots.append(root)
 
         def attempts(self):
             return (attempt,)
@@ -374,6 +378,7 @@ def test_prod_entrypoint_audits_without_releasing_or_generating(
 
     class Guard:
         def release_proven_not_submitted(self, *_args, **_kwargs):
+            release_calls.append(_args)
             raise AssertionError("ambiguous reconciliation must not release credits")
 
     monkeypatch.setattr(phase_g_run, "D2DailyCreditLedger", Ledger)
@@ -401,8 +406,13 @@ def test_prod_entrypoint_audits_without_releasing_or_generating(
     )
 
     assert result is expected
+    assert ledger_roots == [tmp_path / "production"]
     assert len(audits) == 1
     assert audits[0]["contract_version"] == "D2_PROD_SAME_ATTEMPT_RECOVERY_V1"
+    assert attempt["generate_action_count"] == 1
+    assert attempt["approval_action_count"] == 0
+    assert attempt["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
+    assert release_calls == []
 
 
 def test_d2_prod_reconciliation_audit_is_idempotent(tmp_path: Path) -> None:
@@ -424,3 +434,63 @@ def test_d2_prod_reconciliation_audit_is_idempotent(tmp_path: Path) -> None:
     assert first == second
     saved = ledger.attempts()[0]
     assert len(saved["prod_reconciliation_history"]) == 1
+
+
+def test_prod_reconciliation_fails_closed_when_given_the_ledger_root_as_runtime_root(
+    tmp_path: Path,
+) -> None:
+    identity = _identity()
+    context = ProductionExecutionContext(
+        "PROD",
+        "PRV_0001",
+        identity.provider_account_id,
+        identity.provider_project_id,
+        "GFLOW_PROD_AUTH",
+        identity.scene_id,
+        identity.generation_profile_id,
+        identity.scene_prompt_id,
+        identity.d2_run_id,
+        CreditBudgetContext(),
+        production_job_id=identity.production_job_id,
+        scene_job_id=identity.scene_job_id,
+    )
+
+    with pytest.raises(PhaseGError, match="exactly one persisted D2 attempt"):
+        phase_g_run.reconcile_prod_same_attempt(
+            tmp_path / "runtime" / "production",
+            context,
+            identity,
+            credit_guard=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_non_prod_context_fails_before_opening_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    context = ProductionExecutionContext(
+        "TEST",
+        "PRV_0001",
+        identity.provider_account_id,
+        identity.provider_project_id,
+        "GFLOW_PROD_AUTH",
+        identity.scene_id,
+        identity.generation_profile_id,
+        identity.scene_prompt_id,
+        identity.d2_run_id,
+        CreditBudgetContext(),
+        production_job_id=identity.production_job_id,
+        scene_job_id=identity.scene_job_id,
+    )
+
+    def no_ledger(_root: Path) -> None:
+        raise AssertionError("non-PROD context must fail before ledger access")
+
+    monkeypatch.setattr(phase_g_run, "D2DailyCreditLedger", no_ledger)
+    with pytest.raises(PhaseGError, match="PROD context does not match attempt identity"):
+        phase_g_run.reconcile_prod_same_attempt(
+            tmp_path,
+            context,
+            identity,
+            credit_guard=object(),  # type: ignore[arg-type]
+        )

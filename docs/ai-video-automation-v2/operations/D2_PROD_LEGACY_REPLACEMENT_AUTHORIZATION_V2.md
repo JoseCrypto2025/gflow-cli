@@ -95,6 +95,15 @@ digest of the raw traceback.
 The operator stops after exact local media validation. It does not upload, persist `FINAL_OUTPUT`,
 or enter D7/D8.
 
+When replaying an authorization whose exact replacement attempt already has a Generate action, the
+operator follows the same-attempt reconciliation branch before any Flow browser or execution path.
+The reconciler receives the runtime state root and reads the PROD ledger under
+`<runtime-state-root>/production/phase-g/`. It records a stage event for reconciliation and, if that
+stage fails, appends a redacted failure event with the attempt ID, exception class/message, source
+location, traceback digest, and timestamp. A post-click execution interruption is recorded before
+reconciliation with reason `PHASE_G_EXECUTION_INTERRUPTED_AFTER_CLICK`. These diagnostics do not
+change the attempt action count, approval count, or reservation, and replay cannot retry Generate.
+
 The operator reports Google's published 14:00–17:00 UTC non-subscriber availability warning as
 an advisory; Flow decides whether a request can proceed. A correlated `YhhmEf` submit response
 with parsed reasons records sanitized refusal facts. A reason code is retained when exactly one

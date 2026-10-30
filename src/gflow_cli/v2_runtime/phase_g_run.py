@@ -92,7 +92,9 @@ def reconcile_prod_same_attempt(
         runtime_state_root.anchor
     ):
         raise PhaseGError("PHASE_G_LEDGER_PATH_INVALID", "runtime state root is invalid")
-    ledger = D2DailyCreditLedger(runtime_state_root)
+    # Operator callers pass the runtime base (for example /var/lib/gflow); the
+    # PROD ledger itself is rooted under /production/phase-g.
+    ledger = D2DailyCreditLedger(runtime_state_root / "production")
     matches = [row for row in ledger.attempts() if row.get("d2_run_id") == identity.d2_run_id]
     if len(matches) != 1:
         raise PhaseGError(

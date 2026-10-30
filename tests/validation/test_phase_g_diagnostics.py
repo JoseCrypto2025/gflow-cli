@@ -24,8 +24,10 @@ from gflow_cli.v2_runtime.phase_g_diagnostics import (
     PhaseGDiagnosticRecorder,
     PhaseGExecutionProgress,
 )
+from gflow_cli.v2_runtime.phase_g_prod_reconciliation import ProdAttemptIdentity
 from gflow_cli.v2_runtime.production_execution import (
     CreditBudgetContext,
+    ProductionCreditGuard,
     ProductionExecutionContext,
 )
 from scripts.operations import run_legacy_replacement
@@ -76,6 +78,74 @@ def test_diagnostic_recorder_persists_redacted_failure_and_traceback_digest(
     assert private_prompt not in json.dumps(events)
     assert "Bearer" not in str(failure["exception_message"])
     assert datetime.fromisoformat(str(failure["timestamp"]).replace("Z", "+00:00")).tzinfo
+
+
+def test_post_click_reconciliation_failure_is_durably_recorded_without_provider_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    recorder = _recorder(runtime_root)
+    progress = PhaseGExecutionProgress(recorder=recorder)
+    identity = ProdAttemptIdentity(
+        production_job_id="PRD_000002",
+        scene_job_id="SJB_000002",
+        d2_run_id="D2_replacement-0001",
+        provider_account_id="PVA_0001",
+        provider_project_id="project-1",
+        scene_id="SCN_000001",
+        scene_prompt_id="SPV_000001",
+        generation_profile_id="GPR_0001",
+        prompt_sha256="a" * 64,
+    )
+    context = ProductionExecutionContext(
+        environment="PROD",
+        provider_id="PRV_0001",
+        provider_account_id=identity.provider_account_id,
+        provider_project_id=identity.provider_project_id,
+        auth_profile="GFLOW_PROD_AUTH",
+        scene_id=identity.scene_id,
+        generation_profile_id=identity.generation_profile_id,
+        scene_prompt_id=identity.scene_prompt_id,
+        attempt_id=identity.d2_run_id,
+        credit_budget_context=CreditBudgetContext(),
+        production_job_id=identity.production_job_id,
+        scene_job_id=identity.scene_job_id,
+    )
+    private_prompt = "private post-click prompt that must be redacted"
+    provider_actions: list[str] = []
+
+    def fail_reconciliation(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"ledger mismatch {private_prompt}")
+
+    def forbidden_generation(*_args: object, **_kwargs: object) -> None:
+        provider_actions.append("generate")
+        raise AssertionError("reconciliation must not execute generation")
+
+    monkeypatch.setattr(run_legacy_replacement, "reconcile_prod_same_attempt", fail_reconciliation)
+    monkeypatch.setattr(run_legacy_replacement, "execute_and_validate", forbidden_generation)
+
+    with pytest.raises(RuntimeError, match="ledger mismatch"):
+        run_legacy_replacement._reconcile_with_diagnostics(
+            runtime_root,
+            context,
+            identity,
+            credit_guard=cast(ProductionCreditGuard, object()),
+            recorder=recorder,
+            progress=progress,
+            repository_root=Path(__file__).resolve().parents[2],
+            sensitive_values=(private_prompt,),
+        )
+
+    events = [json.loads(line) for line in recorder.path.read_text(encoding="utf-8").splitlines()]
+    failure = next(event for event in events if event["event_type"] == "FAILURE")
+    assert failure["reason_code"] == "PHASE_G_POST_CLICK_RECONCILIATION_FAILED"
+    assert failure["failed_stage"] == "SAME_ATTEMPT_RECONCILIATION"
+    assert failure["attempt_id"] == identity.d2_run_id
+    assert failure["exception_type"] == "RuntimeError"
+    assert failure["source_file"] == "tests/validation/test_phase_g_diagnostics.py"
+    assert len(str(failure["traceback_digest"])) == 64
+    assert private_prompt not in json.dumps(events)
+    assert provider_actions == []
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PROD same-attempt reconciliation path and post-click diagnostics.** Reconciliation now resolves the
+  PROD D2 ledger beneath the runtime root's `production/phase-g` directory. The replacement operator
+  records redacted execution-interruption and reconciliation-failure details on the exact existing
+  attempt, and replay after a recorded click remains reconciliation-only.
+
 - **Phase G pre-click diagnostics.** Adds durable redacted stage and failure records, plus a
   read-only diagnostic mode bound to one existing consumed legacy replacement. The mode verifies
   the profile, project, and settings snapshot, then stops before journal, settings, prompt, credit,

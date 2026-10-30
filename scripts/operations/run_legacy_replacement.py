@@ -57,6 +57,8 @@ from gflow_cli.v2_runtime.phase_g_artifacts import ValidatedVideo, validate_vide
 from gflow_cli.v2_runtime.phase_g_diagnostics import (
     PhaseGDiagnosticRecorder,
     PhaseGExecutionProgress,
+    PhaseGFailureReason,
+    PhaseGStage,
 )
 from gflow_cli.v2_runtime.phase_g_prod_legacy_reconciliation import (
     LegacyProdReconciliationDecision,
@@ -115,6 +117,62 @@ class LegacyReplacementOperatorError(ValueError):
 
 class LegacyParentJobLinkageError(LegacyReplacementOperatorError):
     """The legacy parent does not have both persisted canonical job IDs."""
+
+
+def _record_phase_g_failure(
+    recorder: PhaseGDiagnosticRecorder,
+    progress: PhaseGExecutionProgress,
+    exc: Exception,
+    *,
+    repository_root: Path,
+    reason_code: PhaseGFailureReason,
+    failed_stage: PhaseGStage,
+    sensitive_values: tuple[str, ...] = (),
+) -> bool:
+    """Persist a redacted failure without letting diagnostics change execution state."""
+    try:
+        recorder.record_failure(
+            exc,
+            progress,
+            repository_root=repository_root,
+            sensitive_values=sensitive_values,
+            reason_code=reason_code,
+            failed_stage=failed_stage,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _reconcile_with_diagnostics(
+    runtime_root: Path,
+    context: ProductionExecutionContext,
+    identity: ProdAttemptIdentity,
+    *,
+    credit_guard: ProductionCreditGuard,
+    recorder: PhaseGDiagnosticRecorder,
+    progress: PhaseGExecutionProgress,
+    repository_root: Path,
+    sensitive_values: tuple[str, ...] = (),
+) -> ProdReconciliationResult:
+    progress.start("SAME_ATTEMPT_RECONCILIATION")
+    try:
+        result = reconcile_prod_same_attempt(
+            runtime_root, context, identity, credit_guard=credit_guard
+        )
+    except Exception as exc:
+        _record_phase_g_failure(
+            recorder,
+            progress,
+            exc,
+            repository_root=repository_root,
+            reason_code="PHASE_G_POST_CLICK_RECONCILIATION_FAILED",
+            failed_stage="SAME_ATTEMPT_RECONCILIATION",
+            sensitive_values=sensitive_values,
+        )
+        raise
+    progress.complete("SAME_ATTEMPT_RECONCILIATION")
+    return result
 
 
 def is_non_subscriber_peak_window(now: datetime) -> bool:
@@ -1313,6 +1371,18 @@ def run_once(
         prior_approvals = _action_count(prior_attempt, "approval_action_count")
         if prior_clicks > 1 or prior_approvals > 1 or (prior_clicks == 0 and prior_approvals != 0):
             raise LegacyReplacementOperatorError("persisted replacement action count is unsafe")
+        phase_g_recorder = PhaseGDiagnosticRecorder(
+            runtime_root,
+            attempt_id=attempt_id,
+            authorization_id=authorization_id,
+            production_job_id=child_prod_id,
+            scene_job_id=child_scene_id,
+        )
+        phase_g_progress = PhaseGExecutionProgress(recorder=phase_g_recorder, strict=False)
+        sensitive_values = (
+            phase_g_request.compiled_prompt_text,
+            phase_g_request.compiled_negative_prompt,
+        )
         if prior_clicks > 0:
             attempt_identity = ProdAttemptIdentity(
                 production_job_id=child_prod_id,
@@ -1325,8 +1395,15 @@ def run_once(
                 generation_profile_id=profile_id,
                 prompt_sha256=prompt_sha,
             )
-            recon = reconcile_prod_same_attempt(
-                runtime_root, context, attempt_identity, credit_guard=guard
+            recon = _reconcile_with_diagnostics(
+                runtime_root,
+                context,
+                attempt_identity,
+                credit_guard=guard,
+                recorder=phase_g_recorder,
+                progress=phase_g_progress,
+                repository_root=repository_root,
+                sensitive_values=sensitive_values,
             )
             reconciled_attempt = _attempt(d2_ledger, attempt_id)
             if reconciled_attempt is None:
@@ -1379,14 +1456,6 @@ def run_once(
             raise LegacyReplacementOperatorError(
                 "fresh provider free balance is below the exact quote"
             )
-        phase_g_recorder = PhaseGDiagnosticRecorder(
-            runtime_root,
-            attempt_id=attempt_id,
-            authorization_id=authorization_id,
-            production_job_id=child_prod_id,
-            scene_job_id=child_scene_id,
-        )
-        phase_g_progress = PhaseGExecutionProgress(recorder=phase_g_recorder, strict=False)
         try:
             generated: PhaseGD2Run = asyncio.run(
                 execute_and_validate(
@@ -1399,6 +1468,15 @@ def run_once(
             observed = _attempt(d2_ledger, attempt_id)
             clicks = _action_count(observed, "generate_action_count") if observed else 0
             if clicks == 1:
+                _record_phase_g_failure(
+                    phase_g_recorder,
+                    phase_g_progress,
+                    exc,
+                    repository_root=repository_root,
+                    reason_code="PHASE_G_EXECUTION_INTERRUPTED_AFTER_CLICK",
+                    failed_stage="POST_CLICK_EXECUTION",
+                    sensitive_values=sensitive_values,
+                )
                 identity = ProdAttemptIdentity(
                     production_job_id=child_prod_id,
                     scene_job_id=child_scene_id,
@@ -1410,8 +1488,15 @@ def run_once(
                     generation_profile_id=profile_id,
                     prompt_sha256=prompt_sha,
                 )
-                reconciliation_result = reconcile_prod_same_attempt(
-                    runtime_root, context, identity, credit_guard=guard
+                reconciliation_result = _reconcile_with_diagnostics(
+                    runtime_root,
+                    context,
+                    identity,
+                    credit_guard=guard,
+                    recorder=phase_g_recorder,
+                    progress=phase_g_progress,
+                    repository_root=repository_root,
+                    sensitive_values=sensitive_values,
                 )
                 observed_after = _attempt(d2_ledger, attempt_id)
                 if observed_after is None:
@@ -1514,8 +1599,15 @@ def run_once(
             generation_profile_id=profile_id,
             prompt_sha256=prompt_sha,
         )
-        reconciliation_result = reconcile_prod_same_attempt(
-            runtime_root, context, identity, credit_guard=guard
+        reconciliation_result = _reconcile_with_diagnostics(
+            runtime_root,
+            context,
+            identity,
+            credit_guard=guard,
+            recorder=phase_g_recorder,
+            progress=phase_g_progress,
+            repository_root=repository_root,
+            sensitive_values=sensitive_values,
         )
         attempt_after = _attempt(d2_ledger, attempt_id)
         if attempt_after is None:

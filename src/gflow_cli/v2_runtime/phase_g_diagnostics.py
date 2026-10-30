@@ -37,6 +37,13 @@ PhaseGStage = Literal[
     "SUBMISSION_BASELINE",
     "GENERATE_CHECKPOINT",
     "GENERATE_CLICK",
+    "POST_CLICK_EXECUTION",
+    "SAME_ATTEMPT_RECONCILIATION",
+]
+PhaseGFailureReason = Literal[
+    "PHASE_G_EXECUTION_FAILED_BEFORE_CLICK",
+    "PHASE_G_EXECUTION_INTERRUPTED_AFTER_CLICK",
+    "PHASE_G_POST_CLICK_RECONCILIATION_FAILED",
 ]
 
 _ATTEMPT_RE = re.compile(r"^D2_[A-Za-z0-9_-]{8,64}$")
@@ -147,6 +154,8 @@ class PhaseGDiagnosticRecorder:
         *,
         repository_root: Path,
         sensitive_values: tuple[str, ...] = (),
+        reason_code: PhaseGFailureReason = "PHASE_G_EXECUTION_FAILED_BEFORE_CLICK",
+        failed_stage: PhaseGStage | None = None,
     ) -> dict[str, object]:
         raw_traceback = "".join(traceback.format_exception(exc))
         source_file, source_line = _exception_location(exc, repository_root)
@@ -161,10 +170,10 @@ class PhaseGDiagnosticRecorder:
             "authorization_id": self.authorization_id,
             "production_job_id": self.production_job_id,
             "scene_job_id": self.scene_job_id,
-            "reason_code": "PHASE_G_EXECUTION_FAILED_BEFORE_CLICK",
+            "reason_code": reason_code,
             "exception_type": exception_type,
             "exception_message": _safe_message(str(exc), sensitive_values),
-            "failed_stage": progress.failed_stage,
+            "failed_stage": failed_stage or progress.failed_stage,
             "last_completed_stage": progress.last_completed_stage,
             "source_file": source_file,
             "source_line": source_line,
