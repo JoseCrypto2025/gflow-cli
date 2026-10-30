@@ -14,6 +14,8 @@ from gflow_cli.v2_runtime.production_execution import (
     ProductionExecutionError,
 )
 
+_PROD_PROJECT = "aafe9282-071f-4333-baa4-92b9f76a9c27"
+
 
 def _context(
     environment: str = "PROD", attempt: str = "D6_attempt_0001"
@@ -22,7 +24,7 @@ def _context(
         environment,
         "PRV_0001",
         "PVA_0002" if environment == "PROD" else "PVA_0001",
-        "prod-project" if environment == "PROD" else "test-project",
+        _PROD_PROJECT if environment == "PROD" else "test-project",
         "GFLOW_PROD_AUTH" if environment == "PROD" else "GFLOW_V2_TEST_AUTH",
         "SCN_000001",
         "GPR_0002" if environment == "PROD" else "GPR_0001",
@@ -169,7 +171,7 @@ def test_execution_context_requires_exact_resolved_identity() -> None:
         "environment": "PROD",
         "provider_id": "PRV_0001",
         "provider_account_id": "PVA_0002",
-        "provider_project_id": "prod-project",
+        "provider_project_id": _PROD_PROJECT,
         "auth_profile": "GFLOW_PROD_AUTH",
         "scene_id": "SCN_000001",
         "generation_profile_id": "GPR_0002",
@@ -179,6 +181,22 @@ def test_execution_context_requires_exact_resolved_identity() -> None:
     resolved["provider_account_id"] = "PVA_0001"
     with pytest.raises(ProductionExecutionError, match="differs"):
         context.validate(resolved)
+
+
+def test_prod_context_rejects_noncanonical_project() -> None:
+    with pytest.raises(ProductionExecutionError, match="canonically pinned"):
+        replace(_context(), provider_project_id="date-stamped-project").validate(
+            {
+                "environment": "PROD",
+                "provider_id": "PRV_0001",
+                "provider_account_id": "PVA_0002",
+                "provider_project_id": "date-stamped-project",
+                "auth_profile": "GFLOW_PROD_AUTH",
+                "scene_id": "SCN_000001",
+                "generation_profile_id": "GPR_0002",
+                "scene_prompt_id": "SPV_000006",
+            }
+        )
 
 
 def test_daily_credit_guard_is_shared_across_test_and_prod(tmp_path: Path) -> None:

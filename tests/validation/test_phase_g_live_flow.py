@@ -11,6 +11,7 @@ import pytest
 import gflow_cli.v2_runtime.phase_g_live_flow as live_flow
 from gflow_cli.api.transports.batchexecute import TEXT_TO_VIDEO_SUBMIT_RPC
 from gflow_cli.errors import WafRejectionError
+from gflow_cli.v2_runtime.errors import FlowPresubmitError
 from gflow_cli.v2_runtime.phase_g import FlowSubmissionBaseline, PhaseGError
 from gflow_cli.v2_runtime.phase_g_live_flow import (
     GoogleFlowAgentOnlyGenerationPort,
@@ -20,6 +21,7 @@ from gflow_cli.v2_runtime.phase_g_live_flow import (
     canonical_finished_tile_url_hash,
     canonical_finished_tile_url_identity,
     provider_directive_sha256,
+    validate_prod_flow_identity,
 )
 
 
@@ -138,6 +140,9 @@ def _port(gate_after_polls: int | None) -> GoogleFlowAgentOnlyGenerationPort:
     port._generate_click_dispatched = None
     port._submit_requests = []
     port._submit_observed_at = None
+    port._submit_request_sha256 = None
+    port._submit_response_sha256 = None
+    port._submit_response_at = None
     port._submit_project_id = None
     port._submit_request_failed = None
     port._submit_response_observed = False
@@ -336,6 +341,18 @@ async def test_submit_request_observer_is_armed_before_generate_click() -> None:
     assert "flow-generate-icon-button button" in page.selectors
 
 
+def test_prod_open_identity_guard_rejects_wrong_project_before_browser_open() -> None:
+    with pytest.raises(FlowPresubmitError) as mismatch:
+        validate_prod_flow_identity(
+            expected_email="singleava508@gmail.com",
+            auth_profile_key="GFLOW_PROD_AUTH",
+            provider_account_id="PVA_0002",
+            provider_project_id="date-stamped-project",
+            project_name="AI Video Automation V2 - PROD",
+        )
+    assert mismatch.value.code == "FLOW_PROJECT_MISMATCH"
+
+
 @pytest.mark.asyncio
 async def test_agent_turn_dispatch_does_not_wait_for_or_require_yhhmef(
     monkeypatch: pytest.MonkeyPatch,
@@ -423,13 +440,40 @@ def test_duplicate_submit_requests_count_without_reading_sensitive_request_data(
     assert not hasattr(evidence, "headers")
 
 
-@pytest.mark.asyncio
-async def test_submit_response_generation_record_is_correlated_to_exact_request(
+def test_submit_request_body_is_only_retained_as_sha256(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _port(None)
+    port._page = SimpleNamespace(url="https://flow.google.com/project/project")  # type: ignore[assignment]
+    port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
+    port._submit_observer_armed = True
+    port._submit_dispatch_started_at = 1.0
+    port._submit_dispatch_deadline = 20.0
+    monkeypatch.setattr(live_flow, "_monotonic", lambda: 2.0)
+
+    request = SimpleNamespace(
+        url="https://flow.google.com/data/batchexecute?rpcids=YhhmEf",
+        method="POST",
+        post_data="safe-request-fixture",
+    )
+    port._on_request(request)
+    evidence = port.read_submit_transport_evidence()
+
+    assert (
+        evidence.provider_submit_request_sha256
+        == hashlib.sha256(b"safe-request-fixture").hexdigest()
+    )
+    assert "safe-request-fixture" not in repr(evidence)
+
+
+def test_submit_response_generation_record_is_correlated_to_exact_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     port = _port(None)
     request = SimpleNamespace(
-        url="https://flow.google.com/data/batchexecute?rpcids=YhhmEf", method="POST"
+        url="https://flow.google.com/data/batchexecute?rpcids=YhhmEf",
+        method="POST",
+        post_data="safe-request-fixture",
     )
     port._request = SimpleNamespace(provider_project_id="project")  # type: ignore[assignment]
     port._submit_requests = [request]
@@ -454,11 +498,18 @@ async def test_submit_response_generation_record_is_correlated_to_exact_request(
         ),
     )
 
-    await asyncio.wait_for(port._capture_response(Response()), timeout=2)  # type: ignore[arg-type]
+    coroutine = port._capture_response(Response())  # type: ignore[arg-type]
+    with pytest.raises(StopIteration):
+        coroutine.send(None)
 
     evidence = port.read_submit_transport_evidence()
     assert evidence.provider_submit_response_observed is True
     assert evidence.provider_submit_response_status == 200
+    assert (
+        evidence.provider_submit_response_sha256
+        == hashlib.sha256(b"SENSITIVE_RESPONSE_BODY").hexdigest()
+    )
+    assert evidence.provider_submit_response_at is not None
     assert evidence.provider_submit_generation_record_observed is True
     assert evidence.provider_submit_refusal_detected is False
     assert "SENSITIVE_RESPONSE_BODY" not in repr(evidence)

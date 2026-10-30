@@ -309,17 +309,26 @@ class GoogleFlowAgentOnlyPort:
             )
         page = await self._ensure_page()
         target_url = f"{_FLOW_ORIGIN}/project/{project_id}"
-        if page.url != target_url:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
-        await page.locator("flow-agent-panel").wait_for(state="visible", timeout=30_000)
+        try:
+            if page.url != target_url:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
+            await page.locator("flow-agent-panel").wait_for(state="visible", timeout=30_000)
+        except Exception as exc:
+            raise FlowPresubmitError(
+                "FLOW_PROJECT_NOT_READY", "the pinned Flow project could not be reached"
+            ) from exc
         parsed = urlparse(page.url)
         if parsed.scheme != "https" or parsed.netloc != "flow.google.com":
-            return FlowProjectState(None)
+            raise FlowPresubmitError(
+                "FLOW_PROJECT_NOT_READY", "Flow did not serve the requested project page"
+            )
         match = re.fullmatch(r"/project/([A-Za-z0-9_-]+)", parsed.path)
         title = await page.title()
         selected = match.group(1) if match else None
         if selected != project_id or self.project_name.casefold() not in title.casefold():
-            return FlowProjectState(None)
+            raise FlowPresubmitError(
+                "FLOW_PROJECT_MISMATCH", "Flow did not read back the pinned project identity"
+            )
         return FlowProjectState(selected)
 
     async def inspect_surface(self) -> str | None:

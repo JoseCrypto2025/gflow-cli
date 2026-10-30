@@ -222,14 +222,73 @@ def test_submit_transport_evidence_is_sanitized_and_explicit(tmp_path: Path) -> 
             provider_submit_request_count=1,
             provider_submit_dispatch_window_completed=True,
             provider_submit_response_observed=False,
+            provider_submit_request_sha256="a" * 64,
         ),
     )
 
     assert attempt["provider_submit_rpc_observed"] is True
     assert attempt["provider_submit_request_count"] == 1
+    assert attempt["provider_submit_request_sha256"] == "a" * 64
+    assert attempt["provider_submit_response_sha256"] is None
     assert attempt["provider_submit_transport_classification"] == ("SUBMIT_SENT_RESPONSE_UNKNOWN")
     assert "request_body" not in attempt
     assert "headers" not in attempt
+
+
+def test_generate_checkpoint_and_outcome_snapshot_are_durable_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    request = phase_g_request(tmp_path)
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    ledger.create_attempt(request)
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id,
+            frozenset({"old-media"}),
+            frozenset({"old-execution"}),
+            0,
+            frozenset(),
+            "0:",
+        ),
+    )
+    ledger._mutate(  # noqa: SLF001 - exercise PROD-only click evidence on a focused attempt
+        lambda payload: payload["attempts"][0].update(execution_environment="PROD")
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    attempted = ledger.record_state(request.d2_run_id, submission_state="UNKNOWN_SUBMISSION_STATE")
+    assert attempted["baseline_project_id"] == request.provider_project_id
+    assert attempted["baseline_captured_at"]
+    assert attempted["generate_action_intent_at"] == attempted["generate_action_at"]
+    assert attempted["output_count_at_click"] == 1
+    assert attempted["active_project_id_at_click"] == request.provider_project_id
+    assert attempted["prompt_sha256_at_click"] == request.prompt_sha256
+
+    snapshot = {
+        "project_id": request.provider_project_id,
+        "media_ids": ("old-media", "new-media"),
+        "execution_ids": ("old-execution", "new-execution"),
+    }
+    first = ledger.capture_outcome_snapshot(
+        request.d2_run_id, **snapshot, observed_at="2026-10-30T12:00:00Z"
+    )
+    replay = ledger.capture_outcome_snapshot(
+        request.d2_run_id, **snapshot, observed_at="2026-10-30T12:01:00Z"
+    )
+    assert len(first["asset_outcome_snapshots"]) == 1
+    assert len(replay["asset_outcome_snapshots"]) == 1
+    assert replay["generate_action_count"] == 1
+    assert replay["accounted_credit_cost"] == attempted["accounted_credit_cost"]
+    assert replay["provider_project_id"] == request.provider_project_id
+    with pytest.raises(PhaseGError) as mismatch:
+        ledger.capture_outcome_snapshot(
+            request.d2_run_id,
+            project_id="wrong-project",
+            media_ids=("new-media",),
+            execution_ids=(),
+            observed_at="2026-10-30T12:02:00Z",
+        )
+    assert mismatch.value.code == "PHASE_G_PROJECT_MISMATCH"
 
 
 def test_correlated_submit_rpc_reason_is_allowlisted_without_terminalizing_attempt(
@@ -258,11 +317,15 @@ def test_correlated_submit_rpc_reason_is_allowlisted_without_terminalizing_attem
             provider_submit_refusal_detected=True,
             provider_submit_refusal_code="TEST_ONLY_REASON_TOKEN",
             provider_submit_request_failed=False,
+            provider_submit_response_sha256="b" * 64,
+            provider_submit_response_at="2026-10-23T00:00:01.000Z",
         ),
     )
 
     assert attempt["submission_state"] == "GENERATE_ACTION_RECORDED"
     assert attempt["provider_submit_refusal_detected"] is True
+    assert attempt["provider_submit_response_sha256"] == "b" * 64
+    assert attempt["provider_submit_response_at"] == "2026-10-23T00:00:01.000Z"
     assert attempt["provider_submit_transport_classification"] == "SUBMIT_RESPONSE_PROVIDER_REFUSAL"
 
 

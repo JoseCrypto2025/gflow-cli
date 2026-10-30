@@ -11,7 +11,7 @@ import hashlib
 import re
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 _TEST_PROJECT_ID = "34e60953-e534-46e9-ac65-993893e61065"
 _TEST_PROJECT_NAME = "AI Video Automation V2 - TEST"
 _TEST_AUTH_PROFILE = "GFLOW_V2_TEST_AUTH"
+_PROD_ACCOUNT_ID = "PVA_0002"
+_PROD_PROJECT_ID = "aafe9282-071f-4333-baa4-92b9f76a9c27"
+_PROD_ACCOUNT_EMAIL = "singleava508@gmail.com"
+_PROD_PROJECT_NAME = "AI Video Automation V2 - PROD"
+_PROD_AUTH_PROFILE = "GFLOW_PROD_AUTH"
 _MODEL_DISPLAY_NAMES = {"MDL_0001": "Veo 3.1 - Lite"}
 _FLOW_ORIGIN = "https://flow.google.com"
 _VIDEO_STATE_JS = r"""
@@ -252,6 +257,26 @@ def provider_directive_sha256(prompt: str) -> str:
     return hashlib.sha256(" ".join(prompt.split()).encode("utf-8")).hexdigest()
 
 
+def validate_prod_flow_identity(
+    *,
+    auth_profile_key: str,
+    expected_email: str,
+    provider_account_id: str,
+    provider_project_id: str,
+    project_name: str,
+) -> None:
+    """Fail before opening a browser unless PROD uses its canonical identity tuple."""
+    if auth_profile_key == _PROD_AUTH_PROFILE and (
+        expected_email.casefold() != _PROD_ACCOUNT_EMAIL
+        or provider_account_id != _PROD_ACCOUNT_ID
+        or provider_project_id != _PROD_PROJECT_ID
+        or project_name != _PROD_PROJECT_NAME
+    ):
+        raise FlowPresubmitError(
+            "FLOW_PROJECT_MISMATCH", "PROD Flow access must use the canonical pinned identity"
+        )
+
+
 def _finished_tile_hashes(state: Mapping[str, object]) -> list[str]:
     """Hash stable tile identities returned by the DOM probe without query strings."""
     locations = state.get("finished_tile_locations")
@@ -344,6 +369,9 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._generate_click_dispatched: bool | None = None
         self._submit_requests: list[Any] = []
         self._submit_observed_at: str | None = None
+        self._submit_request_sha256: str | None = None
+        self._submit_response_sha256: str | None = None
+        self._submit_response_at: str | None = None
         self._submit_project_id: str | None = None
         self._submit_request_failed: bool | None = None
         self._submit_response_observed = False
@@ -372,6 +400,13 @@ class GoogleFlowAgentOnlyGenerationPort:
                 "FLOW_EXPECTED_IDENTITY_REQUIRED",
                 "live Phase G requires an explicitly verified Google account identity",
             )
+        validate_prod_flow_identity(
+            auth_profile_key=auth_profile_key,
+            expected_email=expected_email,
+            provider_account_id=provider_account_id,
+            provider_project_id=provider_project_id,
+            project_name=project_name,
+        )
         base = await GoogleFlowAgentOnlyPort.open(
             auth_profile_key=auth_profile_key,
             provider_account_id=provider_account_id,
@@ -429,6 +464,19 @@ class GoogleFlowAgentOnlyGenerationPort:
         if self._request is not None or self._generate_clicked:
             raise PhaseGError("PHASE_G_PORT_ALREADY_BOUND", "Flow port is already bound")
         context = request.execution_context
+        if (
+            context is not None
+            and context.environment == "PROD"
+            and (
+                context.provider_account_id != _PROD_ACCOUNT_ID
+                or context.provider_project_id != _PROD_PROJECT_ID
+                or context.auth_profile != _PROD_AUTH_PROFILE
+                or request.provider_project_id != _PROD_PROJECT_ID
+            )
+        ):
+            raise PhaseGError(
+                "FLOW_PROJECT_MISMATCH", "PROD request does not use the canonical pinned project"
+            )
         if context is None:
             valid_identity = (
                 self._auth_profile_key == _TEST_AUTH_PROFILE
@@ -677,6 +725,9 @@ class GoogleFlowAgentOnlyGenerationPort:
             provider_submit_generation_record_observed=(self._submit_generation_record_observed),
             provider_submit_refusal_detected=self._submit_refusal_detected,
             provider_submit_refusal_code=self._submit_refusal_code,
+            provider_submit_request_sha256=self._submit_request_sha256,
+            provider_submit_response_sha256=self._submit_response_sha256,
+            provider_submit_response_at=self._submit_response_at,
         )
 
     def disarm_submit_request_observer(self) -> None:
@@ -800,16 +851,38 @@ class GoogleFlowAgentOnlyGenerationPort:
             raise PhaseGError("PHASE_G_GATE_NOT_APPROVED", "new gate was not approved")
         deadline = observation_deadline
         peak_pending = self._observed_peak_pending
+        asset_snapshot_media_ids: tuple[str, ...] = ()
+        asset_snapshot_execution_ids: tuple[str, ...] = ()
+        asset_snapshot_at: str | None = None
         first_observation = True
         while first_observation or _monotonic() < deadline:
             first_observation = False
             await self._raise_wire_refusal()
             page = self._require_page()
+            parsed_url = urlparse(page.url)
+            if (
+                parsed_url.netloc != "flow.google.com"
+                or parsed_url.path != f"/project/{request.provider_project_id}"
+            ):
+                raise PhaseGError(
+                    "FLOW_PROJECT_MISMATCH", "Flow left the pinned project during observation"
+                )
             state = await page.evaluate(_VIDEO_STATE_JS)
             if not isinstance(state, dict):
                 await _async_sleep(1)
                 continue
             state = cast(dict[str, object], state)
+            asset_snapshot_media_ids = tuple(sorted(self._valid_ids(state.get("media_ids"))))
+            asset_snapshot_execution_ids = tuple(
+                sorted(
+                    record.workflow_id.casefold()
+                    for record in self._records.values()
+                    if record.project_id == request.provider_project_id
+                )
+            )
+            asset_snapshot_at = (
+                datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            )
             if self._observed_new_turn_bubble_index is None:
                 self._observed_new_turn_bubble_index = self._new_agent_turn_bubble_index(
                     state, baseline
@@ -831,14 +904,19 @@ class GoogleFlowAgentOnlyGenerationPort:
                     )
             wire_failed = [record for record in wire_new if record.is_failed]
             if wire_failed:
-                return PhaseGAttemptEvidence(
-                    request.d2_run_id,
-                    "GENERATION_FAILED",
-                    provider_execution_id=wire_failed[0].workflow_id,
-                    provider_media_id=wire_failed[0].media_id,
-                    provider_project_id=request.provider_project_id,
-                    terminal_state="GENERATION_FAILED",
-                    attributed_confirmation_id=confirmation_id,
+                return replace(
+                    PhaseGAttemptEvidence(
+                        request.d2_run_id,
+                        "GENERATION_FAILED",
+                        provider_execution_id=wire_failed[0].workflow_id,
+                        provider_media_id=wire_failed[0].media_id,
+                        provider_project_id=request.provider_project_id,
+                        terminal_state="GENERATION_FAILED",
+                        attributed_confirmation_id=confirmation_id,
+                    ),
+                    asset_snapshot_media_ids=asset_snapshot_media_ids,
+                    asset_snapshot_execution_ids=asset_snapshot_execution_ids,
+                    asset_snapshot_at=asset_snapshot_at,
                 )
             wire_done = [record for record in wire_new if record.is_done]
             finished_dom_ids = set(self._valid_ids(state.get("finished_media_ids")))
@@ -896,14 +974,19 @@ class GoogleFlowAgentOnlyGenerationPort:
                 self._submission_surface != "AGENT_ONLY" or len(new_tile_hashes) == len(media_ids)
             ):
                 ids = tuple(sorted(media_ids))
-                return PhaseGAttemptEvidence(
-                    request.d2_run_id,
-                    "UNEXPECTED_MULTI_OUTPUT",
-                    provider_execution_id=wire_new[0].workflow_id if wire_new else None,
-                    provider_project_id=request.provider_project_id,
-                    terminal_state="UNEXPECTED_MULTI_OUTPUT",
-                    attributed_confirmation_id=confirmation_id,
-                    new_provider_media_ids=ids,
+                return replace(
+                    PhaseGAttemptEvidence(
+                        request.d2_run_id,
+                        "UNEXPECTED_MULTI_OUTPUT",
+                        provider_execution_id=wire_new[0].workflow_id if wire_new else None,
+                        provider_project_id=request.provider_project_id,
+                        terminal_state="UNEXPECTED_MULTI_OUTPUT",
+                        attributed_confirmation_id=confirmation_id,
+                        new_provider_media_ids=ids,
+                    ),
+                    asset_snapshot_media_ids=asset_snapshot_media_ids,
+                    asset_snapshot_execution_ids=asset_snapshot_execution_ids,
+                    asset_snapshot_at=asset_snapshot_at,
                 )
             baseline_chat_count, _, baseline_chat_hash = (baseline.agent_turn_id or "0:").partition(
                 ":"
@@ -935,25 +1018,35 @@ class GoogleFlowAgentOnlyGenerationPort:
                     ),
                     None,
                 )
-                return PhaseGAttemptEvidence(
-                    request.d2_run_id,
-                    "GENERATION_SUCCEEDED",
-                    provider_execution_id=workflow_id,
-                    provider_media_id=media_id,
-                    provider_project_id=request.provider_project_id,
-                    terminal_state="GENERATION_SUCCEEDED",
-                    attributed_confirmation_id=confirmation_id,
-                    new_provider_media_ids=(media_id,),
+                return replace(
+                    PhaseGAttemptEvidence(
+                        request.d2_run_id,
+                        "GENERATION_SUCCEEDED",
+                        provider_execution_id=workflow_id,
+                        provider_media_id=media_id,
+                        provider_project_id=request.provider_project_id,
+                        terminal_state="GENERATION_SUCCEEDED",
+                        attributed_confirmation_id=confirmation_id,
+                        new_provider_media_ids=(media_id,),
+                    ),
+                    asset_snapshot_media_ids=asset_snapshot_media_ids,
+                    asset_snapshot_execution_ids=asset_snapshot_execution_ids,
+                    asset_snapshot_at=asset_snapshot_at,
                 )
             if _monotonic() >= deadline and peak_pending:
-                return PhaseGAttemptEvidence(
-                    request.d2_run_id,
-                    "GENERATION_PENDING",
-                    provider_execution_id=wire_new[0].workflow_id if wire_new else None,
-                    provider_media_id=wire_new[0].media_id if wire_new else None,
-                    provider_project_id=request.provider_project_id,
-                    attributed_confirmation_id=confirmation_id,
-                    new_provider_media_ids=tuple(sorted(media_ids)),
+                return replace(
+                    PhaseGAttemptEvidence(
+                        request.d2_run_id,
+                        "GENERATION_PENDING",
+                        provider_execution_id=wire_new[0].workflow_id if wire_new else None,
+                        provider_media_id=wire_new[0].media_id if wire_new else None,
+                        provider_project_id=request.provider_project_id,
+                        attributed_confirmation_id=confirmation_id,
+                        new_provider_media_ids=tuple(sorted(media_ids)),
+                    ),
+                    asset_snapshot_media_ids=asset_snapshot_media_ids,
+                    asset_snapshot_execution_ids=asset_snapshot_execution_ids,
+                    asset_snapshot_at=asset_snapshot_at,
                 )
             if _monotonic() >= deadline:
                 break
@@ -967,19 +1060,29 @@ class GoogleFlowAgentOnlyGenerationPort:
         ]
         if wire_pending:
             record = wire_pending[0]
-            return PhaseGAttemptEvidence(
-                request.d2_run_id,
-                "GENERATION_PENDING" if record.status in {2, 6} else "SUBMISSION_ACKNOWLEDGED",
-                provider_execution_id=record.workflow_id,
-                provider_media_id=record.media_id,
-                provider_project_id=record.project_id,
-                attributed_confirmation_id=confirmation_id,
+            return replace(
+                PhaseGAttemptEvidence(
+                    request.d2_run_id,
+                    "GENERATION_PENDING" if record.status in {2, 6} else "SUBMISSION_ACKNOWLEDGED",
+                    provider_execution_id=record.workflow_id,
+                    provider_media_id=record.media_id,
+                    provider_project_id=record.project_id,
+                    attributed_confirmation_id=confirmation_id,
+                ),
+                asset_snapshot_media_ids=asset_snapshot_media_ids,
+                asset_snapshot_execution_ids=asset_snapshot_execution_ids,
+                asset_snapshot_at=asset_snapshot_at,
             )
-        return PhaseGAttemptEvidence(
-            request.d2_run_id,
-            "UNKNOWN_SUBMISSION_STATE",
-            provider_project_id=request.provider_project_id,
-            attributed_confirmation_id=confirmation_id,
+        return replace(
+            PhaseGAttemptEvidence(
+                request.d2_run_id,
+                "UNKNOWN_SUBMISSION_STATE",
+                provider_project_id=request.provider_project_id,
+                attributed_confirmation_id=confirmation_id,
+            ),
+            asset_snapshot_media_ids=asset_snapshot_media_ids,
+            asset_snapshot_execution_ids=asset_snapshot_execution_ids,
+            asset_snapshot_at=asset_snapshot_at,
         )
 
     async def download_exact_media(self, temp_root: Path, media_id: str) -> RecoveredClip:
@@ -1027,6 +1130,15 @@ class GoogleFlowAgentOnlyGenerationPort:
         ):
             return
         self._submit_requests.append(request)
+        try:
+            request_body = request.post_data
+        except Exception:
+            request_body = None
+        self._submit_request_sha256 = (
+            hashlib.sha256(request_body.encode("utf-8")).hexdigest()
+            if isinstance(request_body, str)
+            else None
+        )
         self._submit_project_id = attempt.provider_project_id
         if self._submit_observed_at is None:
             self._submit_observed_at = (
@@ -1071,6 +1183,11 @@ class GoogleFlowAgentOnlyGenerationPort:
             body = await response.text()
         except Exception:
             return
+        if is_submit_response:
+            self._submit_response_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            self._submit_response_at = (
+                datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            )
         for error in rpc_errors(body):
             if not is_submit_response or error.rpcid != TEXT_TO_VIDEO_SUBMIT_RPC:
                 continue

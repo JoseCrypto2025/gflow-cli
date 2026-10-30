@@ -58,6 +58,10 @@ _ACCOUNT_ID = "PVA_0001"
 _PROJECT_ID = "34e60953-e534-46e9-ac65-993893e61065"
 _PROJECT_NAME = "AI Video Automation V2 - TEST"
 _AUTH_PROFILE = "GFLOW_V2_TEST_AUTH"
+_PROD_ACCOUNT_ID = "PVA_0002"
+_PROD_PROJECT_ID = "aafe9282-071f-4333-baa4-92b9f76a9c27"
+_PROD_PROJECT_NAME = "AI Video Automation V2 - PROD"
+_PROD_AUTH_PROFILE = "GFLOW_PROD_AUTH"
 _MODEL_DISPLAY_NAMES = {"MDL_0001": "Veo 3.1 - Lite"}
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", re.I)
 
@@ -280,6 +284,15 @@ def build_phase_g_request(
     account = accounts[0]
     sheet_project_id = account.get("Provider_Project_ID")
     project_id = execution_context.provider_project_id if execution_context else _PROJECT_ID
+    if environment == "PROD" and (
+        account_id != _PROD_ACCOUNT_ID
+        or execution_context is None
+        or execution_context.auth_profile != _PROD_AUTH_PROFILE
+        or project_id != _PROD_PROJECT_ID
+    ):
+        raise PhaseGError(
+            "FLOW_PROJECT_MISMATCH", "PROD execution must use the canonical pinned project"
+        )
     context_identity: dict[str, str] = {}
     if (
         not isinstance(sheet_project_id, str)

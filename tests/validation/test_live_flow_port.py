@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from gflow_cli.v2_runtime.errors import FlowPresubmitError
@@ -81,6 +83,51 @@ def test_live_port_rejects_personal_or_unmapped_auth_profile_names() -> None:
             project_name="AI Video Automation V2 - TEST",
             model_display_names={"MDL_0001": "Veo 3.1 - Lite"},
         )
+
+
+def test_select_project_mismatch_and_not_ready_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _port()
+
+    class Page:
+        url = "https://flow.google.com/project/34e60953-e534-46e9-ac65-993893e61065"
+
+        async def goto(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def locator(self, _selector: str) -> SimpleNamespace:
+            async def wait_for(**_kwargs: object) -> None:
+                return None
+
+            return SimpleNamespace(wait_for=wait_for)
+
+        async def title(self) -> str:
+            return "Wrong Flow Project"
+
+    page = Page()
+
+    async def ensure_page() -> Page:
+        return page
+
+    monkeypatch.setattr(port, "_ensure_page", ensure_page)
+    with pytest.raises(FlowPresubmitError) as mismatch:
+        port.select_project(port.provider_project_id).send(None)
+    assert mismatch.value.code == "FLOW_PROJECT_MISMATCH"
+
+    async def unavailable_page() -> Page:
+        page.url = "https://flow.google.com/"
+
+        async def fail_goto(*_args: object, **_kwargs: object) -> None:
+            raise TimeoutError("unavailable")
+
+        page.goto = fail_goto  # type: ignore[method-assign]
+        return page
+
+    monkeypatch.setattr(port, "_ensure_page", unavailable_page)
+    with pytest.raises(FlowPresubmitError) as not_ready:
+        port.select_project(port.provider_project_id).send(None)
+    assert not_ready.value.code == "FLOW_PROJECT_NOT_READY"
 
 
 @pytest.mark.parametrize(

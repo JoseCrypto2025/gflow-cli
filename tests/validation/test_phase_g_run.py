@@ -30,6 +30,8 @@ from gflow_cli.v2_runtime.production_execution import (
 from tests.validation.test_phase_e_prompt_preflight import _fixtures
 from tests.validation.test_phase_g import request_for
 
+_PROD_PROJECT = "aafe9282-071f-4333-baa4-92b9f76a9c27"
+
 
 def _prompt_rows() -> list[dict[str, object]]:
     return [
@@ -94,7 +96,7 @@ def test_prod_request_builder_binds_context_to_live_master_identity(tmp_path: Pa
         Provider_Account_ID="PVA_0002",
         Environment="PROD",
         Auth_Profile_Key="GFLOW_PROD_AUTH",
-        Provider_Project_ID="prod-project",
+        Provider_Project_ID=_PROD_PROJECT,
     )
     tables["PROVIDER_ACCOUNT_MASTER"].append(prod_account)
     prod_profile = deepcopy(tables["GENERATION_PROFILE_MASTER"][0])
@@ -119,7 +121,7 @@ def test_prod_request_builder_binds_context_to_live_master_identity(tmp_path: Pa
         "PROD",
         "PRV_0001",
         "PVA_0002",
-        "prod-project",
+        _PROD_PROJECT,
         "GFLOW_PROD_AUTH",
         "SCN_000001",
         "GPR_0002",
@@ -141,7 +143,7 @@ def test_prod_request_builder_binds_context_to_live_master_identity(tmp_path: Pa
     )
 
     assert request.provider_account_id == "PVA_0002"
-    assert request.provider_project_id == "prod-project"
+    assert request.provider_project_id == _PROD_PROJECT
     assert request.execution_context == context
 
 
@@ -165,6 +167,59 @@ def test_prod_request_builder_rejects_test_account_context(tmp_path: Path) -> No
         build_phase_g_request(
             tables,
             _prompt_rows(),
+            d2_run_id=context.attempt_id,
+            runtime_state_root=tmp_path / "state",
+            temp_root=tmp_path / "temp",
+            execution_context=context,
+        )
+
+
+def test_prod_request_builder_rejects_date_stamped_project(tmp_path: Path) -> None:
+    tables = _d2_test_tables()
+    prod_account = deepcopy(tables["PROVIDER_ACCOUNT_MASTER"][0])
+    prod_account.update(
+        Provider_Account_ID="PVA_0002",
+        Environment="PROD",
+        Auth_Profile_Key="GFLOW_PROD_AUTH",
+        Provider_Project_ID="date-stamped-project",
+    )
+    tables["PROVIDER_ACCOUNT_MASTER"].append(prod_account)
+    prod_profile = deepcopy(tables["GENERATION_PROFILE_MASTER"][0])
+    prod_profile.update(
+        Generation_Profile_ID="GPR_0002",
+        Provider_Account_ID="PVA_0002",
+        Environment="PROD",
+        Purpose="production",
+    )
+    tables["GENERATION_PROFILE_MASTER"].append(prod_profile)
+    context = ProductionExecutionContext(
+        "PROD",
+        "PRV_0001",
+        "PVA_0002",
+        "date-stamped-project",
+        "GFLOW_PROD_AUTH",
+        "SCN_000001",
+        "GPR_0002",
+        "SPV_000006",
+        "D6_test-run-0002",
+        CreditBudgetContext(provider_remaining_free=50),
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+    )
+    preflight = preflight_scene(InMemorySceneCatalog(tables), "SCN_000001", "GPR_0002", "PROD")
+    prompt = _prompt_rows()[0]
+    prompt.update(
+        Scene_Prompt_ID="SPV_000006",
+        Generation_Profile_ID="GPR_0002",
+        Compiled_Prompt_Text=preflight.compiled_prompt or "",
+        Compiled_Negative_Prompt=preflight.compiled_negative_prompt or "",
+        Source_Context_SHA256=preflight.source_context_sha256 or "",
+        Prompt_SHA256=preflight.prompt_sha256 or "",
+    )
+    with pytest.raises(PhaseGError, match="canonical pinned project"):
+        build_phase_g_request(
+            tables,
+            [prompt],
             d2_run_id=context.attempt_id,
             runtime_state_root=tmp_path / "state",
             temp_root=tmp_path / "temp",

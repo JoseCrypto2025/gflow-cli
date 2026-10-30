@@ -274,6 +274,9 @@ class PhaseGAttemptEvidence:
     accounted_credit_cost: Decimal | None = None
     attributed_confirmation_id: str | None = None
     new_provider_media_ids: tuple[str, ...] = ()
+    asset_snapshot_media_ids: tuple[str, ...] = ()
+    asset_snapshot_execution_ids: tuple[str, ...] = ()
+    asset_snapshot_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +297,9 @@ class PhaseGSubmitTransportEvidence:
     provider_submit_generation_record_observed: bool | None = None
     provider_submit_refusal_detected: bool | None = None
     provider_submit_refusal_code: str | None = None
+    provider_submit_request_sha256: str | None = None
+    provider_submit_response_sha256: str | None = None
+    provider_submit_response_at: str | None = None
     submission_surface: str = "CLASSIC_MIGRATED"
     agent_turn_dispatched: bool | None = None
 
@@ -773,6 +779,14 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 confirmation_id,
                 observation_deadline=observation_deadline,
             )
+            if evidence.asset_snapshot_at is not None:
+                self.ledger.capture_outcome_snapshot(
+                    request.d2_run_id,
+                    project_id=request.provider_project_id,
+                    media_ids=evidence.asset_snapshot_media_ids,
+                    execution_ids=evidence.asset_snapshot_execution_ids,
+                    observed_at=evidence.asset_snapshot_at,
+                )
             submit_transport = self.port.read_submit_transport_evidence()
             self.ledger.record_submit_transport_evidence(request.d2_run_id, submit_transport)
             if (
@@ -2683,7 +2697,16 @@ class D2DailyCreditLedger:
                     )
             attempt["generate_action_count"] = 1
             if attempt.get("execution_environment") == "PROD":
-                attempt["generate_action_at"] = _utc_now()
+                action_at = _utc_now()
+                attempt["generate_action_intent_at"] = action_at
+                attempt["generate_action_at"] = action_at
+                attempt["active_project_id_at_click"] = attempt["provider_project_id"]
+                attempt["active_account_id_at_click"] = attempt["provider_account_id"]
+                attempt["model_id_at_click"] = attempt["model_id"]
+                attempt["aspect_ratio_at_click"] = attempt["requested_aspect_ratio"]
+                attempt["output_count_at_click"] = attempt["requested_output_count"]
+                attempt["prompt_id_at_click"] = attempt["scene_prompt_id"]
+                attempt["prompt_sha256_at_click"] = attempt["prompt_sha256"]
             attempt["submission_state"] = "GENERATE_ACTION_RECORDED"
             attempt["updated_at"] = _utc_now()
             return dict(attempt)
@@ -2726,6 +2749,12 @@ class D2DailyCreditLedger:
             raise PhaseGError(
                 "PHASE_G_SUBMIT_EVIDENCE_INVALID", "submit request facts are incomplete"
             )
+        for digest in (
+            evidence.provider_submit_request_sha256,
+            evidence.provider_submit_response_sha256,
+        ):
+            if digest is not None and not _SHA256_RE.fullmatch(digest):
+                raise PhaseGError("PHASE_G_SUBMIT_EVIDENCE_INVALID", "submit digest is invalid")
         if not count and any(
             value is not None
             for value in (
@@ -2852,6 +2881,9 @@ class D2DailyCreditLedger:
                     evidence.provider_submit_generation_record_observed
                 ),
                 provider_submit_refusal_detected=evidence.provider_submit_refusal_detected,
+                provider_submit_request_sha256=evidence.provider_submit_request_sha256,
+                provider_submit_response_sha256=evidence.provider_submit_response_sha256,
+                provider_submit_response_at=evidence.provider_submit_response_at,
                 provider_submit_transport_classification=(
                     self._submit_transport_classification(evidence)
                 ),
@@ -2904,6 +2936,8 @@ class D2DailyCreditLedger:
                 )
             attempt.update(
                 baseline_captured=True,
+                baseline_captured_at=_utc_now(),
+                baseline_project_id=baseline.project_id,
                 baseline_media_ids=sorted(baseline.media_ids),
                 baseline_execution_ids=sorted(baseline.execution_ids),
                 baseline_pending_count=baseline.pending_count,
@@ -2914,6 +2948,67 @@ class D2DailyCreditLedger:
                 baseline_chat_video_media_ids=sorted(baseline.chat_video_media_ids),
                 updated_at=_utc_now(),
             )
+            return dict(attempt)
+
+        return self._mutate(update)
+
+    def capture_outcome_snapshot(
+        self,
+        d2_run_id: str,
+        *,
+        project_id: str,
+        media_ids: Sequence[str],
+        execution_ids: Sequence[str],
+        observed_at: str,
+    ) -> dict[str, object]:
+        """Persist one idempotent, read-only post-submit project asset observation."""
+        if (
+            not observed_at
+            or not project_id
+            or any(not value for value in (*media_ids, *execution_ids))
+        ):
+            raise PhaseGError("PHASE_G_ASSET_SNAPSHOT_INVALID", "asset snapshot is incomplete")
+        ordered_media_ids = sorted(set(value.casefold() for value in media_ids))
+        ordered_execution_ids = sorted(set(value.casefold() for value in execution_ids))
+        digest_value = {
+            "project_id": project_id,
+            "media_ids": ordered_media_ids,
+            "execution_ids": ordered_execution_ids,
+        }
+        snapshot_sha256 = hashlib.sha256(
+            json.dumps(digest_value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            attempt = self._attempt(payload, d2_run_id)
+            if _counter(attempt.get("generate_action_count")) < 1 or project_id != attempt.get(
+                "provider_project_id"
+            ):
+                raise PhaseGError(
+                    "PHASE_G_PROJECT_MISMATCH",
+                    "asset snapshot is not bound to this submitted attempt",
+                )
+            history_value = attempt.get("asset_outcome_snapshots", [])
+            if not isinstance(history_value, list) or any(
+                not isinstance(item, dict) for item in cast(list[object], history_value)
+            ):
+                raise PhaseGError("PHASE_G_LEDGER_CORRUPT", "asset snapshot history is invalid")
+            history = cast(list[dict[str, object]], history_value)
+            existing = next(
+                (item for item in history if item.get("snapshot_sha256") == snapshot_sha256), None
+            )
+            if existing is None:
+                history.append(
+                    {
+                        "project_id": project_id,
+                        "observed_at": observed_at,
+                        "media_ids": ordered_media_ids,
+                        "execution_ids": ordered_execution_ids,
+                        "snapshot_sha256": snapshot_sha256,
+                    }
+                )
+                attempt["asset_outcome_snapshots"] = history
+                attempt["updated_at"] = _utc_now()
             return dict(attempt)
 
         return self._mutate(update)
@@ -4498,6 +4593,14 @@ class D2DailyCreditLedger:
             "started_at": now,
             "started_bangkok_date": datetime.now(_BANGKOK).date().isoformat(),
             "generate_action_count": 0,
+            "generate_action_intent_at": None,
+            "active_project_id_at_click": None,
+            "active_account_id_at_click": None,
+            "model_id_at_click": None,
+            "aspect_ratio_at_click": None,
+            "output_count_at_click": None,
+            "prompt_id_at_click": None,
+            "prompt_sha256_at_click": None,
             "generate_click_dispatched": None,
             "provider_submit_rpc_observed": None,
             "submission_surface": None,
@@ -4522,6 +4625,8 @@ class D2DailyCreditLedger:
             "observed_credit_cost": None,
             "observed_visible_balance": None,
             "baseline_captured": False,
+            "baseline_captured_at": None,
+            "baseline_project_id": None,
             "baseline_media_ids": [],
             "baseline_execution_ids": [],
             "baseline_pending_count": None,
@@ -4537,6 +4642,10 @@ class D2DailyCreditLedger:
             "provider_execution_id": None,
             "provider_media_id": None,
             "provider_media_ids": [],
+            "provider_submit_request_sha256": None,
+            "provider_submit_response_sha256": None,
+            "provider_submit_response_at": None,
+            "asset_outcome_snapshots": [],
             "terminal_state": None,
             "updated_at": now,
         }

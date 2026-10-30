@@ -21,6 +21,20 @@ class ProdReconciliationResult(StrEnum):
     AMBIGUOUS_AFTER_RECONCILIATION = "AMBIGUOUS_AFTER_RECONCILIATION"
 
 
+class ProdAssetOutcome(StrEnum):
+    PREPARED = "PREPARED"
+    CLICK_RECORDED = "CLICK_RECORDED"
+    SUBMISSION_OBSERVED = "SUBMISSION_OBSERVED"
+    SUBMISSION_ACCEPTED = "SUBMISSION_ACCEPTED"
+    PROCESSING = "PROCESSING"
+    OUTPUT_FOUND = "OUTPUT_FOUND"
+    SUCCESS = "SUCCESS"
+    PROVIDER_REJECTED = "PROVIDER_REJECTED"
+    PROVEN_NOT_SUBMITTED = "PROVEN_NOT_SUBMITTED"
+    TIMEOUT_PENDING = "TIMEOUT_PENDING"
+    AMBIGUOUS_AFTER_RECONCILIATION = "AMBIGUOUS_AFTER_RECONCILIATION"
+
+
 @dataclass(frozen=True, slots=True)
 class ProdAttemptIdentity:
     production_job_id: str
@@ -251,6 +265,96 @@ def prod_evidence_from_attempt(
 ) -> ProdReconciliationEvidence | None:
     """Build evidence only from fields already durably observed in one D2 row."""
     return _evidence_from_attempt(identity, attempt)
+
+
+def classify_prod_asset_outcome(
+    expected: ProdAttemptIdentity,
+    attempt: Mapping[str, object],
+    *,
+    after_project_id: str,
+    after_media_ids: tuple[str, ...],
+    after_execution_ids: tuple[str, ...],
+    timed_out: bool = False,
+) -> ProdAssetOutcome:
+    """Classify one read-only project snapshot without latest-item or time heuristics."""
+    if not _persisted_identity_matches(expected, attempt):
+        return ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+    if attempt.get("provider_project_id") != expected.provider_project_id:
+        return ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+    if after_project_id != expected.provider_project_id:
+        return ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+    if attempt.get("generate_action_count") != 1:
+        return ProdAssetOutcome.PREPARED
+    if attempt.get("baseline_captured") is not True:
+        return ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+    if not isinstance(attempt.get("baseline_media_ids"), list) or not isinstance(
+        attempt.get("baseline_execution_ids"), list
+    ):
+        return ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+    baseline_media = _string_tuple(attempt.get("baseline_media_ids"))
+    baseline_execution = _string_tuple(attempt.get("baseline_execution_ids"))
+    if attempt.get("submission_state") == "D2_SUCCEEDED":
+        media_id = attempt.get("provider_media_id")
+        if (
+            isinstance(media_id, str)
+            and media_id.casefold() not in {item.casefold() for item in baseline_media}
+            and media_id.casefold() in {item.casefold() for item in after_media_ids}
+        ):
+            return ProdAssetOutcome.SUCCESS
+        return ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+    persisted_evidence = _evidence_from_attempt(expected, attempt)
+    if (
+        persisted_evidence is not None
+        and classify_prod_reconciliation(expected, persisted_evidence, persisted_attempt=attempt)
+        == ProdReconciliationResult.PROVEN_NOT_SUBMITTED
+    ):
+        return ProdAssetOutcome.PROVEN_NOT_SUBMITTED
+    if (
+        attempt.get("provider_submit_response_observed") is True
+        and attempt.get("provider_submit_response_status") is not None
+        and attempt.get("provider_submit_refusal_detected") is True
+        and attempt.get("submission_state") in {"PROVIDER_REFUSED", "WAF_REJECTED"}
+    ):
+        return ProdAssetOutcome.PROVIDER_REJECTED
+    if timed_out and attempt.get("submission_state") in {
+        "GENERATE_ACTION_RECORDED",
+        "UNKNOWN_SUBMISSION_STATE",
+        "SUBMISSION_ACKNOWLEDGED",
+        "GENERATION_PENDING",
+    }:
+        return ProdAssetOutcome.TIMEOUT_PENDING
+    if attempt.get("submission_state") == "GENERATION_PENDING":
+        return ProdAssetOutcome.PROCESSING
+
+    current_media = {item.casefold() for item in after_media_ids}
+    current_execution = {item.casefold() for item in after_execution_ids}
+    old_media = {item.casefold() for item in baseline_media}
+    old_execution = {item.casefold() for item in baseline_execution}
+    new_media = current_media - old_media
+    new_execution = current_execution - old_execution
+    provider_media = attempt.get("provider_media_id")
+    provider_execution = attempt.get("provider_execution_id")
+    if (
+        isinstance(provider_media, str)
+        and provider_media.casefold() in new_media
+        and attempt.get("provider_project_id") == expected.provider_project_id
+        and (
+            provider_execution is None
+            or (
+                isinstance(provider_execution, str)
+                and provider_execution.casefold() not in old_execution
+                and provider_execution.casefold() in new_execution
+            )
+        )
+    ):
+        return ProdAssetOutcome.OUTPUT_FOUND
+    if attempt.get("submission_state") == "GENERATE_ACTION_RECORDED":
+        return ProdAssetOutcome.CLICK_RECORDED
+    if _integer(attempt.get("provider_submit_request_count")) > 0:
+        return ProdAssetOutcome.SUBMISSION_OBSERVED
+    if attempt.get("submission_state") in {"SUBMISSION_ACKNOWLEDGED", "GENERATION_PENDING"}:
+        return ProdAssetOutcome.SUBMISSION_ACCEPTED
+    return ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
 
 
 def _persisted_identity_matches(

@@ -75,6 +75,8 @@ settings controls, migrated batchexecute parser, and exact media recovery path.
 The production Drive storage adapter remains fail-closed; D2 persistence uses
 the connected Drive connector with separate remote download/hash verification. See
 [Phase G D2 controlled execution](architecture/PHASE_G_D2_CONTROLLED_EXECUTION.md).
+PROD project pinning and future D6 submit/asset-outcome evidence are governed by
+[D6 Generation Outcome Evidence V1](operations/D6_GENERATION_OUTCOME_EVIDENCE_V1.md).
 The live port requires an expected TEST account identity and fails closed on
 non-English UI locales until translated control behavior is verified. A
 one-shot, credit-consuming regression is available at

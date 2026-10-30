@@ -8,9 +8,11 @@ import pytest
 from gflow_cli.v2_runtime import phase_g_run
 from gflow_cli.v2_runtime.phase_g import D2DailyCreditLedger, PhaseGError
 from gflow_cli.v2_runtime.phase_g_prod_reconciliation import (
+    ProdAssetOutcome,
     ProdAttemptIdentity,
     ProdReconciliationEvidence,
     ProdReconciliationResult,
+    classify_prod_asset_outcome,
     classify_prod_reconciliation,
     evidence_audit_record,
 )
@@ -80,6 +82,103 @@ def test_ui_click_without_provider_receipt_remains_ambiguous() -> None:
         persisted_attempt=_attempt(identity, generate_action_count=1),
     )
     assert result is ProdReconciliationResult.AMBIGUOUS_AFTER_RECONCILIATION
+
+
+def test_latest_asset_alone_does_not_link_to_attempt() -> None:
+    identity = _identity()
+    result = classify_prod_asset_outcome(
+        identity,
+        _attempt(identity),
+        after_project_id=identity.provider_project_id,
+        after_media_ids=("newest-visible-media",),
+        after_execution_ids=(),
+    )
+    assert result is ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+
+
+def test_provider_media_identity_and_new_project_snapshot_find_output() -> None:
+    identity = _identity()
+    attempt = _attempt(
+        identity,
+        submission_state="GENERATION_SUCCEEDED",
+        provider_execution_id="exec-9",
+        provider_media_id="media-9",
+        provider_media_ids=["media-9"],
+    )
+    assert (
+        classify_prod_asset_outcome(
+            identity,
+            attempt,
+            after_project_id=identity.provider_project_id,
+            after_media_ids=("old-media", "media-9"),
+            after_execution_ids=("exec-9",),
+        )
+        is ProdAssetOutcome.OUTPUT_FOUND
+    )
+
+
+def test_old_asset_is_not_output_and_wrong_project_fails_closed() -> None:
+    identity = _identity()
+    attempt = _attempt(
+        identity,
+        provider_execution_id="exec-9",
+        provider_media_id="old-media",
+        provider_media_ids=["old-media"],
+        baseline_media_ids=["old-media"],
+    )
+    assert (
+        classify_prod_asset_outcome(
+            identity,
+            attempt,
+            after_project_id=identity.provider_project_id,
+            after_media_ids=("old-media",),
+            after_execution_ids=("exec-9",),
+        )
+        is ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+    )
+    assert (
+        classify_prod_asset_outcome(
+            identity,
+            attempt,
+            after_project_id="wrong-project",
+            after_media_ids=("new-media",),
+            after_execution_ids=("new-exec",),
+        )
+        is ProdAssetOutcome.AMBIGUOUS_AFTER_RECONCILIATION
+    )
+
+
+def test_asset_monitor_retains_timeout_pending_and_requires_validated_success() -> None:
+    identity = _identity()
+    ambiguous = _attempt(identity)
+    assert (
+        classify_prod_asset_outcome(
+            identity,
+            ambiguous,
+            after_project_id=identity.provider_project_id,
+            after_media_ids=(),
+            after_execution_ids=(),
+            timed_out=True,
+        )
+        is ProdAssetOutcome.TIMEOUT_PENDING
+    )
+    succeeded = _attempt(
+        identity,
+        submission_state="D2_SUCCEEDED",
+        provider_execution_id="exec-9",
+        provider_media_id="media-9",
+        provider_media_ids=["media-9"],
+    )
+    assert (
+        classify_prod_asset_outcome(
+            identity,
+            succeeded,
+            after_project_id=identity.provider_project_id,
+            after_media_ids=("media-9",),
+            after_execution_ids=("exec-9",),
+        )
+        is ProdAssetOutcome.SUCCESS
+    )
 
 
 def test_exact_provider_acceptance_proves_pending_submission() -> None:

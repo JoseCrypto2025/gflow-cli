@@ -22,6 +22,9 @@ from .timestamps import format_utc_timestamp
 
 _BANGKOK = timezone(timedelta(hours=7), name="Asia/Bangkok")
 _TERMINAL = frozenset({"SUCCESS", "PROVIDER_REJECTED", "FAILED_CONFIRMED", "WAF_REJECTION"})
+_PROD_PROVIDER_ACCOUNT_ID = "PVA_0002"
+_PROD_PROVIDER_PROJECT_ID = "aafe9282-071f-4333-baa4-92b9f76a9c27"
+_PROD_AUTH_PROFILE = "GFLOW_PROD_AUTH"
 
 
 class ProductionExecutionError(ValueError):
@@ -94,6 +97,12 @@ class ProductionExecutionContext:
         }
         if any(not value for value in expected.values()) or not self.attempt_id:
             raise ProductionExecutionError("execution identity is incomplete")
+        if self.environment == "PROD" and (
+            self.provider_account_id != _PROD_PROVIDER_ACCOUNT_ID
+            or self.provider_project_id != _PROD_PROVIDER_PROJECT_ID
+            or self.auth_profile != _PROD_AUTH_PROFILE
+        ):
+            raise ProductionExecutionError("PROD execution identity is not canonically pinned")
         if self.environment == "PROD" and (not self.production_job_id or not self.scene_job_id):
             raise ProductionExecutionError("PROD execution must bind production and scene jobs")
         replacement_values = (

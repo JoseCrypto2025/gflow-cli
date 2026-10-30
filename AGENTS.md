@@ -241,6 +241,11 @@ Before any legacy PROD D2 attempt assessment or recovery, also read
 This compatibility contract is separate from modern PROD and frozen TEST recovery; it never
 backfills historical D2 evidence.
 
+Before any future PROD Phase G / D6 generation execution, also read
+[`docs/ai-video-automation-v2/operations/D6_GENERATION_OUTCOME_EVIDENCE_V1.md`](docs/ai-video-automation-v2/operations/D6_GENERATION_OUTCOME_EVIDENCE_V1.md).
+It pins the PROD Flow project and defines the durable submit and asset-outcome evidence boundary;
+it does not authorize a Generate action.
+
 Before applying an ambiguous-evidence-exhausted legacy recovery policy, also read
 [`docs/ai-video-automation-v2/operations/AMBIGUOUS_LEGACY_RECOVERY_POLICY_V1.md`](docs/ai-video-automation-v2/operations/AMBIGUOUS_LEGACY_RECOVERY_POLICY_V1.md).
 This policy quarantines the exact legacy job pair while preserving its unknown 50-credit
