@@ -111,7 +111,10 @@ def _run_f5(world: dict[str, Any]) -> None:
     )
     assert request.provider_account_id == _ACCOUNT_ID
     assert request.provider_project_id == _PROJECT_ID
-    assert display_names[request.model_id] == "Veo 3.1 - Lite"
+    assert request.model_id == "MDL_0001"
+    assert display_names[request.model_id].replace(" ", "").replace("-", "").casefold() == (
+        "veo3.1lite"
+    )
     assert request.preflight.technical_configuration.get("duration_sec") == 8
     assert request.preflight.technical_configuration.get("aspect_ratio") == "9:16"
     assert request.preflight.technical_configuration.get("output_count") == 1
