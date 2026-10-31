@@ -343,6 +343,7 @@ def _execution_context(
         scene_prompt_id=prompt_id,
         attempt_id=attempt_id,
         credit_budget_context=CreditBudgetContext(
+            authorized_run_ceiling=Decimal("30"),
             provider_remaining_free=visible_free_credits,
             is_free_quota=True,
             paid_fallback=False,

@@ -175,6 +175,7 @@ def test_execution_context_requires_exact_live_prod_identity() -> None:
     assert context.environment == "PROD"
     assert context.provider_account_id == "PVA_0002"
     assert context.provider_project_id == "aafe9282-071f-4333-baa4-92b9f76a9c27"
+    assert context.credit_budget_context.authorized_run_ceiling == Decimal("30")
     assert context.credit_budget_context.provider_remaining_free == Decimal("50")
     assert context.production_job_id == "PRD_000003"
     assert context.scene_job_id == "SJB_000003"

@@ -40,10 +40,16 @@ class CreditBudgetContext:
     quote_unit: str = "CREDIT"
     is_free_quota: bool = True
     paid_fallback: bool = False
+    authorized_run_ceiling: Decimal | None = None
 
     def __post_init__(self) -> None:
         try:
             ceiling = Decimal(str(self.daily_user_ceiling))
+            run_ceiling = (
+                Decimal(str(self.authorized_run_ceiling))
+                if self.authorized_run_ceiling is not None
+                else None
+            )
             remaining = (
                 Decimal(str(self.provider_remaining_free))
                 if self.provider_remaining_free is not None
@@ -53,6 +59,10 @@ class CreditBudgetContext:
             raise ProductionExecutionError("credit budget value is invalid") from exc
         if not ceiling.is_finite() or ceiling != Decimal("50"):
             raise ProductionExecutionError("daily free credit ceiling must remain 50")
+        if run_ceiling is not None and (
+            not run_ceiling.is_finite() or run_ceiling <= 0 or run_ceiling > ceiling
+        ):
+            raise ProductionExecutionError("authorized per-run credit ceiling is invalid")
         if self.quote_unit != "CREDIT":
             raise ProductionExecutionError("provider quote must be expressed in credits")
         if remaining is not None and (not remaining.is_finite() or remaining < 0):
@@ -226,6 +236,20 @@ class ProductionCreditGuard:
                 quote_cap = context.max_reservation_credits
                 quote_digest = context.reservation_quote_input_digest
                 quote_version = context.reservation_quote_source_version
+            authorized_ceiling: Decimal | None = None
+            if (
+                context.environment == "PROD"
+                and context.legacy_replacement_authorization_id is None
+            ):
+                authorized_ceiling = context.credit_budget_context.authorized_run_ceiling
+                if authorized_ceiling is None:
+                    raise ProductionExecutionError(
+                        "authorized per-run credit ceiling is required for PROD"
+                    )
+                if quote_cap is not None and quote_cap > authorized_ceiling:
+                    raise ProductionExecutionError(
+                        "validated quote exceeds the authorized per-run credit ceiling"
+                    )
             if any(
                 (row.get("provider_id"), row.get("date")) == identity
                 and row.get("state") not in _TERMINAL
@@ -238,6 +262,26 @@ class ProductionCreditGuard:
                 for row in records
             ):
                 raise ProductionExecutionError("provider generation stop condition is active")
+            if (
+                context.environment == "PROD"
+                and context.legacy_replacement_authorization_id is None
+                and quote_cap is not None
+            ):
+                prior_reservations = sum(
+                    (
+                        Decimal(str(row.get("reserved_credits", "0")))
+                        for row in records
+                        if (row.get("provider_id"), row.get("date")) == identity
+                    ),
+                    Decimal(0),
+                )
+                if (
+                    prior_reservations + quote_cap
+                    > context.credit_budget_context.daily_user_ceiling
+                ):
+                    raise ProductionExecutionError(
+                        "validated quote exceeds remaining shared daily free credit ceiling"
+                    )
             row: dict[str, object] = {
                 "attempt_id": context.attempt_id,
                 "environment": context.environment,
@@ -264,6 +308,9 @@ class ProductionCreditGuard:
                 row["max_reservation_credits"] = str(quote_cap)
                 row["reservation_quote_input_digest"] = quote_digest
                 row["reservation_quote_source_version"] = quote_version
+                if authorized_ceiling is not None:
+                    row["validated_quote_credits"] = str(quote_cap)
+                    row["authorized_run_ceiling"] = str(authorized_ceiling)
             if context.environment == "PROD":
                 row["production_job_id"] = context.production_job_id
                 row["scene_job_id"] = context.scene_job_id
@@ -526,6 +573,22 @@ class ProductionCreditGuard:
                     raise ProductionExecutionError(
                         "confirmation quote exceeds the validated per-run quote cap"
                     )
+                if row.get("legacy_replacement_authorization_id") is None:
+                    try:
+                        authorized_ceiling = Decimal(str(row.get("authorized_run_ceiling")))
+                        validated_quote = Decimal(str(row.get("validated_quote_credits")))
+                    except InvalidOperation as exc:
+                        raise ProductionExecutionError(
+                            "validated quote or authorized per-run ceiling is missing"
+                        ) from exc
+                    if (
+                        not authorized_ceiling.is_finite()
+                        or not validated_quote.is_finite()
+                        or quote > min(authorized_ceiling, validated_quote)
+                    ):
+                        raise ProductionExecutionError(
+                            "confirmation quote exceeds the authorized per-run reservation"
+                        )
             used = sum(
                 (
                     Decimal(str(item.get("reserved_credits", "0")))
@@ -569,6 +632,8 @@ class ProductionCreditGuard:
             row = self._find(payload, attempt_id)
             if row.get("state") in _TERMINAL:
                 raise ProductionExecutionError("terminal attempt cannot be changed")
+            if row.get("state") == "UNKNOWN_SUBMISSION_STATE" and state == row.get("state"):
+                return dict(row)
             if row.get("generate_click_count") != 1:
                 raise ProductionExecutionError("attempt has no recorded Generate click")
             if actual is not None:
@@ -587,7 +652,31 @@ class ProductionCreditGuard:
                         "actual provider usage exceeds the shared daily free credit ceiling"
                     )
             if state == "UNKNOWN_SUBMISSION_STATE":
-                row["reserved_credits"] = str(row.get("quoted_credits") or Decimal("50"))
+                if (
+                    row.get("environment") == "PROD"
+                    and row.get("legacy_replacement_authorization_id") is None
+                ):
+                    try:
+                        authorized_ceiling = Decimal(str(row.get("authorized_run_ceiling")))
+                        validated_quote = Decimal(str(row.get("validated_quote_credits")))
+                    except InvalidOperation as exc:
+                        raise ProductionExecutionError(
+                            "validated quote or authorized per-run ceiling is missing"
+                        ) from exc
+                    if (
+                        not authorized_ceiling.is_finite()
+                        or not validated_quote.is_finite()
+                        or validated_quote <= 0
+                    ):
+                        raise ProductionExecutionError(
+                            "validated quote or authorized per-run ceiling is invalid"
+                        )
+                    observed_quote = Decimal(str(row.get("quoted_credits") or validated_quote))
+                    row["reserved_credits"] = str(
+                        min(authorized_ceiling, validated_quote, observed_quote)
+                    )
+                else:
+                    row["reserved_credits"] = str(row.get("quoted_credits") or Decimal("50"))
             elif actual is not None:
                 row["reserved_credits"] = str(actual)
             row["state"] = state

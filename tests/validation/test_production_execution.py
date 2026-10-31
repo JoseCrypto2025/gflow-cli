@@ -30,10 +30,13 @@ def _context(
         "GPR_0002" if environment == "PROD" else "GPR_0001",
         "SPV_000006" if environment == "PROD" else "SPV_000004",
         attempt,
-        CreditBudgetContext(provider_remaining_free=Decimal("50")),
+        CreditBudgetContext(
+            authorized_run_ceiling=Decimal("30"),
+            provider_remaining_free=Decimal("50"),
+        ),
         production_job_id="PRD_000001" if environment == "PROD" else None,
         scene_job_id="SJB_000001" if environment == "PROD" else None,
-        max_reservation_credits=Decimal("50") if environment == "PROD" else None,
+        max_reservation_credits=Decimal("30") if environment == "PROD" else None,
         reservation_quote_input_digest="a" * 64 if environment == "PROD" else None,
         reservation_quote_source_version="PCT_000001:verified:snapshot:sha256"
         if environment == "PROD"
@@ -219,15 +222,10 @@ def test_daily_credit_guard_is_shared_across_test_and_prod(tmp_path: Path) -> No
     )
     guard.resolve(test_context.attempt_id, "FAILED_CONFIRMED", actual_credits=Decimal("30"))
 
-    guard.prepare(prod_context, now=fixed)
-    guard.record_generate_click(prod_context.attempt_id)
     with pytest.raises(ProductionExecutionError, match="shared daily"):
-        guard.reserve_quote(
-            prod_context.attempt_id,
-            video_count=1,
-            quoted_credits=Decimal("21"),
-            budget=prod_context.credit_budget_context,
-        )
+        guard.prepare(prod_context, now=fixed)
+
+    assert all(row["attempt_id"] != prod_context.attempt_id for row in guard._read()["attempts"])  # noqa: SLF001 - insufficient daily capacity creates no attempt or reservation
 
 
 def test_prod_quote_cannot_exceed_bound_per_run_cap(tmp_path: Path) -> None:
@@ -267,6 +265,88 @@ def test_prod_attempt_requires_quote_cap_before_ledger_creation(tmp_path: Path) 
         guard.prepare(context, now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))
 
     assert guard._read()["attempts"] == []  # noqa: SLF001
+
+
+@pytest.mark.parametrize("quote", [Decimal("10"), Decimal("20")])
+def test_unknown_prod_attempt_reserves_validated_quote_not_daily_budget(
+    tmp_path: Path, quote: Decimal
+) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    context = replace(
+        _context("PROD", f"D2_quote-{quote}"),
+        max_reservation_credits=quote,
+    )
+    guard.prepare(context, now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))
+    guard.record_generate_click(context.attempt_id)
+
+    guard.resolve(context.attempt_id, "UNKNOWN_SUBMISSION_STATE")
+
+    row = guard._read()["attempts"][0]  # noqa: SLF001 - inspect held exposure
+    assert row["validated_quote_credits"] == str(quote)
+    assert row["authorized_run_ceiling"] == "30"
+    assert row["reserved_credits"] == str(quote)
+    assert row["state"] == "UNKNOWN_SUBMISSION_STATE"
+
+
+def test_prod_quote_above_authorized_ceiling_stops_before_ledger_creation(
+    tmp_path: Path,
+) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    context = replace(
+        _context("PROD", "D2_quote-over-ceiling"),
+        max_reservation_credits=Decimal("40"),
+    )
+
+    with pytest.raises(ProductionExecutionError, match="authorized per-run credit ceiling"):
+        guard.prepare(context, now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))
+
+    assert guard._read()["attempts"] == []  # noqa: SLF001 - no reservation was created
+
+
+def test_prod_confirmation_quote_may_reserve_less_than_validated_quote(tmp_path: Path) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    context = replace(
+        _context("PROD", "D2_lower-confirmation-quote"),
+        max_reservation_credits=Decimal("10"),
+    )
+    guard.prepare(context, now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))
+    guard.record_generate_click(context.attempt_id)
+    guard.reserve_quote(
+        context.attempt_id,
+        video_count=1,
+        quoted_credits=Decimal("6"),
+        budget=context.credit_budget_context,
+    )
+
+    guard.resolve(context.attempt_id, "UNKNOWN_SUBMISSION_STATE")
+
+    assert guard._read()["attempts"][0]["reserved_credits"] == "6"  # noqa: SLF001
+
+
+def test_replayed_unknown_state_preserves_existing_historical_reservation(tmp_path: Path) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    context = replace(
+        _context("PROD", "D2_historical-unknown"),
+        max_reservation_credits=Decimal("10"),
+    )
+    guard.prepare(context, now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))
+    guard.record_generate_click(context.attempt_id)
+    guard.resolve(context.attempt_id, "UNKNOWN_SUBMISSION_STATE")
+
+    def seed_historical_reservation(payload: dict[str, object]) -> dict[str, object]:
+        attempts = payload["attempts"]
+        assert isinstance(attempts, list)
+        attempts[0]["reserved_credits"] = "50"
+        attempts[0]["quoted_credits"] = None
+        return payload
+
+    guard._mutate(seed_historical_reservation)  # noqa: SLF001 - model existing deployed row
+    before = guard._read()["attempts"][0]  # noqa: SLF001 - verify immutable replay
+    guard.resolve(context.attempt_id, "UNKNOWN_SUBMISSION_STATE")
+    after = guard._read()["attempts"][0]  # noqa: SLF001 - verify immutable replay
+
+    assert after == before
+    assert after["reserved_credits"] == "50"
 
 
 def test_unknown_attempt_reserves_ceiling_and_blocks_next_environment(tmp_path: Path) -> None:

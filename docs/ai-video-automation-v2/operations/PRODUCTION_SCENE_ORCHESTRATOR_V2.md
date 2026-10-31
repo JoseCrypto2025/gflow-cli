@@ -41,8 +41,14 @@ schema-validated canonical direct-credit quote. A missing or ambiguous quote
 holds the run before job/attempt/reservation creation. The validated amount,
 source version, and input digest are bound to the PROD credit guard. The later
 Flow confirmation may reserve less, but cannot exceed this per-run cap; the
-separate shared daily 50-credit ceiling remains in force. Effective duration
-and aspect ratio come from Phase E's scene/series/profile precedence.
+separate authorized per-run ceiling is 30 credits, and the shared daily 50-credit
+ceiling remains a distinct account budget. The effective reservation is bounded
+by the validated quote and the authorized per-run ceiling; a daily budget never
+enlarges it. If submission remains unknown before Flow supplies a confirmation
+quote, the PROD guard retains that bounded quote reservation. Replaying an
+already-unknown historical attempt is a no-op and preserves its recorded
+reservation. Effective duration and aspect ratio come from Phase E's
+scene/series/profile precedence.
 
 The PROD operator pins `GFLOW_CLI_HOME` to
 `/var/lib/gflow/browser-state`, which resolves

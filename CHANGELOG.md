@@ -124,6 +124,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PROD unresolved credit exposure stays within the validated quote.** The
+  production operator binds a distinct 30-credit per-run authorization ceiling;
+  unresolved submission reserves the lesser of that ceiling and the canonical
+  quote instead of falling back to the shared 50-credit daily budget. Replaying
+  an already-unknown attempt preserves its recorded reservation.
+
 - **PROD same-attempt reconciliation is identity-bound and fail-closed.** Adds the
   separate `D2_PROD_SAME_ATTEMPT_RECOVERY_V1` runtime contract and internal reconciler;
   only a persisted, exact correlated refusal can release that attempt's reservation.
