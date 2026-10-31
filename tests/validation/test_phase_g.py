@@ -200,6 +200,238 @@ def test_unknown_post_submit_state_reserves_remaining_daily_budget(tmp_path: Pat
     assert duplicate.value.code == "PHASE_G_DUPLICATE_SUBMIT_FORBIDDEN"
 
 
+def _prod_certification_request(
+    tmp_path: Path,
+    *,
+    run_id: str,
+    production_job_id: str | None,
+    scene_job_id: str | None,
+) -> PhaseGExecutionRequest:
+    base = request_for(tmp_path)
+    preflight = replace(
+        base.preflight,
+        generation_profile_id="GPR_0002",
+        resolved={**base.preflight.resolved, "provider_account_id": "PVA_0002"},
+    )
+    prompt = replace(base.prompt_version, generation_profile_id="GPR_0002")
+    production_request = replace(
+        base,
+        preflight=preflight,
+        prompt_version=prompt,
+        provider_account_id="PVA_0002",
+        provider_project_id="aafe9282-071f-4333-baa4-92b9f76a9c27",
+    )
+    context = ProductionExecutionContext(
+        environment="PROD",
+        provider_id="PRV_0001",
+        provider_account_id="PVA_0002",
+        provider_project_id="aafe9282-071f-4333-baa4-92b9f76a9c27",
+        auth_profile="GFLOW_PROD_AUTH",
+        scene_id="SCN_000001",
+        generation_profile_id="GPR_0002",
+        scene_prompt_id="SPV_000002",
+        attempt_id=run_id,
+        credit_budget_context=CreditBudgetContext(provider_remaining_free=Decimal("50")),
+        production_job_id=production_job_id,
+        scene_job_id=scene_job_id,
+        max_reservation_credits=Decimal("10"),
+        reservation_quote_input_digest="d" * 64,
+        reservation_quote_source_version="PCT_000001:verified:test",
+    )
+    return PhaseGExecutionRequest.from_presubmit(
+        production_request, run_id, execution_context=context
+    )
+
+
+def _record_unknown_prod_attempt(
+    ledger: D2DailyCreditLedger, request: PhaseGExecutionRequest
+) -> None:
+    ledger.capture_baseline(
+        request.d2_run_id,
+        FlowSubmissionBaseline(
+            request.provider_project_id,
+            frozenset(),
+            frozenset(),
+            0,
+            frozenset(),
+            "turn-before",
+        ),
+    )
+    ledger.mark_generate_action(request.d2_run_id)
+    ledger.record_state(
+        request.d2_run_id,
+        submission_state="UNKNOWN_SUBMISSION_STATE",
+        accounted_credit_cost=50,
+    )
+
+
+def test_prod_unknown_attempt_blocks_replay_of_same_certification_run(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    first = _prod_certification_request(
+        tmp_path,
+        run_id="D2_prod-run-0001",
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+    )
+    ledger.create_attempt(first)
+    _record_unknown_prod_attempt(ledger, first)
+
+    replay = _prod_certification_request(
+        tmp_path,
+        run_id="D2_prod-run-0002",
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+    )
+    with pytest.raises(PhaseGError) as blocked:
+        ledger.create_attempt(replay)
+
+    assert blocked.value.code == "PHASE_G_ATTEMPT_UNRESOLVED"
+    assert len(ledger.attempts()) == 1
+
+
+def test_prod_reconciled_ambiguous_attempt_blocks_same_run_retry(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    first = _prod_certification_request(
+        tmp_path,
+        run_id="D2_prod-run-0001",
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+    )
+    ledger.create_attempt(first)
+    _record_unknown_prod_attempt(ledger, first)
+    ledger._mutate(  # noqa: SLF001 - seed a previously persisted PROD reconciliation result
+        lambda payload: payload["attempts"][0].update(
+            prod_reconciliation_history=[
+                {
+                    "contract_version": "D2_PROD_SAME_ATTEMPT_RECOVERY_V1",
+                    "result": "AMBIGUOUS_AFTER_RECONCILIATION",
+                }
+            ]
+        )
+    )
+    replay = _prod_certification_request(
+        tmp_path,
+        run_id="D2_prod-run-0002",
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+    )
+
+    with pytest.raises(PhaseGError) as blocked:
+        ledger.create_attempt(replay)
+
+    assert blocked.value.code == "PHASE_G_ATTEMPT_UNRESOLVED"
+    assert len(ledger.attempts()) == 1
+
+
+def test_prod_explicit_new_certification_run_skips_historical_unknowns_immutably(
+    tmp_path: Path,
+) -> None:
+    from gflow_cli.v2_runtime.production_jobs import (
+        InMemoryProductionJobStore,
+        ProductionJobCoordinator,
+        ProductionRequest,
+    )
+
+    job_store = InMemoryProductionJobStore()
+    first_claim = ProductionJobCoordinator(job_store).submit_request(
+        ProductionRequest("SCR_000001", "PROD", "certification-run-intent-01", ("SPV_000007",))
+    )
+    second_request = ProductionRequest(
+        "SCR_000001", "PROD", "certification-run-intent-02", ("SPV_000007",)
+    )
+    second_claim = ProductionJobCoordinator(job_store).submit_request(second_request)
+    run_two_replay = ProductionJobCoordinator(job_store).submit_request(second_request)
+    third_claim = ProductionJobCoordinator(job_store).submit_request(
+        ProductionRequest("SCR_000001", "PROD", "certification-run-intent-03", ("SPV_000007",))
+    )
+    assert [
+        first_claim.production_job.production_run_no,
+        second_claim.production_job.production_run_no,
+        third_claim.production_job.production_run_no,
+    ] == [1, 2, 3]
+    assert run_two_replay.replayed
+    assert (
+        run_two_replay.production_job.production_job_id
+        == second_claim.production_job.production_job_id
+    )
+    assert first_claim.production_job.request_idempotency_key != (
+        second_claim.production_job.request_idempotency_key
+    )
+    assert second_claim.production_job.request_idempotency_key != (
+        third_claim.production_job.request_idempotency_key
+    )
+
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    historical_requests = [
+        _prod_certification_request(
+            tmp_path,
+            run_id="D2_prod-run-0001",
+            production_job_id=first_claim.production_job.production_job_id,
+            scene_job_id=first_claim.scene_jobs[0].scene_job_id,
+        ),
+        _prod_certification_request(
+            tmp_path,
+            run_id="D2_prod-run-0002",
+            production_job_id=second_claim.production_job.production_job_id,
+            scene_job_id=second_claim.scene_jobs[0].scene_job_id,
+        ),
+    ]
+    for request in historical_requests:
+        ledger.create_attempt(request)
+        _record_unknown_prod_attempt(ledger, request)
+        if request is historical_requests[0]:
+            previous_day = (
+                datetime.now(UTC).astimezone(timezone(timedelta(hours=7))).date()
+                - timedelta(days=1)
+            ).isoformat()
+            ledger._mutate(  # noqa: SLF001 - model a reservation from an earlier Bangkok day
+                lambda payload, day=previous_day: payload["attempts"][0].update(accounting_date=day)
+            )
+    historical_before = ledger.attempts()
+
+    run_three = _prod_certification_request(
+        tmp_path,
+        run_id="D2_prod-run-0003",
+        production_job_id=third_claim.production_job.production_job_id,
+        scene_job_id=third_claim.scene_jobs[0].scene_job_id,
+    )
+    created = ledger.create_attempt(run_three)
+
+    historical_after = ledger.attempts()[:2]
+    assert historical_after == historical_before
+    assert [row["generate_action_count"] for row in historical_after] == [1, 1]
+    assert [row["accounted_credit_cost"] for row in historical_after] == ["50", "50"]
+    assert created["production_job_id"] == third_claim.production_job.production_job_id
+    assert created["scene_job_id"] == third_claim.scene_jobs[0].scene_job_id
+    assert created["generate_action_count"] == 0
+    assert created["approval_action_count"] == 0
+    assert ledger.accounted_today() == Decimal("50")
+
+
+def test_prod_unknown_history_without_run_lineage_still_blocks(tmp_path: Path) -> None:
+    ledger = D2DailyCreditLedger(tmp_path / "runtime")
+    historical = _prod_certification_request(
+        tmp_path,
+        run_id="D2_prod-run-0001",
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+    )
+    ledger.create_attempt(historical)
+    _record_unknown_prod_attempt(ledger, historical)
+
+    missing_lineage = _prod_certification_request(
+        tmp_path,
+        run_id="D2_prod-run-0002",
+        production_job_id=None,
+        scene_job_id=None,
+    )
+    with pytest.raises(PhaseGError) as blocked:
+        ledger.create_attempt(missing_lineage)
+
+    assert blocked.value.code == "PHASE_G_ATTEMPT_UNRESOLVED"
+    assert len(ledger.attempts()) == 1
+
+
 def test_submit_transport_evidence_is_sanitized_and_explicit(tmp_path: Path) -> None:
     request = phase_g_request(tmp_path)
     ledger = D2DailyCreditLedger(tmp_path / "runtime")

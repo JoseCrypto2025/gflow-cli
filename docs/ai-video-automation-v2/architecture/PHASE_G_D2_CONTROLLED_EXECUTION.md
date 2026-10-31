@@ -109,10 +109,19 @@ prior approvals, exact TEST identity, and an exact live gate fingerprint. It
 cannot fill a prompt or click Generate. Its read-only gate lookup waits up to
 15 seconds for Flow's permission DOM to hydrate, polling once per second; zero
 gates at timeout and multiple gates fail closed under the same error contract.
-WAF refusal, unresolved attempts, and already successful D2 output prevent
-another paid attempt. A recorded Generate action blocks normal attempt
-creation, apart from the existing forensic-closure exception for a distinct
-run. The separate one-time authorization in
+WAF refusal and already successful D2 output prevent another paid attempt. A
+recorded Generate action always blocks reuse of the same certification run. For
+PROD, an unresolved attempt also blocks any replay whose existing Production Job
+ID or Scene Job ID matches that attempt. A separately authorized certification
+run may proceed past an unresolved historical PROD attempt only after the
+production operator has required a distinct durable run-intent key and the
+coordinator has claimed a new Production Job/Scene Job lineage. The D2 ledger
+checks that both persisted job IDs are present and distinct and that the
+historical attempt records its single Generate action; missing or overlapping
+lineage remains blocked. This does not change either historical attempt or its
+reservation, and an ambiguous outcome never creates the next run automatically.
+TEST retains its existing global unresolved-attempt guard. The separate
+one-time authorization in
 [`D2_EXPLICIT_RETRY_AUTHORIZATION_V1.md`](../operations/D2_EXPLICIT_RETRY_AUTHORIZATION_V1.md)
 is the only supported exception, limited to one distinct D2 row after an exact
 terminal `UNEXPECTED_MULTI_OUTPUT` predecessor. An already generated media ID

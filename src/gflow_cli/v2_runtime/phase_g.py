@@ -4357,6 +4357,8 @@ class D2DailyCreditLedger:
                 "GENERATION_PENDING",
                 "SUBMISSION_ACKNOWLEDGED",
             }:
+                if self._is_separate_prod_certification_run(request, previous):
+                    continue
                 if (
                     legacy_replacement_authorization is not None
                     and previous.get("d2_run_id")
@@ -4438,6 +4440,47 @@ class D2DailyCreditLedger:
             }
         attempts.append(attempt)
         return dict(attempt)
+
+    @staticmethod
+    def _is_separate_prod_certification_run(
+        request: PhaseGExecutionRequest, previous: Mapping[str, object]
+    ) -> bool:
+        """Allow an explicitly claimed PROD run past a different unresolved run only.
+
+        The production operator requires a durable run-intent key before it claims
+        the Production Job. That job and its Scene Job are the existing persisted
+        certification-run identity copied to every PROD D2 attempt. Missing or
+        overlapping lineage remains blocked, including same-intent replays.
+        """
+        context = request.execution_context
+        if context is None or context.environment != "PROD":
+            return False
+        if context.legacy_replacement_authorization_id is not None:
+            return False
+        current_production_id = context.production_job_id
+        current_scene_id = context.scene_job_id
+        previous_production_id = previous.get("production_job_id")
+        previous_scene_id = previous.get("scene_job_id")
+        previous_environment = previous.get("execution_environment")
+        generate_count = previous.get("generate_action_count")
+        if (
+            previous_environment not in (None, "PROD")
+            or not isinstance(current_production_id, str)
+            or not current_production_id
+            or not isinstance(current_scene_id, str)
+            or not current_scene_id
+            or not isinstance(previous_production_id, str)
+            or not previous_production_id
+            or not isinstance(previous_scene_id, str)
+            or not previous_scene_id
+            or type(generate_count) is not int
+            or generate_count != 1
+        ):
+            return False
+        return (
+            previous_production_id != current_production_id
+            and previous_scene_id != current_scene_id
+        )
 
     @staticmethod
     def _misattribution_retry_chain_closed(

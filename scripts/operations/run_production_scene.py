@@ -256,6 +256,8 @@ def _execution_context(
     attempt_id: str,
     visible_free_credits: Decimal,
     quote: ReplacementQuote,
+    production_job_id: str | None = None,
+    scene_job_id: str | None = None,
 ) -> ProductionExecutionContext:
     if quote.amount is None:
         raise ProductionSceneOperatorError("validated canonical per-run quote is unavailable")
@@ -293,6 +295,8 @@ def _execution_context(
         max_reservation_credits=quote.amount,
         reservation_quote_input_digest=quote.input_digest,
         reservation_quote_source_version=quote.source_version,
+        production_job_id=production_job_id,
+        scene_job_id=scene_job_id,
     )
 
 
@@ -569,6 +573,8 @@ def run_once(
             attempt_id=d2_run_id,
             visible_free_credits=current_credits,
             quote=quote,
+            production_job_id=claim.production_job.production_job_id,
+            scene_job_id=scene_job.scene_job_id,
         )
         phase_g_request = _build_bound_request(
             tables,
