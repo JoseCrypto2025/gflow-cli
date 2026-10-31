@@ -239,19 +239,16 @@ class ProductionOrchestrator:
             phase_g_request = phase_g_request_factory(job, d2_run_id)
             context = phase_g_request.execution_context
             if context is not None and request.execution_environment == "PROD":
-                if context.production_job_id not in {
-                    None,
-                    claim.production_job.production_job_id,
-                } or context.scene_job_id not in {None, job.scene_job_id}:
+                if (
+                    context.production_job_id != claim.production_job.production_job_id
+                    or context.scene_job_id != job.scene_job_id
+                    or context.production_run_no != claim.production_job.production_run_no
+                    or context.request_idempotency_key
+                    != claim.production_job.request_idempotency_key
+                ):
                     raise ProductionOrchestrationError(
-                        "PROD execution context names a different production or scene job"
+                        "PROD execution context does not bind the claimed production run"
                     )
-                context = replace(
-                    context,
-                    production_job_id=claim.production_job.production_job_id,
-                    scene_job_id=job.scene_job_id,
-                )
-                phase_g_request = replace(phase_g_request, execution_context=context)
             generated_root = workspace.directories.get("generated")
             if (
                 phase_g_request.d2_run_id != d2_run_id

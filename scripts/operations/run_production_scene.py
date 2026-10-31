@@ -8,10 +8,11 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from gflow_cli.services.credits import inspect_profile
@@ -36,14 +37,16 @@ from gflow_cli.v2_runtime.legacy_replacement import (
     ReplacementQuoteStatus,
     quote_generation_reservation,
 )
-from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, Row, preflight_scene
+from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, PreflightResult, Row, preflight_scene
 from gflow_cli.v2_runtime.phase_g import PhaseGExecutionRequest
 from gflow_cli.v2_runtime.phase_g_run import build_phase_g_request, run_fresh_presubmit
 from gflow_cli.v2_runtime.production_execution import (
     CreditBudgetContext,
     ProductionExecutionContext,
+    ProductionExecutionError,
 )
 from gflow_cli.v2_runtime.production_jobs import (
+    JobClaim,
     ProductionJobCoordinator,
     ProductionRequest,
     SceneJob,
@@ -245,6 +248,65 @@ def _validated_quote(
     return quote
 
 
+def _validate_prod_account(tables: dict[str, list[Row]], account_id: str, project_id: str) -> None:
+    account = _unique_row(
+        tables.get("PROVIDER_ACCOUNT_MASTER", []),
+        "Provider_Account_ID",
+        account_id,
+        "production provider account",
+    )
+    if (
+        account.get("Provider_ID") != "PRV_0001"
+        or account.get("Environment") != "PROD"
+        or account.get("Status") != "ACTIVE"
+        or account.get("Auth_Profile_Key") != "GFLOW_PROD_AUTH"
+        or account.get("Execution_Target") != "WEB_UI"
+        or account.get("Base_URL") != "https://flow.google.com/"
+        or account.get("Provider_Project_ID") != project_id
+        or project_id != "aafe9282-071f-4333-baa4-92b9f76a9c27"
+    ):
+        raise ProductionSceneOperatorError("production account or project identity differs")
+
+
+def _validate_preclaim(
+    *,
+    tables: dict[str, list[Row]],
+    preflight: PreflightResult,
+    request: ProductionRequest,
+    quote: ReplacementQuote,
+    scene_id: str,
+    profile_id: str,
+    account_id: str,
+    project_id: str,
+    prompt_id: str,
+    prompt_sha256: str,
+) -> None:
+    """Validate read-only PROD inputs before any job identity exists."""
+    _validate_prod_account(tables, account_id, project_id)
+    if (
+        request.execution_environment != "PROD"
+        or not request.request_idempotency_key
+        or request.scene_prompt_ids != (prompt_id,)
+        or preflight.status != "PREFLIGHT_PASS"
+        or not preflight.ready_for_provider_adapter
+        or preflight.scene_id != scene_id
+        or preflight.generation_profile_id != profile_id
+        or preflight.prompt_sha256 != prompt_sha256
+        or preflight.resolved.get("provider_id") != "PRV_0001"
+        or preflight.resolved.get("provider_account_id") != account_id
+        or preflight.resolved.get("model_id") != "MDL_0001"
+        or preflight.resolved.get("generation_mode") != "TEXT_TO_VIDEO"
+        or preflight.technical_configuration.get("output_count") != 1
+        or quote.status is not ReplacementQuoteStatus.VALID
+        or quote.amount is None
+        or quote.amount <= 0
+        or quote.unit != "CREDIT"
+        or not quote.input_digest
+        or not quote.source_version
+    ):
+        raise ProductionSceneOperatorError("production preclaim validation failed")
+
+
 def _execution_context(
     *,
     tables: dict[str, list[Row]],
@@ -258,24 +320,18 @@ def _execution_context(
     quote: ReplacementQuote,
     production_job_id: str | None = None,
     scene_job_id: str | None = None,
+    production_run_no: int | None = None,
+    request_idempotency_key: str | None = None,
 ) -> ProductionExecutionContext:
     if quote.amount is None:
         raise ProductionSceneOperatorError("validated canonical per-run quote is unavailable")
+    _validate_prod_account(tables, account_id, project_id)
     account = _unique_row(
         tables.get("PROVIDER_ACCOUNT_MASTER", []),
         "Provider_Account_ID",
         account_id,
         "production provider account",
     )
-    if (
-        account.get("Environment") != "PROD"
-        or account.get("Status") != "ACTIVE"
-        or account.get("Auth_Profile_Key") != "GFLOW_PROD_AUTH"
-        or account.get("Execution_Target") != "WEB_UI"
-        or account.get("Base_URL") != "https://flow.google.com/"
-        or account.get("Provider_Project_ID") != project_id
-    ):
-        raise ProductionSceneOperatorError("production account or project identity differs")
     return ProductionExecutionContext(
         environment="PROD",
         provider_id=str(account.get("Provider_ID", "")),
@@ -297,7 +353,61 @@ def _execution_context(
         reservation_quote_source_version=quote.source_version,
         production_job_id=production_job_id,
         scene_job_id=scene_job_id,
+        production_run_no=production_run_no,
+        request_idempotency_key=request_idempotency_key,
     )
+
+
+def _validate_bound_claim_context(
+    request: ProductionRequest,
+    phase_g_request: PhaseGExecutionRequest,
+    claim: JobClaim,
+) -> None:
+    """Require exact job/run/key lineage before F5 touches the Flow surface."""
+    context = phase_g_request.execution_context
+    if len(claim.scene_jobs) != 1 or context is None:
+        raise ProductionSceneOperatorError("bound claim must contain one Scene Job and context")
+    scene_job = claim.scene_jobs[0]
+    production = claim.production_job
+    if (
+        request.execution_environment != "PROD"
+        or phase_g_request.d2_run_id != scene_phase_g_run_id(scene_job)
+        or context.attempt_id != phase_g_request.d2_run_id
+        or context.production_job_id != production.production_job_id
+        or context.scene_job_id != scene_job.scene_job_id
+        or context.production_run_no != production.production_run_no
+        or context.request_idempotency_key != production.request_idempotency_key
+        or context.request_idempotency_key != request.request_idempotency_key
+        or scene_job.production_job_id != production.production_job_id
+        or scene_job.scene_prompt_id not in request.scene_prompt_ids
+    ):
+        raise ProductionSceneOperatorError("bound claim context differs from persisted run lineage")
+    try:
+        context.validate(
+            {
+                "environment": context.environment,
+                "provider_id": context.provider_id,
+                "provider_account_id": context.provider_account_id,
+                "provider_project_id": context.provider_project_id,
+                "auth_profile": context.auth_profile,
+                "scene_id": context.scene_id,
+                "generation_profile_id": context.generation_profile_id,
+                "scene_prompt_id": context.scene_prompt_id,
+            }
+        )
+    except ProductionExecutionError as exc:
+        raise ProductionSceneOperatorError("bound PROD execution context is invalid") from exc
+
+
+def _run_f5_after_bound_claim(
+    request: ProductionRequest,
+    phase_g_request: PhaseGExecutionRequest,
+    claim: JobClaim,
+    *,
+    expected_email: str,
+) -> Coroutine[Any, Any, None]:
+    _validate_bound_claim_context(request, phase_g_request, claim)
+    return run_fresh_presubmit(phase_g_request, expected_email=expected_email)
 
 
 def _build_bound_request(
@@ -459,46 +569,105 @@ def run_once(
             (prompt_id,),
         )
         starting_credits = _read_current_production_credits(expected_email)
+        _validate_preclaim(
+            tables=tables,
+            preflight=preflight,
+            request=request,
+            quote=quote,
+            scene_id=scene_id,
+            profile_id=profile_id,
+            account_id=account_id,
+            project_id=project_id,
+            prompt_id=prompt_id,
+            prompt_sha256=prompt_sha,
+        )
+        transaction_rows = OptimisticGoogleSheetsJobStore(
+            writer_transport, schema_dir, writer_lock_root=settings.runtime_state_root
+        )
+        jobs = GoogleSheetsProductionJobStore(transaction_rows)
+        existing_productions = transaction_rows.read_rows("PRODUCTION_JOBS")
+        matching_requests = [
+            row
+            for row in existing_productions
+            if row.get("Request_Idempotency_Key") == request.request_idempotency_key
+        ]
+        if len(matching_requests) > 1:
+            raise ProductionSceneOperatorError("production idempotency key is duplicated")
+        if _has_unresolved_different_workload(existing_productions, request):
+            raise ProductionSceneOperatorError(
+                "another unresolved Production Job exists for a different workload"
+            )
+        if not execute:
+            run_numbers = [
+                int(str(row["Production_Run_No"]))
+                for row in existing_productions
+                if row.get("Script_ID") == script_id
+            ]
+            return {
+                "status": "READY_FOR_CLAIM_AND_EXECUTION",
+                "preclaim_validation": "PASS",
+                "run_claim_readiness": "PASS",
+                "current_max_production_run_no": max(run_numbers, default=0),
+                "scene_id": scene_id,
+                "generation_profile_id": profile_id,
+                "provider_account_id": account_id,
+                "provider_project_id": project_id,
+                "scene_prompt_id": prompt_id,
+                "prompt_sha256": prompt_sha,
+                "audio_intent": "NO_AUDIO",
+                "output_count": 1,
+                "validated_quote_credits": str(quote.amount),
+                "quote_source_version": quote.source_version,
+                "provider_credits_before_f5": str(starting_credits),
+                "generate_clicked": False,
+                "sheet_rows_written": False,
+            }
+
         digest_before_f5 = _snapshot_digest(tables)
-        context = _execution_context(
+        claim = ProductionJobCoordinator(jobs).submit_request(request, datetime.now(UTC))
+        if len(claim.scene_jobs) != 1:
+            raise ProductionSceneOperatorError("exactly one Scene Job must be claimed")
+        scene_job = claim.scene_jobs[0]
+        workspace = _workspace_for_job(
+            settings.temp_root, scene_job.scene_job_id, scene_job.job_status
+        )
+        created_at = (
+            parse_utc_timestamp(scene_job.created_at) if scene_job.created_at else datetime.now(UTC)
+        )
+        d2_run_id = scene_phase_g_run_id(scene_job)
+        execution_context = _execution_context(
             tables=tables,
             scene_id=scene_id,
             profile_id=profile_id,
             account_id=account_id,
             project_id=project_id,
             prompt_id=prompt_id,
-            attempt_id="D2_"
-            + hashlib.sha256((request.request_idempotency_key + ":F5").encode()).hexdigest()[:32],
+            attempt_id=d2_run_id,
             visible_free_credits=starting_credits,
             quote=quote,
+            production_job_id=claim.production_job.production_job_id,
+            scene_job_id=scene_job.scene_job_id,
+            production_run_no=claim.production_job.production_run_no,
+            request_idempotency_key=claim.production_job.request_idempotency_key,
         )
         phase_g_for_f5 = _build_bound_request(
             tables,
             scene_id=scene_id,
             profile_id=profile_id,
-            context=context,
+            context=execution_context,
             runtime_state_root=settings.runtime_state_root,
-            temp_root=settings.temp_root,
+            temp_root=workspace.directories["generated"],
         )
         if phase_g_for_f5.output_count != 1:
             raise ProductionSceneOperatorError("production output count must be exactly one")
-        if not execute:
-            return {
-                "status": "READY_FOR_F5_AND_EXECUTION",
-                "scene_id": scene_id,
-                "generation_profile_id": profile_id,
-                "provider_account_id": account_id,
-                "provider_project_id": project_id,
-                "scene_prompt_id": prompt_id,
-                "audio_intent": "NO_AUDIO",
-                "output_count": 1,
-                "validated_quote_credits": str(quote.amount),
-                "provider_credits_before_f5": str(starting_credits),
-                "generate_clicked": False,
-                "sheet_rows_written": False,
-            }
-
-        asyncio.run(run_fresh_presubmit(phase_g_for_f5, expected_email=expected_email))
+        asyncio.run(
+            _run_f5_after_bound_claim(
+                request,
+                phase_g_for_f5,
+                claim,
+                expected_email=expected_email,
+            )
+        )
         refreshed = snapshot_source.read()
         refreshed_tables = {name: list(rows) for name, rows in refreshed.tables.items()}
         if _snapshot_digest(refreshed_tables) != digest_before_f5:
@@ -535,52 +704,25 @@ def run_once(
         ):
             raise ProductionSceneOperatorError("post-F5 Phase E or prompt binding changed")
         current_credits = _read_current_production_credits(expected_email)
-
-        transaction_rows = OptimisticGoogleSheetsJobStore(
-            writer_transport, schema_dir, writer_lock_root=settings.runtime_state_root
-        )
-        jobs = GoogleSheetsProductionJobStore(transaction_rows)
-        existing_productions = transaction_rows.read_rows("PRODUCTION_JOBS")
-        matching_requests = [
-            row
-            for row in existing_productions
-            if row.get("Request_Idempotency_Key") == request.request_idempotency_key
-        ]
-        if len(matching_requests) > 1:
-            raise ProductionSceneOperatorError("production idempotency key is duplicated")
-        if _has_unresolved_different_workload(existing_productions, request):
-            raise ProductionSceneOperatorError(
-                "another unresolved Production Job exists for a different workload"
-            )
-        claim = ProductionJobCoordinator(jobs).submit_request(request, datetime.now(UTC))
-        if len(claim.scene_jobs) != 1:
-            raise ProductionSceneOperatorError("exactly one Scene Job must be claimed")
-        scene_job = claim.scene_jobs[0]
-        workspace = _workspace_for_job(
-            settings.temp_root, scene_job.scene_job_id, scene_job.job_status
-        )
-        created_at = (
-            parse_utc_timestamp(scene_job.created_at) if scene_job.created_at else datetime.now(UTC)
-        )
-        d2_run_id = scene_phase_g_run_id(scene_job)
-        execution_context = _execution_context(
-            tables=tables,
-            scene_id=scene_id,
-            profile_id=profile_id,
-            account_id=account_id,
-            project_id=project_id,
-            prompt_id=prompt_id,
-            attempt_id=d2_run_id,
-            visible_free_credits=current_credits,
-            quote=quote,
-            production_job_id=claim.production_job.production_job_id,
-            scene_job_id=scene_job.scene_job_id,
-        )
         phase_g_request = _build_bound_request(
             tables,
             scene_id=scene_id,
             profile_id=profile_id,
-            context=execution_context,
+            context=_execution_context(
+                tables=tables,
+                scene_id=scene_id,
+                profile_id=profile_id,
+                account_id=account_id,
+                project_id=project_id,
+                prompt_id=prompt_id,
+                attempt_id=d2_run_id,
+                visible_free_credits=current_credits,
+                quote=quote,
+                production_job_id=claim.production_job.production_job_id,
+                scene_job_id=scene_job.scene_job_id,
+                production_run_no=claim.production_job.production_run_no,
+                request_idempotency_key=claim.production_job.request_idempotency_key,
+            ),
             runtime_state_root=settings.runtime_state_root,
             temp_root=workspace.directories["generated"],
         )

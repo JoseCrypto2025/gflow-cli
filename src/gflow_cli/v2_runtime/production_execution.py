@@ -84,6 +84,8 @@ class ProductionExecutionContext:
     max_reservation_credits: Decimal | None = None
     reservation_quote_input_digest: str | None = None
     reservation_quote_source_version: str | None = None
+    production_run_no: int | None = None
+    request_idempotency_key: str | None = None
 
     def validate(self, resolved: dict[str, str]) -> None:
         if self.environment not in {"DEV", "TEST", "PROD"}:
@@ -108,6 +110,18 @@ class ProductionExecutionContext:
             raise ProductionExecutionError("PROD execution identity is not canonically pinned")
         if self.environment == "PROD" and (not self.production_job_id or not self.scene_job_id):
             raise ProductionExecutionError("PROD execution must bind production and scene jobs")
+        if self.production_run_no is not None and (
+            self.environment != "PROD"
+            or type(self.production_run_no) is not int
+            or self.production_run_no <= 0
+        ):
+            raise ProductionExecutionError("production run number is invalid")
+        if self.request_idempotency_key is not None and (
+            self.environment != "PROD"
+            or type(self.request_idempotency_key) is not str
+            or not self.request_idempotency_key.strip()
+        ):
+            raise ProductionExecutionError("production request idempotency key is invalid")
         if self.max_reservation_credits is not None and (
             not self.max_reservation_credits.is_finite() or self.max_reservation_credits <= 0
         ):

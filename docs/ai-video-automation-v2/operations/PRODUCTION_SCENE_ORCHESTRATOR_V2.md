@@ -12,9 +12,14 @@ repository's read-only `gflow credits` service using the `gflow-prod` profile;
 caller-supplied balances are not accepted. It also requires the production
 runtime environment and an externally provisioned Google Workspace credential.
 The account, project, profile, current approved prompt, Scene audio intent, and
-one-output setting are checked against fresh live Master data. Phase F5 runs
-before a production job is claimed. After F5, the operator reads the full
-snapshot again and holds if any canonical Sheet data changed.
+one-output setting are checked against fresh live Master data. Read-only
+pre-claim validation runs before any job claim and does not construct a full
+PROD execution context. For `--execute`, the explicit run intent is claimed
+first, producing the idempotent Production Job and Scene Job lineage. The
+operator then constructs and validates a context bound to both job IDs, run
+number, and request idempotency key before running non-submitting Phase F5.
+After F5, the operator reads the full snapshot again and holds if any canonical
+Sheet data changed.
 
 Every execution requires a stable `--production-run-intent` value. The request
 idempotency key binds the workload fingerprint (Scene, profile, approved prompt
@@ -47,12 +52,14 @@ inspection.
 
 Without `--execute`, the command performs the live Sheets read, Phase E checks,
 and a read-only Flow balance inspection through the `gflow-prod` profile, then
-prints `READY_FOR_F5_AND_EXECUTION`; it does not run F5 or write transaction
-rows. The deployed script imports the SHA-verified application source tree
+prints `READY_FOR_CLAIM_AND_EXECUTION` with pre-claim and claim-readiness
+results; it does not run F5, create job rows, or construct a job-bound context.
+The deployed script imports the SHA-verified application source tree
 via `PYTHONPATH=/opt/gflow-v2/src:/opt/gflow-v2`, so the runtime does not
-require an editable project installation. With `--execute`, it runs
-non-submitting F5 and then the canonical one-shot lifecycle. The Phase G
-request is bound to the claimed Scene Job's deterministic D2 ID. Re-entry on
+require an editable project installation. With `--execute`, it claims the
+explicit intent, constructs and validates the fully bound context, runs
+non-submitting F5, and then enters the canonical one-shot lifecycle. The Phase
+G request is bound to the claimed Scene Job's deterministic D2 ID. Re-entry on
 an unresolved Scene Job uses the same Phase G request for recovery;
 caller-supplied media is not accepted.
 Replaying an existing request key returns its exact Production/Scene Job
@@ -95,8 +102,8 @@ python scripts/operations/run_production_scene.py `
 Reuse that exact run-intent value for a replay. Supply a new value only after a
 separate authorization for a new certification cycle.
 
-The balance is read before F5 and refreshed after F5, before the attempt is
-claimed. A missing, unauthenticated, or mismatched profile balance holds the
+The balance is read before the job claim and refreshed after F5, before Phase G
+execution. A missing, unauthenticated, or mismatched profile balance holds the
 operator. The Phase G quote is still subject to the shared daily credit guard.
 The operator supports only
 the explicit `Dialogue_Mode=NONE` branch. It creates no TTS row and does not

@@ -279,6 +279,10 @@ def test_orchestrator_composes_the_pinned_phase_g_adapter(
                 scene_job.scene_prompt_id,
                 d2_run_id,
                 CreditBudgetContext(),
+                production_job_id=scene_job.production_job_id,
+                scene_job_id=scene_job.scene_job_id,
+                production_run_no=1,
+                request_idempotency_key="production-request-1",
             ),
             presubmit_request=SimpleNamespace(temp_root=workspace.directories["generated"]),
         )
