@@ -283,6 +283,35 @@ async def test_agent_only_settings_are_journaled_restored_and_marked_clean(
 
 
 @pytest.mark.asyncio
+async def test_agent_settings_journal_ignores_display_only_model_readback_metadata(
+    tmp_path: Path,
+) -> None:
+    port = FakeAgentPort()
+    port.original_settings.update(
+        {"model_name": "Veo 3.1 Lite [Lower Priority]", "model_priority": "LOWER_PRIORITY"}
+    )
+    port.applied = dict(port.original_settings)
+    request = agent_request_for(tmp_path)
+
+    outcome = await GoogleFlowProviderAdapter("PRV_0001").prepare(request, port)
+    journal = AgentSettingsRecoveryJournal(
+        request.runtime_state_root, request.provider_account_id, request.provider_project_id
+    )
+    record = journal.read()
+
+    assert outcome.state == "FLOW_PRESUBMIT_READY"
+    assert record is not None and record.state == "CLEAN"
+    assert record.original_settings["model_id"] == "MDL_0001"
+    assert "model_name" not in record.original_settings
+    assert "model_priority" not in record.original_settings
+    assert port.applied == {
+        key: value
+        for key, value in port.original_settings.items()
+        if key not in {"model_name", "model_priority"}
+    }
+
+
+@pytest.mark.asyncio
 async def test_agent_transaction_reconciles_baseline_prepared_and_restored_states(
     tmp_path: Path,
 ) -> None:

@@ -330,7 +330,9 @@ class GoogleFlowProviderAdapter:
                 )
 
         try:
-            original: dict[str, object] = dict(await transaction_port.snapshot_settings())
+            original = AgentSettingsRecoveryJournal.restorable_settings(
+                await transaction_port.snapshot_settings()
+            )
             correlation_id = request.prompt_version.scene_prompt_id
             journal.begin(
                 correlation_id=correlation_id,

@@ -11,6 +11,7 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +37,7 @@ _ALLOWED_SETTINGS = frozenset(
         "confirm_before_generating",
     }
 )
+_READBACK_METADATA_KEYS = frozenset({"model_name", "model_priority"})
 
 
 class RecoveryJournalError(V2RuntimeError):
@@ -151,6 +153,16 @@ class AgentSettingsRecoveryJournal:
         if not _CORRELATION_RE.fullmatch(record.correlation_id):
             raise RecoveryJournalError("recovery journal correlation ID is invalid")
         return record
+
+    @staticmethod
+    def restorable_settings(snapshot: Mapping[str, object]) -> dict[str, object]:
+        """Keep only restorable settings while rejecting unknown readback fields."""
+        unexpected = set(snapshot) - _ALLOWED_SETTINGS - _READBACK_METADATA_KEYS
+        if unexpected:
+            raise RecoveryJournalError("recovery journal contains a non-semantic setting")
+        return _validate_settings(
+            {key: value for key, value in snapshot.items() if key in _ALLOWED_SETTINGS}
+        )
 
     def begin(
         self,
