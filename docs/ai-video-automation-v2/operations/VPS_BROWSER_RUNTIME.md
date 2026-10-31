@@ -124,6 +124,7 @@ sudo -u gflow env \
   RUNTIME_ENV=production STORAGE_PROVIDER=google-drive \
   RUNTIME_STATE_ROOT=/var/lib/gflow TEMP_ROOT=/var/tmp/gflow \
   LOG_ROOT=/var/log/gflow GFLOW_APP_ROOT=/opt/gflow-v2 \
+  PYTHONPATH=/opt/gflow-v2/src:/opt/gflow-v2 \
   GFLOW_EXPECTED_APP_SHA=86b172ba2987945913cbb8fcc174ac6de6609392 \
   /opt/gflow-v2/.venv/bin/python /opt/gflow-v2-ops/v2_runtime_doctor.py
 ```
@@ -343,7 +344,14 @@ and project `aafe9282-071f-4333-baa4-92b9f76a9c27`. Invoke it only for that
 exact target:
 
 ```bash
-python scripts/operations/inspect_flow_pricing_read_only.py \
+cd /opt/gflow-v2-src
+sudo -u gflow env \
+GFLOW_CLI_HOME=/var/lib/gflow/browser-state \
+PYTHONPATH=/opt/gflow-v2/src:/opt/gflow-v2-src \
+RUNTIME_ENV=production STORAGE_PROVIDER=google-drive \
+RUNTIME_STATE_ROOT=/var/lib/gflow TEMP_ROOT=/var/tmp/gflow LOG_ROOT=/var/log/gflow \
+/usr/bin/xvfb-run -a /opt/gflow-v2/.venv/bin/python \
+  scripts/operations/inspect_flow_pricing_read_only.py \
   --provider-account-id PVA_0002 \
   --project-id aafe9282-071f-4333-baa4-92b9f76a9c27
 ```
@@ -352,8 +360,12 @@ The operation obtains the repository `ProfileLease` non-blockingly before
 session verification and retains it through browser close. Contention returns
 `PROFILE_IN_USE`; it never bypasses either the repository lease or Chromium's
 native profile lock. It reuses V2 Agent-only project navigation and the
-read-only settings snapshot, including the duration radio's locale-invariant
-number when that group is present. It does not call `prepare_live_flow()`,
+read-only settings snapshot. The current settings DOM does not expose a proven
+duration control; duration is reported as `UNAVAILABLE` with selector
+confidence `NONE`. The inspector never derives duration from a neighboring
+toggle group such as an image output count. Idle UI settings are reported as
+observed and are not treated as the Phase G effective configuration. It does
+not call `prepare_live_flow()`,
 `apply_settings()`, prompt-fill methods, or any Generate/approval/submission
 method. The settings pane may be opened and closed to read selected values;
 no save control is used. The Generate control is read-only text evidence and

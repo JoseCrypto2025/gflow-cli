@@ -16,6 +16,35 @@ one-output setting are checked against fresh live Master data. Phase F5 runs
 before a production job is claimed. After F5, the operator reads the full
 snapshot again and holds if any canonical Sheet data changed.
 
+Every execution requires a stable `--production-run-intent` value. The request
+idempotency key binds the workload fingerprint (Scene, profile, approved prompt
+ID and SHA-256) to that explicit run intent. Replaying the same intent returns
+the same Production Job and Scene Job. A separately authorized intent creates
+a new Production Job and Scene Job; `Production_Run_No` is allocated as the
+next number under the existing Sheets writer lock and uniqueness checks. The
+`Scene_Set_SHA256` and D2-to-D6 workload compatibility fingerprint remain
+independent of the run number. A retry or timeout must reuse the same intent;
+it never allocates the next run automatically. The persisted
+`Request_Idempotency_Key` contains the workload digest and run-intent token, so
+after a process or CLI restart an operator can read that exact field from the
+existing Production Job and pass the full saved key as `--production-run-intent`
+to replay. The operator validates that its embedded workload digest matches the
+current Scene/Profile/Prompt before accepting it.
+
+Before any Production Job is claimed, the operator resolves a fresh
+schema-validated canonical direct-credit quote. A missing or ambiguous quote
+holds the run before job/attempt/reservation creation. The validated amount,
+source version, and input digest are bound to the PROD credit guard. The later
+Flow confirmation may reserve less, but cannot exceed this per-run cap; the
+separate shared daily 50-credit ceiling remains in force. Effective duration
+and aspect ratio come from Phase E's scene/series/profile precedence.
+
+The PROD operator pins `GFLOW_CLI_HOME` to
+`/var/lib/gflow/browser-state`, which resolves
+`GFLOW_PROD_AUTH → gflow-prod → /var/lib/gflow/browser-state/profile_gflow-prod`.
+An explicitly configured different profile root fails closed before profile
+inspection.
+
 Without `--execute`, the command performs the live Sheets read, Phase E checks,
 and a read-only Flow balance inspection through the `gflow-prod` profile, then
 prints `READY_FOR_F5_AND_EXECUTION`; it does not run F5 or write transaction
@@ -26,8 +55,10 @@ non-submitting F5 and then the canonical one-shot lifecycle. The Phase G
 request is bound to the claimed Scene Job's deterministic D2 ID. Re-entry on
 an unresolved Scene Job uses the same Phase G request for recovery;
 caller-supplied media is not accepted.
-Existing production or Scene Jobs for the same prompt prevent a second claim.
-Jobs remain `QUEUED` until the Phase G adapter returns validated provider
+Replaying an existing request key returns its exact Production/Scene Job
+lineage. For a different explicit run intent, same-workload historical jobs keep their
+original rows and are never reused; unresolved work for a different workload
+continues to block. Jobs remain `QUEUED` until the Phase G adapter returns validated provider
 execution and media identities. An exception before that proof moves both jobs
 to `HOLD` with `PROVIDER_RECONCILIATION_REQUIRED`; replay cannot Generate from
 HOLD and may only use the exact-media Phase G recovery path. PROD evidence
@@ -57,8 +88,12 @@ python scripts/operations/run_production_scene.py `
   --provider-account-id PVA_0002 `
   --provider-project-id aafe9282-071f-4333-baa4-92b9f76a9c27 `
   --expected-email singleava508@gmail.com `
+  --production-run-intent certification-2026-10-31-01 `
   --execute
 ```
+
+Reuse that exact run-intent value for a replay. Supply a new value only after a
+separate authorization for a new certification cycle.
 
 The balance is read before F5 and refreshed after F5, before the attempt is
 claimed. A missing, unauthenticated, or mismatched profile balance holds the

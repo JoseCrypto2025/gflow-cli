@@ -42,7 +42,6 @@ _VIDEO_MODEL_BUTTON = 'button[aria-label="Video generation default model"]'
 _SAVE_BUTTON = "button.settings-save-button"
 _BACK_BUTTON = "flow-agent-panel button:has(mat-icon:text-is('arrow_back'))"
 _GENERATE_BUTTON = "flow-generate-icon-button button"
-_DURATION_RADIO_RE = re.compile(r"^\s*(\d+)(?!\d)(?!\s*[pPkK]\b)\D*$")
 _AUTH_PROFILE_NAMES = {
     "GFLOW_V2_TEST_AUTH": "gflow-v2-test",
     "GFLOW_PROD_AUTH": "gflow-prod",
@@ -607,12 +606,9 @@ class GoogleFlowAgentOnlyPort:
             raise FlowPresubmitError(
                 "FLOW_AGENT_SETTINGS_UNREADABLE", "video aspect or count readback is unavailable"
             )
-        duration: int | None = None
-        if allow_unmapped_model:
-            duration_text = await self._selected_radio_text(groups.nth(1))
-            duration_match = _DURATION_RADIO_RE.fullmatch(duration_text)
-            if duration_match is not None:
-                duration = int(duration_match.group(1))
+        # The visible toggle groups are image ratio/count and video ratio/count.
+        # No authoritative duration control is present in this surface, so do not
+        # reinterpret the image output-count group as duration.
         confirmation = view.locator('input[type="radio"]:checked')
         if await confirmation.count() != 1:
             raise FlowPresubmitError(
@@ -634,7 +630,8 @@ class GoogleFlowAgentOnlyPort:
             "confirm_before_generating": confirm_value,
         }
         if allow_unmapped_model:
-            settings["duration"] = duration
+            settings["duration"] = None
+            settings["duration_selector_confidence"] = "NONE"
         return settings
 
     @staticmethod

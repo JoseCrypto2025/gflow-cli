@@ -21,7 +21,7 @@ from gflow_cli.v2_runtime.flow_pricing_inspector import (
     inspect_with_port,
     validate_profile_path,
 )
-from gflow_cli.v2_runtime.live_flow import _DURATION_RADIO_RE, GoogleFlowAgentOnlyPort
+from gflow_cli.v2_runtime.live_flow import GoogleFlowAgentOnlyPort
 
 
 def _observation(**overrides: Any) -> FlowPricingObservation:
@@ -135,19 +135,10 @@ def test_missing_or_ambiguous_quote_is_explicitly_unavailable() -> None:
     assert extract_pre_submit_quote("Generate 15 credits", locale="pt-BR") is None
 
 
-@pytest.mark.parametrize(
-    ("label", "expected"),
-    [("8s", 8), ("8 giây", 8), (" 6 Sek. ", 6), ("480p", None), ("4K", None)],
-)
-def test_duration_readback_uses_only_a_safe_number_token(label: str, expected: int | None) -> None:
-    match = _DURATION_RADIO_RE.fullmatch(label)
-    assert (int(match.group(1)) if match is not None else None) == expected
-
-
-def test_duration_is_read_only_and_scoped_to_pricing_inspection(
+def test_image_output_x2_is_not_read_as_video_duration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    labels = ["default", "8 giây", "9:16", "x1"]
+    labels = ["16:9", "x2", "9:16", "x1"]
 
     class SelectedRadio:
         def __init__(self, label: str) -> None:
@@ -167,11 +158,17 @@ def test_duration_is_read_only_and_scoped_to_pricing_inspection(
             return SelectedRadio(self.label)
 
     class Groups:
+        def __init__(self) -> None:
+            self.read_indices: list[int] = []
+
         async def count(self) -> int:
             return 4
 
         def nth(self, index: int) -> RadioGroup:
+            self.read_indices.append(index)
             return RadioGroup(labels[index])
+
+    groups = Groups()
 
     class ModelButton:
         async def inner_text(self) -> str:
@@ -189,7 +186,7 @@ def test_duration_is_read_only_and_scoped_to_pricing_inspection(
             if selector == 'button[aria-label="Video generation default model"]':
                 return ModelButton()
             if selector == "mat-button-toggle-group":
-                return Groups()
+                return groups
             if selector == 'input[type="radio"]:checked':
                 return Confirmation()
             raise AssertionError(f"unexpected read selector: {selector}")
@@ -216,7 +213,9 @@ def test_duration_is_read_only_and_scoped_to_pricing_inspection(
     inspector_settings = _run_immediate(port._read_video_settings(allow_unmapped_model=True))
     presubmit_settings = _run_immediate(port._read_video_settings())
 
-    assert inspector_settings["duration"] == 8
+    assert inspector_settings["duration"] is None
+    assert inspector_settings["duration_selector_confidence"] == "NONE"
+    assert 1 not in groups.read_indices
     assert presubmit_settings.get("duration") is None
 
 
@@ -238,6 +237,27 @@ def test_missing_expected_configuration_is_unknown_and_holds_quote_authority() -
     assert report["INSPECTION_STATUS"] == "HOLD"
 
 
+def test_duration_without_authoritative_selector_confidence_is_unavailable() -> None:
+    report = build_inspection_report(
+        _observation(
+            settings={
+                "model_id": "MDL_0001",
+                "model_name": "Veo 3.1 Lite",
+                "model_priority": "STANDARD",
+                "duration": 2,
+                "aspect_ratio": "9:16",
+                "output_count": 1,
+            }
+        )
+    )
+
+    assert report["VISIBLE_DURATION"] == "UNKNOWN"
+    assert report["DURATION_READBACK"] == "UNAVAILABLE"
+    assert report["DURATION_SELECTOR_CONFIDENCE"] == "NONE"
+    assert report["CONFIG_MATCH"] == "UNKNOWN"
+    assert report["CREDIT_COST_AUTHORITATIVE"] == "NO"
+
+
 def test_complete_expected_configuration_allows_quote_authority() -> None:
     report = build_inspection_report(
         _observation(
@@ -246,12 +266,15 @@ def test_complete_expected_configuration_allows_quote_authority() -> None:
                 "model_name": "Veo 3.1 Lite",
                 "model_priority": "STANDARD",
                 "duration": 8,
+                "duration_selector_confidence": "AUTHORITATIVE",
                 "aspect_ratio": "9:16",
                 "output_count": 1,
             }
         )
     )
     assert report["CONFIG_MATCH"] == "PASS"
+    assert report["DURATION_READBACK"] == 8
+    assert report["DURATION_SELECTOR_CONFIDENCE"] == "AUTHORITATIVE"
     assert report["CREDIT_COST_AUTHORITATIVE"] == "YES"
     assert report["INSPECTION_STATUS"] == "PASS"
 
@@ -265,6 +288,7 @@ def test_missing_pre_submit_quote_holds_even_when_configuration_matches() -> Non
                 "model_name": "Veo 3.1 Lite",
                 "model_priority": "STANDARD",
                 "duration": 8,
+                "duration_selector_confidence": "AUTHORITATIVE",
                 "aspect_ratio": "9:16",
                 "output_count": 1,
             },
@@ -348,6 +372,7 @@ def test_inspector_calls_only_read_only_port_methods() -> None:
                 "model_priority": "STANDARD",
                 "generation_mode": "TEXT_TO_VIDEO",
                 "duration": 8,
+                "duration_selector_confidence": "AUTHORITATIVE",
                 "aspect_ratio": "9:16",
                 "output_count": 1,
             }

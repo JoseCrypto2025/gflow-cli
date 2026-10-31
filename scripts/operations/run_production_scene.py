@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -20,6 +21,7 @@ from gflow_cli.v2_runtime.google_sheets import (
     APPROVED_JOB_ARTIFACTS_FOLDER_ID,
     APPROVED_SPREADSHEET_ID,
     GoogleSheetsApiTransport,
+    GoogleSheetsSnapshot,
     GoogleSheetsSnapshotSource,
     GoogleWorkspaceCredentialProvider,
 )
@@ -27,6 +29,12 @@ from gflow_cli.v2_runtime.google_sheets_production_jobs import GoogleSheetsProdu
 from gflow_cli.v2_runtime.google_sheets_transactions import (
     GoogleSheetsTransactionApiTransport,
     OptimisticGoogleSheetsJobStore,
+)
+from gflow_cli.v2_runtime.legacy_replacement import (
+    ReplacementGenerationConfig,
+    ReplacementQuote,
+    ReplacementQuoteStatus,
+    quote_generation_reservation,
 )
 from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, Row, preflight_scene
 from gflow_cli.v2_runtime.phase_g import PhaseGExecutionRequest
@@ -53,6 +61,11 @@ _ACCOUNT_ID_RE = re.compile(r"^PVA_[0-9]{4}$")
 _PROJECT_ID_RE = re.compile(r"^[0-9a-f-]{36}$", re.I)
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _PROD_CREDITS_PROFILE = "gflow-prod"
+_PROD_BROWSER_STATE_ROOT = Path("/var/lib/gflow/browser-state")
+_RUN_INTENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_PERSISTED_RUN_KEY_RE = re.compile(
+    r"^PROD_SCENE_RUN_V2_[0-9a-f]{64}_[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+)
 
 
 class ProductionSceneOperatorError(ValueError):
@@ -91,12 +104,145 @@ def _read_current_production_credits(expected_email: str) -> Decimal:
     return Decimal(credits)
 
 
-def _request_key(scene_id: str, profile_id: str, prompt_id: str, prompt_sha: str) -> str:
-    payload = json.dumps(
-        ["PRODUCTION_SCENE_ONCE_V1", scene_id, profile_id, prompt_id, prompt_sha],
+def _require_production_profile_home() -> Path:
+    configured = os.environ.get("GFLOW_CLI_HOME")
+    if configured is None:
+        os.environ["GFLOW_CLI_HOME"] = _PROD_BROWSER_STATE_ROOT.as_posix()
+    elif configured.replace("\\", "/") != _PROD_BROWSER_STATE_ROOT.as_posix():
+        raise ProductionSceneOperatorError("production browser profile root differs")
+    return _PROD_BROWSER_STATE_ROOT
+
+
+def _request_key(
+    scene_id: str,
+    profile_id: str,
+    prompt_id: str,
+    prompt_sha: str,
+    production_run_intent: str,
+) -> str:
+    workload = json.dumps(
+        ["PRODUCTION_SCENE_WORKLOAD_V1", scene_id, profile_id, prompt_id, prompt_sha],
         separators=(",", ":"),
     )
-    return "PROD_SCENE_V1_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    workload_digest = hashlib.sha256(workload.encode("utf-8")).hexdigest()
+    key_prefix = f"PROD_SCENE_RUN_V2_{workload_digest}_"
+    if production_run_intent.startswith("PROD_SCENE_RUN_V2_"):
+        if not production_run_intent.startswith(key_prefix) or not _PERSISTED_RUN_KEY_RE.fullmatch(
+            production_run_intent
+        ):
+            raise ProductionSceneOperatorError("persisted production run key has another workload")
+        return production_run_intent
+    if not _RUN_INTENT_RE.fullmatch(production_run_intent):
+        raise ProductionSceneOperatorError("explicit production run intent is invalid")
+    return key_prefix + production_run_intent
+
+
+def _has_unresolved_different_workload(
+    rows: Sequence[dict[str, object]], request: ProductionRequest
+) -> bool:
+    return any(
+        row.get("Script_ID") == request.script_id
+        and row.get("Request_Idempotency_Key") != request.request_idempotency_key
+        and row.get("Scene_Set_SHA256") != request.scene_set_sha256
+        and str(row.get("Job_Status", "")).upper() not in {"COMPLETED", "FAILED", "CANCELLED"}
+        for row in rows
+    )
+
+
+def _quote_config(
+    tables: dict[str, list[Row]],
+    *,
+    scene_id: str,
+    profile_id: str,
+    account_id: str,
+    effective_config: Mapping[str, object],
+) -> ReplacementGenerationConfig:
+    account = _unique_row(
+        tables.get("PROVIDER_ACCOUNT_MASTER", []),
+        "Provider_Account_ID",
+        account_id,
+        "production provider account",
+    )
+    profile = _unique_row(
+        tables.get("GENERATION_PROFILE_MASTER", []),
+        "Generation_Profile_ID",
+        profile_id,
+        "production generation profile",
+    )
+    model_id = str(profile.get("Model_ID", ""))
+    model = _unique_row(tables.get("MODEL_MASTER", []), "Model_ID", model_id, "active model")
+    if (
+        account.get("Provider_ID") != "PRV_0001"
+        or account.get("Environment") != "PROD"
+        or account.get("Status") != "ACTIVE"
+        or account.get("Auth_Profile_Key") != "GFLOW_PROD_AUTH"
+        or account.get("Provider_Project_ID") != "aafe9282-071f-4333-baa4-92b9f76a9c27"
+        or profile.get("Provider_Account_ID") != account_id
+        or profile.get("Environment") != "PROD"
+        or profile.get("Status") != "ACTIVE"
+        or profile.get("Generation_Mode") != "TEXT_TO_VIDEO"
+        or model.get("Provider_ID") != "PRV_0001"
+        or model.get("Status") != "ACTIVE"
+        or re.sub(r"[^a-z0-9]+", "", str(model.get("Model_Name", "")).casefold()) != "veo31lite"
+    ):
+        raise ProductionSceneOperatorError("active quote identity differs from PROD workload")
+    try:
+        duration_sec = float(str(effective_config["duration_sec"]))
+        output_count = int(str(effective_config["output_count"]))
+        aspect_ratio = str(effective_config["aspect_ratio"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProductionSceneOperatorError("effective quote configuration is incomplete") from exc
+    if output_count != 1 or duration_sec <= 0 or not aspect_ratio:
+        raise ProductionSceneOperatorError("quote configuration is outside one-video scope")
+    return ReplacementGenerationConfig(
+        provider_id="PRV_0001",
+        provider_account_id=account_id,
+        model_id=model_id,
+        generation_profile_id=profile_id,
+        generation_mode="TEXT_TO_VIDEO",
+        pricing_variant="STANDARD_LITE",
+        account_pricing_class="NON_ULTRA",
+        output_count=output_count,
+        duration_sec=duration_sec,
+        aspect_ratio=aspect_ratio,
+    )
+
+
+def _validated_quote(
+    snapshot: GoogleSheetsSnapshot,
+    tables: dict[str, list[Row]],
+    *,
+    scene_id: str,
+    profile_id: str,
+    account_id: str,
+    effective_config: Mapping[str, object],
+) -> ReplacementQuote:
+    try:
+        when = datetime.fromisoformat(snapshot.read_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ProductionSceneOperatorError("canonical quote timestamp is invalid") from exc
+    quote = quote_generation_reservation(
+        _quote_config(
+            tables,
+            scene_id=scene_id,
+            profile_id=profile_id,
+            account_id=account_id,
+            effective_config=effective_config,
+        ),
+        snapshot=snapshot,
+        quoted_at=when,
+    )
+    if (
+        quote.status is not ReplacementQuoteStatus.VALID
+        or quote.amount is None
+        or quote.amount <= 0
+        or quote.unit != "CREDIT"
+        or not quote.input_digest
+        or not quote.source_version
+    ):
+        raise ProductionSceneOperatorError("fresh canonical per-run quote is unavailable")
+    assert quote.amount is not None
+    return quote
 
 
 def _execution_context(
@@ -109,7 +255,10 @@ def _execution_context(
     prompt_id: str,
     attempt_id: str,
     visible_free_credits: Decimal,
+    quote: ReplacementQuote,
 ) -> ProductionExecutionContext:
+    if quote.amount is None:
+        raise ProductionSceneOperatorError("validated canonical per-run quote is unavailable")
     account = _unique_row(
         tables.get("PROVIDER_ACCOUNT_MASTER", []),
         "Provider_Account_ID",
@@ -140,6 +289,10 @@ def _execution_context(
             is_free_quota=True,
             paid_fallback=False,
         ),
+        # _validated_quote has already rejected a missing amount.
+        max_reservation_credits=quote.amount,
+        reservation_quote_input_digest=quote.input_digest,
+        reservation_quote_source_version=quote.source_version,
     )
 
 
@@ -190,7 +343,19 @@ def run_once(
     project_id: str,
     expected_email: str,
     execute: bool,
+    production_run_intent: str | None = None,
 ) -> dict[str, object]:
+    _require_production_profile_home()
+    if execute and (
+        production_run_intent is None
+        or not (
+            _RUN_INTENT_RE.fullmatch(production_run_intent)
+            or _PERSISTED_RUN_KEY_RE.fullmatch(production_run_intent)
+        )
+    ):
+        raise ProductionSceneOperatorError(
+            "execute requires an explicit stable production run intent"
+        )
     if (
         not _SCENE_ID_RE.fullmatch(scene_id)
         or not _PROFILE_ID_RE.fullmatch(profile_id)
@@ -266,13 +431,27 @@ def run_once(
         prompt_sha = str(approved_prompt.get("Prompt_SHA256", ""))
         if not prompt_id or not re.fullmatch(r"[0-9a-f]{64}", prompt_sha):
             raise ProductionSceneOperatorError("approved prompt binding is invalid")
+        quote = _validated_quote(
+            snapshot,
+            tables,
+            scene_id=scene_id,
+            profile_id=profile_id,
+            account_id=account_id,
+            effective_config=preflight.technical_configuration,
+        )
         script_id = str(scene.get("Script_ID", ""))
         if not script_id:
             raise ProductionSceneOperatorError("scene script identity is missing")
         request = ProductionRequest(
             script_id,
             "PROD",
-            _request_key(scene_id, profile_id, prompt_id, prompt_sha),
+            _request_key(
+                scene_id,
+                profile_id,
+                prompt_id,
+                prompt_sha,
+                production_run_intent or "READ_ONLY_PREFLIGHT",
+            ),
             (prompt_id,),
         )
         starting_credits = _read_current_production_credits(expected_email)
@@ -287,6 +466,7 @@ def run_once(
             attempt_id="D2_"
             + hashlib.sha256((request.request_idempotency_key + ":F5").encode()).hexdigest()[:32],
             visible_free_credits=starting_credits,
+            quote=quote,
         )
         phase_g_for_f5 = _build_bound_request(
             tables,
@@ -308,6 +488,7 @@ def run_once(
                 "scene_prompt_id": prompt_id,
                 "audio_intent": "NO_AUDIO",
                 "output_count": 1,
+                "validated_quote_credits": str(quote.amount),
                 "provider_credits_before_f5": str(starting_credits),
                 "generate_clicked": False,
                 "sheet_rows_written": False,
@@ -321,6 +502,14 @@ def run_once(
                 "canonical Sheets data changed during F5; rerun gates"
             )
         tables = refreshed_tables
+        quote = _validated_quote(
+            refreshed,
+            tables,
+            scene_id=scene_id,
+            profile_id=profile_id,
+            account_id=account_id,
+            effective_config=preflight.technical_configuration,
+        )
         scene = _unique_row(tables["SCENES"], "Scene_ID", scene_id, "locked scene")
         approved_prompt = _unique_row(
             [
@@ -348,7 +537,6 @@ def run_once(
         )
         jobs = GoogleSheetsProductionJobStore(transaction_rows)
         existing_productions = transaction_rows.read_rows("PRODUCTION_JOBS")
-        existing_scenes = transaction_rows.read_rows("SCENE_JOBS")
         matching_requests = [
             row
             for row in existing_productions
@@ -356,27 +544,10 @@ def run_once(
         ]
         if len(matching_requests) > 1:
             raise ProductionSceneOperatorError("production idempotency key is duplicated")
-        if any(
-            row.get("Script_ID") == script_id
-            and row.get("Request_Idempotency_Key") != request.request_idempotency_key
-            and str(row.get("Job_Status", "")).upper() not in {"COMPLETED", "FAILED", "CANCELLED"}
-            for row in existing_productions
-        ):
+        if _has_unresolved_different_workload(existing_productions, request):
             raise ProductionSceneOperatorError(
-                "another unresolved Production Job exists for this script"
+                "another unresolved Production Job exists for a different workload"
             )
-        if not matching_requests and any(
-            row.get("Scene_Prompt_ID") == prompt_id
-            and str(row.get("Job_Status", "")).upper() not in {"COMPLETED", "FAILED", "CANCELLED"}
-            for row in existing_scenes
-        ):
-            raise ProductionSceneOperatorError(
-                "another unresolved Scene Job exists for this prompt"
-            )
-        if not matching_requests and any(
-            row.get("Scene_Prompt_ID") == prompt_id for row in existing_scenes
-        ):
-            raise ProductionSceneOperatorError("a prior Scene Job already exists for this prompt")
         claim = ProductionJobCoordinator(jobs).submit_request(request, datetime.now(UTC))
         if len(claim.scene_jobs) != 1:
             raise ProductionSceneOperatorError("exactly one Scene Job must be claimed")
@@ -397,6 +568,7 @@ def run_once(
             prompt_id=prompt_id,
             attempt_id=d2_run_id,
             visible_free_credits=current_credits,
+            quote=quote,
         )
         phase_g_request = _build_bound_request(
             tables,
@@ -407,12 +579,10 @@ def run_once(
             temp_root=workspace.directories["generated"],
         )
 
-        def phase_g_request_factory(
-            scene_job: SceneJob, requested_d2_run_id: str
-        ) -> PhaseGExecutionRequest:
+        def phase_g_request_factory(scene_job: SceneJob, d2_run_id: str) -> PhaseGExecutionRequest:
             if (
-                scene_phase_g_run_id(scene_job) != requested_d2_run_id
-                or phase_g_request.d2_run_id != requested_d2_run_id
+                scene_phase_g_run_id(scene_job) != d2_run_id
+                or phase_g_request.d2_run_id != d2_run_id
             ):
                 raise ProductionSceneOperatorError("D2 identity differs from claimed Scene Job")
             return phase_g_request
@@ -467,6 +637,13 @@ def main() -> int:
     parser.add_argument("--provider-account-id", required=True)
     parser.add_argument("--provider-project-id", required=True)
     parser.add_argument("--expected-email", required=True)
+    parser.add_argument(
+        "--production-run-intent",
+        help=(
+            "stable explicit identity for one separately authorized certification run; "
+            "for replay, the persisted Request_Idempotency_Key may be supplied"
+        ),
+    )
     parser.add_argument("--execute", action="store_true", help="run F5 and the one-shot lifecycle")
     args = parser.parse_args()
     try:
@@ -477,6 +654,7 @@ def main() -> int:
             project_id=args.provider_project_id,
             expected_email=args.expected_email,
             execute=args.execute,
+            production_run_intent=args.production_run_intent,
         )
     except Exception as exc:
         code = type(exc).__name__

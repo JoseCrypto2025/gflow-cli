@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
+_PROD_BROWSER_STATE_ROOT = Path("/var/lib/gflow/browser-state")
 sys.path.insert(0, str(_ROOT / "src"))
 
 from gflow_cli.v2_runtime.config import load_runtime_settings  # noqa: E402
@@ -68,9 +70,18 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ensure_prod_profile_home() -> None:
+    configured_home = os.environ.get("GFLOW_CLI_HOME")
+    if configured_home is None:
+        os.environ["GFLOW_CLI_HOME"] = _PROD_BROWSER_STATE_ROOT.as_posix()
+    elif configured_home.replace("\\", "/") != _PROD_BROWSER_STATE_ROOT.as_posix():
+        raise ValueError("configured production browser profile root differs")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        _ensure_prod_profile_home()
         runtime = load_runtime_settings()
         report = asyncio.run(
             inspect_flow_pricing_read_only(

@@ -33,6 +33,11 @@ def _context(
         CreditBudgetContext(provider_remaining_free=Decimal("50")),
         production_job_id="PRD_000001" if environment == "PROD" else None,
         scene_job_id="SJB_000001" if environment == "PROD" else None,
+        max_reservation_credits=Decimal("50") if environment == "PROD" else None,
+        reservation_quote_input_digest="a" * 64 if environment == "PROD" else None,
+        reservation_quote_source_version="PCT_000001:verified:snapshot:sha256"
+        if environment == "PROD"
+        else None,
     )
 
 
@@ -223,6 +228,45 @@ def test_daily_credit_guard_is_shared_across_test_and_prod(tmp_path: Path) -> No
             quoted_credits=Decimal("21"),
             budget=prod_context.credit_budget_context,
         )
+
+
+def test_prod_quote_cannot_exceed_bound_per_run_cap(tmp_path: Path) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    fixed = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+    context = replace(
+        _context("PROD", "D2_capped-0001"),
+        max_reservation_credits=Decimal("10"),
+        reservation_quote_input_digest="a" * 64,
+        reservation_quote_source_version="PCT_000001:verified:snapshot:sha256",
+    )
+    guard.prepare(context, now=fixed)
+    guard.record_generate_click(context.attempt_id)
+
+    with pytest.raises(ProductionExecutionError, match="per-run quote cap"):
+        guard.reserve_quote(
+            context.attempt_id,
+            video_count=1,
+            quoted_credits=Decimal("50"),
+            budget=context.credit_budget_context,
+        )
+
+    assert guard._read()["attempts"][0]["reserved_credits"] == "0"  # noqa: SLF001
+
+
+def test_prod_attempt_requires_quote_cap_before_ledger_creation(tmp_path: Path) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    context = replace(
+        _context("PROD", "D2_missing-cap-0001"),
+        max_reservation_credits=None,
+        reservation_quote_input_digest=None,
+        reservation_quote_source_version=None,
+        legacy_replacement_quote_credits=None,
+    )
+
+    with pytest.raises(ProductionExecutionError, match="canonical per-run quote"):
+        guard.prepare(context, now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))
+
+    assert guard._read()["attempts"] == []  # noqa: SLF001
 
 
 def test_unknown_attempt_reserves_ceiling_and_blocks_next_environment(tmp_path: Path) -> None:

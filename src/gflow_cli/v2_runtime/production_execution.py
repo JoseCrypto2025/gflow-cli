@@ -81,6 +81,9 @@ class ProductionExecutionContext:
     legacy_replacement_quote_credits: Decimal | None = None
     legacy_replacement_quote_input_digest: str | None = None
     legacy_replacement_quote_source_version: str | None = None
+    max_reservation_credits: Decimal | None = None
+    reservation_quote_input_digest: str | None = None
+    reservation_quote_source_version: str | None = None
 
     def validate(self, resolved: dict[str, str]) -> None:
         if self.environment not in {"DEV", "TEST", "PROD"}:
@@ -105,6 +108,24 @@ class ProductionExecutionContext:
             raise ProductionExecutionError("PROD execution identity is not canonically pinned")
         if self.environment == "PROD" and (not self.production_job_id or not self.scene_job_id):
             raise ProductionExecutionError("PROD execution must bind production and scene jobs")
+        if self.max_reservation_credits is not None and (
+            not self.max_reservation_credits.is_finite() or self.max_reservation_credits <= 0
+        ):
+            raise ProductionExecutionError("per-run reservation quote cap is invalid")
+        quote_cap_values = (
+            self.max_reservation_credits,
+            self.reservation_quote_input_digest,
+            self.reservation_quote_source_version,
+        )
+        if any(value is not None for value in quote_cap_values) and (
+            self.environment != "PROD"
+            or self.max_reservation_credits is None
+            or not isinstance(self.reservation_quote_input_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.reservation_quote_input_digest)
+            or not isinstance(self.reservation_quote_source_version, str)
+            or not self.reservation_quote_source_version.strip()
+        ):
+            raise ProductionExecutionError("per-run reservation quote capability is incomplete")
         replacement_values = (
             self.legacy_replacement_authorization_id,
             self.legacy_replacement_parent_attempt_id,
@@ -179,6 +200,18 @@ class ProductionCreditGuard:
                         "attempt ID is already bound to another identity"
                     )
                 return dict(existing)
+            if context.environment == "PROD" and context.max_reservation_credits is None:
+                if context.legacy_replacement_quote_credits is None:
+                    raise ProductionExecutionError(
+                        "validated canonical per-run quote is required for PROD"
+                    )
+                quote_cap = context.legacy_replacement_quote_credits
+                quote_digest = context.legacy_replacement_quote_input_digest
+                quote_version = context.legacy_replacement_quote_source_version
+            else:
+                quote_cap = context.max_reservation_credits
+                quote_digest = context.reservation_quote_input_digest
+                quote_version = context.reservation_quote_source_version
             if any(
                 (row.get("provider_id"), row.get("date")) == identity
                 and row.get("state") not in _TERMINAL
@@ -204,6 +237,19 @@ class ProductionCreditGuard:
                 "reserved_credits": "0",
                 "created_at": format_utc_timestamp(moment),
             }
+            if quote_cap is not None:
+                if (
+                    not quote_cap.is_finite()
+                    or quote_cap <= 0
+                    or not quote_digest
+                    or not quote_version
+                ):
+                    raise ProductionExecutionError(
+                        "validated canonical per-run quote capability is incomplete"
+                    )
+                row["max_reservation_credits"] = str(quote_cap)
+                row["reservation_quote_input_digest"] = quote_digest
+                row["reservation_quote_source_version"] = quote_version
             if context.environment == "PROD":
                 row["production_job_id"] = context.production_job_id
                 row["scene_job_id"] = context.scene_job_id
@@ -455,6 +501,17 @@ class ProductionCreditGuard:
             row = self._find(payload, attempt_id)
             if row.get("state") != "SUBMISSION_UNRESOLVED" or row.get("generate_click_count") != 1:
                 raise ProductionExecutionError("attempt has no single unresolved Generate action")
+            if row.get("environment") == "PROD":
+                try:
+                    maximum = Decimal(str(row.get("max_reservation_credits")))
+                except InvalidOperation as exc:
+                    raise ProductionExecutionError(
+                        "validated canonical per-run quote cap is missing"
+                    ) from exc
+                if not maximum.is_finite() or maximum <= 0 or quote > maximum:
+                    raise ProductionExecutionError(
+                        "confirmation quote exceeds the validated per-run quote cap"
+                    )
             used = sum(
                 (
                     Decimal(str(item.get("reserved_credits", "0")))

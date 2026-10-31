@@ -19,6 +19,7 @@ from gflow_cli.v2_runtime.phase_g import (
     GoogleFlowAgentOnlyGenerationExecutor,
     PhaseGError,
     PhaseGExecutionRequest,
+    _d6_semantic_fingerprint,
     evaluate_d6_release,
 )
 from gflow_cli.v2_runtime.phase_g_artifacts import sha256_file
@@ -158,6 +159,25 @@ def test_d6_requires_phase_e_model_compatibility_fingerprint(tmp_path: Path) -> 
             prerequisite_d2_run_id=_D2_ID,
         )
     assert missing.value.code == "D6_MODEL_COMPATIBILITY_REQUIRED"
+
+
+def test_production_run_number_does_not_change_d2_d6_workload_fingerprint() -> None:
+    workload = {
+        "scene_id": "SCN_000001",
+        "provider_id": "PRV_0001",
+        "generation_mode": "TEXT_TO_VIDEO",
+        "model_id": "MDL_0001",
+        "model_compatibility_sha256": "a" * 64,
+        "requested_duration_sec": 8,
+        "requested_aspect_ratio": "9:16",
+        "requested_output_count": 1,
+        "production_run_no": 2,
+    }
+
+    first_run = _d6_semantic_fingerprint(workload)
+    next_run = _d6_semantic_fingerprint({**workload, "production_run_no": 3})
+
+    assert first_run == next_run
 
 
 def test_d6_prerequisite_must_exist_in_authoritative_ledger(tmp_path: Path) -> None:

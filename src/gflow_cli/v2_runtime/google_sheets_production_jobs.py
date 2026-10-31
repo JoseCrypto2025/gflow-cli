@@ -167,8 +167,23 @@ class GoogleSheetsProductionJobStore:
                 )
                 production_row = production.as_row()
                 validate_production_job_row(production_row)
-                self._rows.append_if_absent("PRODUCTION_JOBS", production_row)
-                replayed = False
+                allocated_production_id = production.production_job_id
+                saved_production_row = self._rows.append_if_unique(
+                    "PRODUCTION_JOBS",
+                    production_row,
+                    unique_constraints=(
+                        ("Request_Idempotency_Key",),
+                        ("Script_ID", "Production_Run_No"),
+                    ),
+                    identity_fields=(
+                        "Script_ID",
+                        "Execution_Environment",
+                        "Request_Idempotency_Key",
+                        "Scene_Set_SHA256",
+                    ),
+                )
+                replayed = saved_production_row.get("Production_Job_ID") != allocated_production_id
+                production = self._production_from_row(saved_production_row, request)
 
             scene_rows = self._rows.read_rows("SCENE_JOBS")
             saved = [
@@ -211,10 +226,20 @@ class GoogleSheetsProductionJobStore:
                 )
                 row = scene.as_row()
                 validate_scene_job_row(row)
-                self._rows.append_if_absent("SCENE_JOBS", row)
+                saved_scene_row = self._rows.append_if_unique(
+                    "SCENE_JOBS",
+                    row,
+                    unique_constraints=(("Production_Job_ID", "Scene_Prompt_ID", "Attempt_No"),),
+                    identity_fields=(
+                        "Production_Job_ID",
+                        "Scene_Prompt_ID",
+                        "Attempt_No",
+                    ),
+                )
+                scene = self._scene_from_row(saved_scene_row)
                 claimed.append(scene)
                 self._events.append(JobEvent(scene.scene_job_id, "", "PENDING", requested_at))
-                all_scene_rows.append(row)
+                all_scene_rows.append(saved_scene_row)
                 next_scene_number += 1
 
             return JobClaim(production, tuple(claimed), replayed)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -254,6 +255,74 @@ def test_production_store_reconciles_lost_claim_ack_by_stable_key(tmp_path: Path
 
     assert claim.production_job.production_job_id == "PRD_000001"
     assert len(transport.tables["PRODUCTION_JOBS"]) == 2
+
+
+def test_two_store_instances_concurrently_replay_one_run_intent(tmp_path: Path) -> None:
+    transport = FakeSheets(_schema_dir())
+    first_store = GoogleSheetsProductionJobStore(_store(tmp_path, transport))
+    second_store = GoogleSheetsProductionJobStore(_store(tmp_path, transport))
+    request = ProductionRequest("SCR_000001", "PROD", "intent-run-3", ("SPV_000007",))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(first_store.claim, request, "2026-10-18T00:00:00Z")
+        second = pool.submit(second_store.claim, request, "2026-10-18T00:00:00Z")
+        claims = (first.result(), second.result())
+
+    assert claims[0].production_job == claims[1].production_job
+    assert claims[0].scene_jobs == claims[1].scene_jobs
+    assert len(transport.tables["PRODUCTION_JOBS"]) == 2
+    assert len(transport.tables["SCENE_JOBS"]) == 2
+
+
+def test_explicit_fresh_run_preserves_historical_pending_lineage(tmp_path: Path) -> None:
+    transport = FakeSheets(_schema_dir())
+    store = GoogleSheetsProductionJobStore(_store(tmp_path, transport))
+    first_request = ProductionRequest("SCR_000001", "PROD", "legacy-run-2", ("SPV_000007",))
+    first = store.claim(first_request, "2026-10-18T00:00:00Z")
+
+    second = store.claim(
+        ProductionRequest("SCR_000001", "PROD", "explicit-cert-run-3", ("SPV_000007",)),
+        "2026-10-18T00:01:00Z",
+    )
+
+    assert second.production_job.production_job_id != first.production_job.production_job_id
+    assert second.scene_jobs[0].scene_job_id != first.scene_jobs[0].scene_job_id
+    assert second.production_job.production_run_no == first.production_job.production_run_no + 1
+    assert second.production_job.scene_set_sha256 == first.production_job.scene_set_sha256
+    old_production = store.read_production_job_row(first.production_job.production_job_id)
+    old_scene = store.read_scene_job_row(first.scene_jobs[0].scene_job_id)
+    assert old_production["Job_Status"] == "REQUESTED"
+    assert old_scene["Job_Status"] == "PENDING"
+
+
+def test_concurrent_distinct_intents_cannot_duplicate_production_run_no(tmp_path: Path) -> None:
+    transport = FakeSheets(_schema_dir())
+    first_store = GoogleSheetsProductionJobStore(_store(tmp_path, transport))
+    second_store = GoogleSheetsProductionJobStore(_store(tmp_path, transport))
+    requests = (
+        ProductionRequest("SCR_000001", "PROD", "intent-a", ("SPV_000007",)),
+        ProductionRequest("SCR_000001", "PROD", "intent-b", ("SPV_000007",)),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = (
+            pool.submit(first_store.claim, requests[0], "2026-10-18T00:00:00Z"),
+            pool.submit(second_store.claim, requests[1], "2026-10-18T00:00:00Z"),
+        )
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except SheetsTransactionError:
+                outcomes.append(None)
+
+    assert sum(result is not None for result in outcomes) == 1
+    assert len(transport.tables["PRODUCTION_JOBS"]) == 2
+    loser_request = requests[0] if outcomes[0] is None else requests[1]
+    retry_store = GoogleSheetsProductionJobStore(_store(tmp_path, transport))
+    retry = retry_store.claim(loser_request, "2026-10-18T00:01:00Z")
+    assert retry.production_job.production_run_no == 2
+    assert len(transport.tables["PRODUCTION_JOBS"]) == 3
 
 
 def test_production_store_rejects_changed_request_and_compare_transition(tmp_path: Path) -> None:

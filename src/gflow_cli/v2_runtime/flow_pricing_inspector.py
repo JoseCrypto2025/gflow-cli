@@ -168,6 +168,8 @@ def build_inspection_report(observation: FlowPricingObservation) -> dict[str, ob
         "ACTIVE_MODEL_PRIORITY": "UNKNOWN",
         "GENERATION_MODE": "UNKNOWN",
         "VISIBLE_DURATION": "UNKNOWN",
+        "DURATION_READBACK": "UNAVAILABLE",
+        "DURATION_SELECTOR_CONFIDENCE": "NONE",
         "VISIBLE_ASPECT_RATIO": "UNKNOWN",
         "VISIBLE_OUTPUT_COUNT": "UNKNOWN",
         "VISIBLE_RESOLUTION": "UNKNOWN",
@@ -238,10 +240,17 @@ def build_inspection_report(observation: FlowPricingObservation) -> dict[str, ob
     report["GENERATION_MODE"] = _safe_text(settings.get("generation_mode")) or "UNKNOWN"
 
     duration = settings.get("duration")
+    duration_confidence = settings.get("duration_selector_confidence")
     aspect_ratio = settings.get("aspect_ratio")
     output_count = settings.get("output_count")
-    if isinstance(duration, int) and not isinstance(duration, bool):
+    if (
+        isinstance(duration, int)
+        and not isinstance(duration, bool)
+        and duration_confidence == "AUTHORITATIVE"
+    ):
         report["VISIBLE_DURATION"] = duration
+        report["DURATION_READBACK"] = duration
+        report["DURATION_SELECTOR_CONFIDENCE"] = "AUTHORITATIVE"
         visible_config["duration"] = duration
     if aspect_ratio in {"9:16", "16:9"}:
         report["VISIBLE_ASPECT_RATIO"] = aspect_ratio

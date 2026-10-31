@@ -230,6 +230,26 @@ def test_phase_e_duration_is_structured_and_drives_distinct_agent_directives(dur
     )
 
 
+def test_effective_scene_configuration_prefers_scene_then_series_then_profile() -> None:
+    tables = _fixtures()
+    tables["GENERATION_PROFILE_MASTER"][0]["Default_Aspect_Ratio"] = "16:9"
+    tables["SERIES_MASTER"][0]["Default_Aspect_Ratio"] = "9:16"
+    tables["SCENES"][0]["Aspect_Ratio_Override"] = "9:16"
+    tables["SCENES"][0]["Duration_Target_Sec"] = 8
+    aspect_capability = next(
+        row for row in tables["MODEL_CAPABILITY_MAP"] if row["Capability_Type"] == "ASPECT_RATIO"
+    )
+    tables["MODEL_CAPABILITY_MAP"].append(
+        {**aspect_capability, "Model_Capability_ID": "CAP_000008", "Capability_Value": "9:16"}
+    )
+
+    result = _compile(tables)
+
+    assert result.status == "PREFLIGHT_PASS", result.errors
+    assert result.technical_configuration["aspect_ratio"] == "9:16"
+    assert result.technical_configuration["duration_sec"] == 8
+
+
 def test_different_structured_durations_produce_different_agent_directives() -> None:
     directives = []
     for duration in (4, 6, 8):

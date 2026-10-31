@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -62,6 +63,45 @@ def test_new_key_advances_per_script_run_number() -> None:
     assert first.production_job.production_run_no == 1
     assert second.production_job.production_run_no == 2
     assert second.production_job.production_job_id == "PRD_000002"
+    assert second.production_job.scene_set_sha256 == first.production_job.scene_set_sha256
+    assert second.scene_jobs[0].scene_job_id != first.scene_jobs[0].scene_job_id
+
+
+def test_replaying_same_intent_after_failure_does_not_allocate_another_run() -> None:
+    store = InMemoryProductionJobStore()
+    request = _request("explicit-run-3")
+    first = store.claim(request, "2026-10-18T00:00:00Z")
+    store.transition_scene(
+        first.scene_jobs[0].scene_job_id,
+        "PENDING",
+        "FAILED",
+        "2026-10-18T00:00:01Z",
+        "TEST_FAILURE",
+    )
+
+    replay = store.claim(request, "2026-10-18T00:00:02Z")
+
+    assert replay.replayed
+    assert replay.production_job == first.production_job
+    assert replay.scene_jobs[0].scene_job_id == first.scene_jobs[0].scene_job_id
+    assert replay.production_job.production_run_no == 1
+    assert len(store.production_jobs()) == 1
+    assert len(store.scene_jobs()) == 1
+
+
+def test_concurrent_replay_of_same_explicit_run_intent_claims_one_job() -> None:
+    store = InMemoryProductionJobStore()
+
+    def claim() -> object:
+        return ProductionJobCoordinator(store).submit_request(_request("explicit-run-3"))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claims = list(pool.map(lambda _: claim(), range(16)))
+
+    assert len(store.production_jobs()) == 1
+    assert len(store.scene_jobs()) == 1
+    assert all(item.production_job == claims[0].production_job for item in claims)
+    assert all(item.scene_jobs == claims[0].scene_jobs for item in claims)
 
 
 def test_scene_transitions_reject_skips_and_hold_without_reason() -> None:

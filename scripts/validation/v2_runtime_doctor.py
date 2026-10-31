@@ -86,8 +86,12 @@ def run_doctor() -> dict[str, Any]:
 
         package_version = _package_version()
         checks.append(_check("gflow_import", True, f"gflow-cli {package_version}"))
-    except ImportError:
-        checks.append(_check("gflow_import", False, "import failed"))
+    except ImportError as exc:
+        missing_name = getattr(exc, "name", None)
+        detail = (
+            f"import failed: {missing_name}" if isinstance(missing_name, str) else "import failed"
+        )
+        checks.append(_check("gflow_import", False, detail[:120]))
     try:
         version = importlib.metadata.version("playwright")
         parts = tuple(int(part) for part in version.split(".")[:2])
