@@ -80,6 +80,38 @@ def test_diagnostic_recorder_persists_redacted_failure_and_traceback_digest(
     assert datetime.fromisoformat(str(failure["timestamp"]).replace("Z", "+00:00")).tzinfo
 
 
+def test_observer_stage_persists_only_allowlisted_safe_evidence(tmp_path: Path) -> None:
+    recorder = _recorder(tmp_path / "runtime")
+    progress = PhaseGExecutionProgress(recorder=recorder, strict=True)
+    evidence = {
+        "http_method": "POST",
+        "endpoint_class": "FLOW_BATCH_EXECUTE",
+        "correlation_id": "YhhmEf",
+        "evidence_digest": "a" * 64,
+    }
+    progress.observer(
+        "PROVIDER_REQUEST_OBSERVED",
+        project_id="aafe9282-071f-4333-baa4-92b9f76a9c27",
+        evidence=evidence,
+    )
+    progress.observer(
+        "PROVIDER_REQUEST_OBSERVED",
+        project_id="aafe9282-071f-4333-baa4-92b9f76a9c27",
+        evidence=evidence,
+    )
+    serialized = recorder.path.read_text(encoding="utf-8")
+    assert len(serialized.splitlines()) == 1
+    assert '"stage":"PROVIDER_REQUEST_OBSERVED"' in serialized
+    assert '"http_method":"POST"' in serialized
+    assert "cookie" not in serialized.casefold()
+    assert "body" not in serialized.casefold()
+    with pytest.raises(ValueError, match="disallowed field"):
+        progress.observer(
+            "PROVIDER_REQUEST_OBSERVED",
+            evidence={"request_body": "sensitive data"},
+        )
+
+
 def test_post_click_reconciliation_failure_is_durably_recorded_without_provider_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

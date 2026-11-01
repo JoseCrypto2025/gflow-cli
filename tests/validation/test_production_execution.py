@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -7,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import gflow_cli.v2_runtime.production_execution as production_execution
 from gflow_cli.v2_runtime.production_execution import (
     CreditBudgetContext,
     ProductionCreditGuard,
@@ -15,6 +18,12 @@ from gflow_cli.v2_runtime.production_execution import (
 )
 
 _PROD_PROJECT = "aafe9282-071f-4333-baa4-92b9f76a9c27"
+_RUN3_ATTEMPT = "D2_5d54c068c457e7cf6fbc7a5319f312ce"
+_RUN3_QUOTE_DIGEST = "8c07afd5d56aefc154eb367434003b513e5af8ffcd6fd71a997f807d9c79daf7"
+_RUN3_QUOTE_VERSION = (
+    "PCT_000001:2026-10-28T15:09:16Z:"
+    "ee1074ae02f4ed3a9fc49759d4502815605b9479f4ce311d945713bdc3b380cc"
+)
 
 
 def _context(
@@ -89,6 +98,117 @@ def test_replacement_quote_is_reserved_before_generate_and_exactly_once(tmp_path
         guard.record_replacement_generate_click(
             context.attempt_id,
             authorization_id=str(context.legacy_replacement_authorization_id),
+        )
+
+
+def test_run3_legacy_unknown_reservation_correction_is_audited_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    run1 = {"attempt_id": "D2_run1", "reserved_credits": "7", "state": "SUCCESS"}
+    run2 = {"attempt_id": "D2_run2", "reserved_credits": "8", "state": "SUCCESS"}
+    run3 = {
+        "attempt_id": _RUN3_ATTEMPT,
+        "environment": "PROD",
+        "provider_id": "PRV_0001",
+        "provider_account_id": "PVA_0002",
+        "provider_project_id": _PROD_PROJECT,
+        "date": "2026-11-01",
+        "production_job_id": "PRD_000003",
+        "scene_job_id": "SJB_000003",
+        "state": "UNKNOWN_SUBMISSION_STATE",
+        "generate_click_count": 1,
+        "reserved_credits": "50",
+        "billing_outcome": "UNKNOWN",
+        "max_reservation_credits": "10",
+        "reservation_quote_input_digest": _RUN3_QUOTE_DIGEST,
+        "reservation_quote_source_version": _RUN3_QUOTE_VERSION,
+    }
+    payload: dict[str, object] = {"schema_version": 1, "attempts": [run1, run2, run3]}
+    guard.root.mkdir(parents=True)
+    guard.path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+    before_row = hashlib.sha256(
+        json.dumps(run3, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    before_ledger = hashlib.sha256(
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    monkeypatch.setattr(production_execution, "_RUN3_CORRECTION_BEFORE_ROW_SHA256", before_row)
+    monkeypatch.setattr(
+        production_execution, "_RUN3_CORRECTION_BEFORE_LEDGER_SHA256", before_ledger
+    )
+
+    corrected = guard.correct_legacy_unknown_reservation(
+        attempt_id=_RUN3_ATTEMPT,
+        production_job_id="PRD_000003",
+        scene_job_id="SJB_000003",
+        expected_row_sha256=before_row,
+        expected_ledger_sha256=before_ledger,
+        quote_input_digest=_RUN3_QUOTE_DIGEST,
+        quote_source_version=_RUN3_QUOTE_VERSION,
+        now=datetime(2026, 11, 1, tzinfo=UTC),
+    )
+    replay = guard.correct_legacy_unknown_reservation(
+        attempt_id=_RUN3_ATTEMPT,
+        production_job_id="PRD_000003",
+        scene_job_id="SJB_000003",
+        expected_row_sha256=before_row,
+        expected_ledger_sha256=before_ledger,
+        quote_input_digest=_RUN3_QUOTE_DIGEST,
+        quote_source_version=_RUN3_QUOTE_VERSION,
+        now=datetime(2026, 11, 1, tzinfo=UTC),
+    )
+    after = guard._read()["attempts"]  # noqa: SLF001 - assert exact shared-ledger mutation
+    assert isinstance(after, list)
+    assert corrected["reserved_credits"] == replay["reserved_credits"] == "10"
+    assert corrected["state"] == replay["state"] == "UNKNOWN_SUBMISSION_STATE"
+    assert corrected["billing_outcome"] == replay["billing_outcome"] == "UNKNOWN"
+    assert after[0] == run1 and after[1] == run2
+    assert len(after[2]["reservation_correction_history"]) == 1
+    assert after[2]["reservation_correction_history"][0]["reason_code"] == (
+        "LEGACY_UNKNOWN_STATE_DAILY_LIMIT_FALLBACK_CORRECTION"
+    )
+    assert [after[index] != payload["attempts"][index] for index in range(3)] == [
+        False,
+        False,
+        True,
+    ]
+
+
+def test_run3_legacy_unknown_reservation_correction_fails_closed_on_stale_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard = ProductionCreditGuard(tmp_path / "runtime")
+    row = {
+        "attempt_id": _RUN3_ATTEMPT,
+        "environment": "PROD",
+        "provider_account_id": "PVA_0002",
+        "provider_project_id": _PROD_PROJECT,
+        "production_job_id": "PRD_000003",
+        "scene_job_id": "SJB_000003",
+        "state": "UNKNOWN_SUBMISSION_STATE",
+        "generate_click_count": 1,
+        "reserved_credits": "50",
+        "billing_outcome": "UNKNOWN",
+        "max_reservation_credits": "10",
+        "reservation_quote_input_digest": _RUN3_QUOTE_DIGEST,
+        "reservation_quote_source_version": _RUN3_QUOTE_VERSION,
+    }
+    guard.root.mkdir(parents=True)
+    guard.path.write_text(json.dumps({"schema_version": 1, "attempts": [row]}), encoding="utf-8")
+    monkeypatch.setattr(production_execution, "_RUN3_CORRECTION_BEFORE_ROW_SHA256", "a" * 64)
+    monkeypatch.setattr(production_execution, "_RUN3_CORRECTION_BEFORE_LEDGER_SHA256", "b" * 64)
+    with pytest.raises(ProductionExecutionError, match="Run 3 reservation changed"):
+        guard.correct_legacy_unknown_reservation(
+            attempt_id=_RUN3_ATTEMPT,
+            production_job_id="PRD_000003",
+            scene_job_id="SJB_000003",
+            expected_row_sha256="a" * 64,
+            expected_ledger_sha256="b" * 64,
+            quote_input_digest=_RUN3_QUOTE_DIGEST,
+            quote_source_version=_RUN3_QUOTE_VERSION,
         )
 
 

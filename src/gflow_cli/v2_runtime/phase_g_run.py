@@ -73,6 +73,7 @@ def reconcile_prod_same_attempt(
     *,
     credit_guard: ProductionCreditGuard,
     evidence: ProdReconciliationEvidence | None = None,
+    progress: PhaseGExecutionProgress | None = None,
 ) -> ProdReconciliationResult:
     """Reconcile one existing PROD attempt using persisted/observed facts only.
 
@@ -120,6 +121,8 @@ def reconcile_prod_same_attempt(
             identity=identity,
             observed_at=observed_at,
         )
+    if progress is not None:
+        progress.observer("RECONCILIATION_STARTED", project_id=identity.provider_project_id)
     result = classify_prod_reconciliation(identity, resolved_evidence, persisted_attempt=attempt)
     if result is ProdReconciliationResult.PROVEN_NOT_SUBMITTED:
         persisted_evidence = prod_evidence_from_attempt(identity, attempt)
@@ -134,6 +137,12 @@ def reconcile_prod_same_attempt(
     audit = evidence_audit_record(result, resolved_evidence)
     audit["contract_version"] = "D2_PROD_SAME_ATTEMPT_RECOVERY_V1"
     ledger.record_prod_reconciliation(identity.d2_run_id, audit)
+    if progress is not None:
+        progress.observer(
+            "RECONCILIATION_FINISHED",
+            project_id=identity.provider_project_id,
+            evidence={"reconciliation_result": result.value},
+        )
     if result is ProdReconciliationResult.PROVEN_NOT_SUBMITTED:
         credit_guard.release_proven_not_submitted(
             identity.d2_run_id,

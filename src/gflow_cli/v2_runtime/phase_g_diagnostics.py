@@ -40,6 +40,21 @@ PhaseGStage = Literal[
     "POST_CLICK_EXECUTION",
     "SAME_ATTEMPT_RECONCILIATION",
 ]
+PhaseGObserverStage = Literal[
+    "PRE_CLICK_READY",
+    "GENERATE_CLICK_INTENT",
+    "GENERATE_CLICK_DISPATCHED",
+    "DOM_OBSERVER_STARTED",
+    "NETWORK_OBSERVER_STARTED",
+    "INITIAL_WINDOW_EXPIRED",
+    "DELAYED_WINDOW_STARTED",
+    "AGENT_TURN_OBSERVED",
+    "PROVIDER_REQUEST_OBSERVED",
+    "PROVIDER_RESPONSE_OBSERVED",
+    "POST_CLICK_PROJECT_SNAPSHOT",
+    "RECONCILIATION_STARTED",
+    "RECONCILIATION_FINISHED",
+]
 PhaseGFailureReason = Literal[
     "PHASE_G_EXECUTION_FAILED_BEFORE_CLICK",
     "PHASE_G_EXECUTION_INTERRUPTED_AFTER_CLICK",
@@ -147,6 +162,88 @@ class PhaseGDiagnosticRecorder:
             }
         )
 
+    def record_observer_stage(
+        self,
+        stage: PhaseGObserverStage,
+        *,
+        project_id: str | None = None,
+        evidence: dict[str, object] | None = None,
+    ) -> None:
+        safe_evidence = evidence or {}
+        allowed = {
+            "chat_turn_count",
+            "chat_turn_delta",
+            "media_delta_count",
+            "pending_count",
+            "http_method",
+            "endpoint_class",
+            "response_status",
+            "correlation_id",
+            "evidence_digest",
+            "reconciliation_result",
+        }
+        if set(safe_evidence) - allowed:
+            raise ValueError("observer diagnostics contain a disallowed field")
+        for key, value in safe_evidence.items():
+            if key in {
+                "chat_turn_count",
+                "chat_turn_delta",
+                "media_delta_count",
+                "pending_count",
+                "response_status",
+            }:
+                if type(value) is not int or value < 0:
+                    raise ValueError("observer diagnostic count is invalid")
+            elif key == "http_method" and value not in {"GET", "POST"}:
+                raise ValueError("observer HTTP method is invalid")
+            elif key == "endpoint_class" and value != "FLOW_BATCH_EXECUTE":
+                raise ValueError("observer endpoint classification is invalid")
+            elif key == "correlation_id" and (
+                not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value)
+            ):
+                raise ValueError("observer correlation ID is invalid")
+            elif key == "reconciliation_result" and value not in {
+                "SUBMISSION_PROVEN_PENDING",
+                "SUBMISSION_PROVEN_EXECUTION_FOUND",
+                "LATE_CONFIRMATION_FOUND",
+                "OUTPUT_ALREADY_EXISTS",
+                "PROVEN_NOT_SUBMITTED",
+                "AMBIGUOUS_AFTER_RECONCILIATION",
+            }:
+                raise ValueError("observer reconciliation result is invalid")
+            elif key == "evidence_digest" and (
+                not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+            ):
+                raise ValueError("observer evidence digest is invalid")
+        if project_id is not None and not re.fullmatch(
+            r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", project_id, re.IGNORECASE
+        ):
+            raise ValueError("observer project ID is invalid")
+        event_identity = {
+            "attempt_id": self.attempt_id,
+            "stage": stage,
+            "project_id": project_id,
+            "evidence": safe_evidence,
+        }
+        event_id = hashlib.sha256(
+            json.dumps(event_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self._append(
+            {
+                "schema_version": 1,
+                "event_type": "OBSERVER_STAGE",
+                "timestamp": _timestamp(),
+                "attempt_id": self.attempt_id,
+                "authorization_id": self.authorization_id,
+                "production_job_id": self.production_job_id,
+                "scene_job_id": self.scene_job_id,
+                "stage": stage,
+                "project_id": project_id,
+                "evidence": safe_evidence,
+                "event_id": event_id,
+            }
+        )
+
     def record_failure(
         self,
         exc: Exception,
@@ -218,6 +315,24 @@ class PhaseGDiagnosticRecorder:
                 raise OSError("Phase G diagnostic path escaped runtime state root")
         if self.path.is_symlink():
             raise OSError("Phase G diagnostic path cannot be a symlink")
+        event_id = record.get("event_id")
+        if isinstance(event_id, str) and self.path.exists():
+            try:
+                for line in self.path.read_text(encoding="utf-8").splitlines():
+                    existing_value = json.loads(line)
+                    if not isinstance(existing_value, dict):
+                        continue
+                    existing = cast(dict[str, object], existing_value)
+                    if existing.get("event_id") != event_id:
+                        continue
+                    existing.pop("timestamp", None)
+                    replay = dict(record)
+                    replay.pop("timestamp", None)
+                    if existing != replay:
+                        raise OSError("Phase G observer event replay conflicts")
+                    return
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise OSError("Phase G observer diagnostics are unreadable") from exc
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
         flags |= cast(int, getattr(os, "O_NOFOLLOW", 0))
         descriptor = os.open(self.path, flags, 0o600)
@@ -257,6 +372,22 @@ class PhaseGExecutionProgress:
         self.current_stage = None
         self.failed_stage = None
         self._record("STAGE_COMPLETED", stage)
+
+    def observer(
+        self,
+        stage: PhaseGObserverStage,
+        *,
+        project_id: str | None = None,
+        evidence: dict[str, object] | None = None,
+    ) -> None:
+        if self.recorder is None:
+            return
+        try:
+            self.recorder.record_observer_stage(stage, project_id=project_id, evidence=evidence)
+        except Exception as exc:
+            self.persistence_error = type(exc).__name__
+            if self.strict:
+                raise
 
     def _record(
         self, event_type: Literal["STAGE_STARTED", "STAGE_COMPLETED"], stage: PhaseGStage

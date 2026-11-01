@@ -1262,6 +1262,34 @@ async def test_agent_only_missing_turn_fails_closed_without_retry(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_agent_only_correlated_network_request_without_turn_remains_ambiguous(
+    tmp_path: Path,
+) -> None:
+    port = FakeGenerationPort()
+    port.submit_evidence = replace(
+        port.submit_evidence,
+        provider_submit_rpc_observed=True,
+        provider_submit_rpc_id="YhhmEf",
+        provider_submit_http_method="POST",
+        provider_submit_project_id="34e60953-e534-46e9-ac65-993893e61065",
+        provider_submit_request_count=1,
+        submission_surface="AGENT_ONLY",
+        agent_turn_dispatched=False,
+    )
+    request, ledger, _journal, executor = make_executor(tmp_path, port)
+
+    with pytest.raises(PhaseGError) as error:
+        await executor.execute(request)
+
+    assert error.value.code == "PHASE_G_AGENT_TURN_NOT_DISPATCHED"
+    assert "DOM=NO NETWORK=YES" in str(error.value)
+    assert port.calls.count("generate") == 1
+    assert port.calls.count("approve") == 0
+    assert ledger.attempts()[0]["agent_turn_dispatched"] is False
+    assert ledger.attempts()[0]["submission_state"] == "UNKNOWN_SUBMISSION_STATE"
+
+
+@pytest.mark.asyncio
 async def test_duplicate_submit_rpcs_after_one_click_fail_closed(tmp_path: Path) -> None:
     port = FakeGenerationPort()
     port.submit_evidence = replace(port.submit_evidence, provider_submit_request_count=2)

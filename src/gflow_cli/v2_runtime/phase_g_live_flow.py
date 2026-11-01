@@ -162,6 +162,7 @@ _APPROVE_ROW = "div[role='radio'].option-row:not(.read-only):has(mat-icon:text-i
 _RECOVERY_GATE_HYDRATION_TIMEOUT_SECONDS = 15.0
 _RECOVERY_GATE_POLL_INTERVAL_SECONDS = 1.0
 _SUBMIT_DISPATCH_TIMEOUT_SECONDS = 15.0
+_SUBMIT_OBSERVATION_TIMEOUT_SECONDS = 240.0
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", re.I)
 _VIDEO_QUOTE_RE = re.compile(r"\b(\d+)\s+videos?\b", re.I)
 _CREDIT_QUOTE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s+credits?\b", re.I)
@@ -362,9 +363,11 @@ class GoogleFlowAgentOnlyGenerationPort:
         self._observed_peak_pending = 0
         self._observed_new_turn = False
         self._observed_new_turn_bubble_index: int | None = None
+        self._agent_turn_stage_recorded = False
         self._submit_observer_armed = False
         self._submit_dispatch_started_at: float | None = None
         self._submit_dispatch_deadline: float | None = None
+        self._submit_initial_deadline: float | None = None
         self._submit_dispatch_window_completed = False
         self._generate_click_dispatched: bool | None = None
         self._submit_requests: list[Any] = []
@@ -609,6 +612,12 @@ class GoogleFlowAgentOnlyGenerationPort:
             frozenset(self._valid_ids(chat_ids)),
         )
         self._baseline = baseline
+        if self._progress is not None:
+            self._progress.observer(
+                "DOM_OBSERVER_STARTED",
+                project_id=baseline.project_id,
+                evidence={"chat_turn_count": chat_count},
+            )
         return baseline
 
     async def arm_submit_request_observer(self) -> None:
@@ -622,6 +631,12 @@ class GoogleFlowAgentOnlyGenerationPort:
         page.on("request", self._on_request)
         page.on("requestfailed", self._on_request_failed)
         self._submit_observer_armed = True
+        if self._progress is not None:
+            self._progress.observer(
+                "NETWORK_OBSERVER_STARTED",
+                project_id=self._provider_project_id,
+                evidence={"endpoint_class": "FLOW_BATCH_EXECUTE", "http_method": "POST"},
+            )
 
     async def _validate_generate_control(self, page: Page) -> Any:
         request = self._require_request()
@@ -666,8 +681,11 @@ class GoogleFlowAgentOnlyGenerationPort:
         submit = await self._validate_generate_control(page)
         self._generate_clicked = True
         self._submit_dispatch_started_at = _monotonic()
-        self._submit_dispatch_deadline = (
+        self._submit_initial_deadline = (
             self._submit_dispatch_started_at + _SUBMIT_DISPATCH_TIMEOUT_SECONDS
+        )
+        self._submit_dispatch_deadline = (
+            self._submit_dispatch_started_at + _SUBMIT_OBSERVATION_TIMEOUT_SECONDS
         )
         try:
             await submit.click(timeout=5_000)
@@ -678,24 +696,42 @@ class GoogleFlowAgentOnlyGenerationPort:
             self._generate_click_dispatched = True
 
     async def await_submit_dispatch(self) -> PhaseGSubmitTransportEvidence:
-        """Observe the exact Agent turn or wait for the Classic Migrated request window."""
+        """Observe an initial dispatch window then passively continue to the shared deadline."""
         if self._submit_dispatch_deadline is None:
             raise PhaseGError("PHASE_G_SUBMIT_OBSERVER_REQUIRED", "Generate was not dispatched")
+        if self._submit_initial_deadline is None:
+            raise PhaseGError("PHASE_G_SUBMIT_OBSERVER_REQUIRED", "dispatch baseline is missing")
+        baseline = self._baseline
+        if baseline is None:
+            raise PhaseGError("PHASE_G_BASELINE_REQUIRED", "dispatch needs a project baseline")
+        initial_deadline = self._submit_initial_deadline
         if self._submission_surface == "AGENT_ONLY":
-            baseline = self._baseline
-            if baseline is None or self._provider_directive_sha256 is None:
+            if self._provider_directive_sha256 is None:
                 raise PhaseGError(
                     "PHASE_G_BASELINE_REQUIRED", "Agent dispatch needs the prompt and chat baseline"
                 )
-            while _monotonic() < self._submit_dispatch_deadline:
+            while _monotonic() < initial_deadline:
                 await self._capture_progress(baseline)
-                if self._observed_new_turn:
+                if self._observed_new_turn or self._submit_requests:
+                    break
+                await _async_sleep(min(1.0, initial_deadline - _monotonic()))
+        else:
+            while _monotonic() < initial_deadline and not self._submit_requests:
+                await _async_sleep(min(1.0, initial_deadline - _monotonic()))
+        if not self._observed_new_turn and not self._submit_requests:
+            if self._progress is not None:
+                self._progress.observer("INITIAL_WINDOW_EXPIRED", project_id=baseline.project_id)
+            await self._record_project_snapshot(baseline)
+            if self._progress is not None:
+                self._progress.observer("DELAYED_WINDOW_STARTED", project_id=baseline.project_id)
+            while _monotonic() < self._submit_dispatch_deadline:
+                if self._submission_surface == "AGENT_ONLY":
+                    await self._capture_progress(baseline)
+                if self._observed_new_turn or self._submit_requests:
                     break
                 await _async_sleep(min(1.0, self._submit_dispatch_deadline - _monotonic()))
-        else:
-            remaining = max(0.0, self._submit_dispatch_deadline - _monotonic())
-            if remaining:
-                await _async_sleep(remaining)
+            await self._record_project_snapshot(baseline)
+        await self._record_project_snapshot(baseline)
         self._submit_dispatch_window_completed = True
         self.disarm_submit_request_observer()
         if self._response_tasks:
@@ -703,6 +739,38 @@ class GoogleFlowAgentOnlyGenerationPort:
         if self._submit_requests and self._submit_request_failed is None:
             self._submit_request_failed = False
         return self.read_submit_transport_evidence()
+
+    async def _record_project_snapshot(self, baseline: FlowSubmissionBaseline) -> None:
+        if self._progress is None:
+            return
+        page = self._require_page()
+        request = self._require_request()
+        parsed_url = urlparse(page.url)
+        if (
+            baseline.project_id != request.provider_project_id
+            or parsed_url.netloc != "flow.google.com"
+            or parsed_url.path != f"/project/{request.provider_project_id}"
+        ):
+            raise PhaseGError(
+                "FLOW_PROJECT_MISMATCH", "post-click snapshot is not on the pinned project"
+            )
+        state_value = await page.evaluate(_VIDEO_STATE_JS)
+        if not isinstance(state_value, dict):
+            return
+        state = cast(dict[str, object], state_value)
+        chat_count = self._integer(state.get("chat_count"))
+        baseline_count = int((baseline.agent_turn_id or "0:").partition(":")[0] or "0")
+        media_ids = self._valid_ids(state.get("media_ids"))
+        self._progress.observer(
+            "POST_CLICK_PROJECT_SNAPSHOT",
+            project_id=baseline.project_id,
+            evidence={
+                "chat_turn_count": chat_count,
+                "chat_turn_delta": max(0, chat_count - baseline_count),
+                "media_delta_count": len(media_ids - baseline.media_ids),
+                "pending_count": self._integer(state.get("pending")),
+            },
+        )
 
     def read_submit_transport_evidence(self) -> PhaseGSubmitTransportEvidence:
         count = len(self._submit_requests)
@@ -1130,6 +1198,21 @@ class GoogleFlowAgentOnlyGenerationPort:
         ):
             return
         self._submit_requests.append(request)
+        if self._progress is not None:
+            safe_metadata = (
+                f"POST|FLOW_BATCH_EXECUTE|{attempt.provider_project_id}|{TEXT_TO_VIDEO_SUBMIT_RPC}"
+            )
+            safe_digest = hashlib.sha256(safe_metadata.encode()).hexdigest()
+            self._progress.observer(
+                "PROVIDER_REQUEST_OBSERVED",
+                project_id=attempt.provider_project_id,
+                evidence={
+                    "http_method": "POST",
+                    "endpoint_class": "FLOW_BATCH_EXECUTE",
+                    "correlation_id": TEXT_TO_VIDEO_SUBMIT_RPC,
+                    "evidence_digest": safe_digest,
+                },
+            )
         try:
             request_body = request.post_data
         except Exception:
@@ -1179,6 +1262,22 @@ class GoogleFlowAgentOnlyGenerationPort:
             self._submit_response_status = int(response.status)
             self._submit_generation_record_observed = False
             self._submit_refusal_detected = False
+            if self._progress is not None:
+                safe_metadata = (
+                    f"{response.status}|FLOW_BATCH_EXECUTE|{self._provider_project_id}|"
+                    f"{TEXT_TO_VIDEO_SUBMIT_RPC}"
+                )
+                safe_digest = hashlib.sha256(safe_metadata.encode()).hexdigest()
+                self._progress.observer(
+                    "PROVIDER_RESPONSE_OBSERVED",
+                    project_id=self._provider_project_id,
+                    evidence={
+                        "endpoint_class": "FLOW_BATCH_EXECUTE",
+                        "response_status": int(response.status),
+                        "correlation_id": TEXT_TO_VIDEO_SUBMIT_RPC,
+                        "evidence_digest": safe_digest,
+                    },
+                )
         try:
             body = await response.text()
         except Exception:
@@ -1271,6 +1370,20 @@ class GoogleFlowAgentOnlyGenerationPort:
                 state, baseline
             )
         self._observed_new_turn = self._observed_new_turn_bubble_index is not None
+        if self._observed_new_turn and not getattr(self, "_agent_turn_stage_recorded", False):
+            self._agent_turn_stage_recorded = True
+            if self._progress is not None:
+                baseline_count = int((baseline.agent_turn_id or "0:").partition(":")[0] or "0")
+                self._progress.observer(
+                    "AGENT_TURN_OBSERVED",
+                    project_id=baseline.project_id,
+                    evidence={
+                        "chat_turn_count": self._integer(state.get("chat_count")),
+                        "chat_turn_delta": max(
+                            0, self._integer(state.get("chat_count")) - baseline_count
+                        ),
+                    },
+                )
 
     def _new_agent_turn_bubble_index(
         self, state: dict[str, object], baseline: FlowSubmissionBaseline

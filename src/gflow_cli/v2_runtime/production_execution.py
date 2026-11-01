@@ -6,6 +6,7 @@ existing Phase G browser executor remains the sole provider interaction path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -25,6 +26,22 @@ _TERMINAL = frozenset({"SUCCESS", "PROVIDER_REJECTED", "FAILED_CONFIRMED", "WAF_
 _PROD_PROVIDER_ACCOUNT_ID = "PVA_0002"
 _PROD_PROVIDER_PROJECT_ID = "aafe9282-071f-4333-baa4-92b9f76a9c27"
 _PROD_AUTH_PROFILE = "GFLOW_PROD_AUTH"
+_RUN3_CORRECTION_ATTEMPT_ID = "D2_5d54c068c457e7cf6fbc7a5319f312ce"
+_RUN3_CORRECTION_PRODUCTION_JOB_ID = "PRD_000003"
+_RUN3_CORRECTION_SCENE_JOB_ID = "SJB_000003"
+_RUN3_CORRECTION_BEFORE_ROW_SHA256 = (
+    "daa32f2e98254231ee28b6bdab02e210fe8a0f261ed1b894860e0e88873c5514"
+)
+_RUN3_CORRECTION_BEFORE_LEDGER_SHA256 = (
+    "01f8b0c1fba8c6fef332389f623ecd942d0636e049e59f1da309122689eb6e2b"
+)
+_RUN3_CORRECTION_QUOTE_INPUT_DIGEST = (
+    "8c07afd5d56aefc154eb367434003b513e5af8ffcd6fd71a997f807d9c79daf7"
+)
+_RUN3_CORRECTION_QUOTE_SOURCE_VERSION = (
+    "PCT_000001:2026-10-28T15:09:16Z:"
+    "ee1074ae02f4ed3a9fc49759d4502815605b9479f4ce311d945713bdc3b380cc"
+)
 
 
 class ProductionExecutionError(ValueError):
@@ -998,6 +1015,136 @@ class ProductionCreditGuard:
             if row.get("attempt_id") == attempt_id:
                 return row
         raise ProductionExecutionError("production attempt does not exist")
+
+    def correct_legacy_unknown_reservation(
+        self,
+        *,
+        attempt_id: str,
+        production_job_id: str,
+        scene_job_id: str,
+        expected_row_sha256: str,
+        expected_ledger_sha256: str,
+        quote_input_digest: str,
+        quote_source_version: str,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        """Apply the one audited Run 3 correction without resolving submission ambiguity."""
+        target = {
+            "attempt_id": attempt_id,
+            "production_job_id": production_job_id,
+            "scene_job_id": scene_job_id,
+            "environment": "PROD",
+            "provider_account_id": _PROD_PROVIDER_ACCOUNT_ID,
+            "provider_project_id": _PROD_PROVIDER_PROJECT_ID,
+            "reserved_credits": "50",
+            "state": "UNKNOWN_SUBMISSION_STATE",
+            "billing_outcome": "UNKNOWN",
+            "generate_click_count": 1,
+            "max_reservation_credits": "10",
+            "reservation_quote_input_digest": quote_input_digest,
+            "reservation_quote_source_version": quote_source_version,
+        }
+        if (
+            attempt_id != _RUN3_CORRECTION_ATTEMPT_ID
+            or production_job_id != _RUN3_CORRECTION_PRODUCTION_JOB_ID
+            or scene_job_id != _RUN3_CORRECTION_SCENE_JOB_ID
+            or expected_row_sha256 != _RUN3_CORRECTION_BEFORE_ROW_SHA256
+            or expected_ledger_sha256 != _RUN3_CORRECTION_BEFORE_LEDGER_SHA256
+            or quote_input_digest != _RUN3_CORRECTION_QUOTE_INPUT_DIGEST
+            or quote_source_version != _RUN3_CORRECTION_QUOTE_SOURCE_VERSION
+        ):
+            raise ProductionExecutionError("Run 3 correction authorization is invalid")
+        moment = now or datetime.now(UTC)
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ProductionExecutionError("credit correction timestamp must be timezone-aware")
+        audit_id = "RCA_RUN3_" + expected_row_sha256[:16].upper()
+
+        def digest(value: object) -> str:
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
+
+        def ledger_digest(value: object) -> str:
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            return hashlib.sha256(encoded + b"\n").hexdigest()
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            records = cast(list[dict[str, object]], payload["attempts"])
+            matches = [row for row in records if row.get("attempt_id") == attempt_id]
+            if len(matches) != 1:
+                raise ProductionExecutionError("Run 3 reservation identity is not unique")
+            row = matches[0]
+            history = row.get("reservation_correction_history", [])
+            if not isinstance(history, list):
+                raise ProductionExecutionError("reservation correction audit is malformed")
+            prior: list[dict[str, object]] = []
+            for event_value in cast(list[object], history):
+                if not isinstance(event_value, dict):
+                    continue
+                event = cast(dict[str, object], event_value)
+                if event.get("audit_record_id") == audit_id:
+                    prior.append(event)
+            if prior:
+                replay_event = {
+                    "audit_record_id": audit_id,
+                    "reason_code": "LEGACY_UNKNOWN_STATE_DAILY_LIMIT_FALLBACK_CORRECTION",
+                    "attempt_id": attempt_id,
+                    "production_job_id": production_job_id,
+                    "scene_job_id": scene_job_id,
+                    "before_amount": "50",
+                    "after_amount": "10",
+                    "before_state": "UNKNOWN_SUBMISSION_STATE",
+                    "after_state": "UNKNOWN_SUBMISSION_STATE",
+                    "provider_billing_outcome": "UNKNOWN",
+                    "generate_click_count": 1,
+                    "quote_input_digest": quote_input_digest,
+                    "quote_source_version": quote_source_version,
+                    "before_row_sha256": expected_row_sha256,
+                    "before_ledger_sha256": expected_ledger_sha256,
+                }
+                if (
+                    len(prior) != 1
+                    or any(prior[0].get(key) != value for key, value in replay_event.items())
+                    or row.get("reserved_credits") != "10"
+                    or row.get("state") != "UNKNOWN_SUBMISSION_STATE"
+                    or row.get("billing_outcome") != "UNKNOWN"
+                ):
+                    raise ProductionExecutionError("Run 3 correction replay differs")
+                return dict(row)
+            if (
+                ledger_digest(payload) != expected_ledger_sha256
+                or digest(row) != expected_row_sha256
+            ):
+                raise ProductionExecutionError("Run 3 reservation changed since authorization")
+            if any(row.get(key) != value for key, value in target.items()):
+                raise ProductionExecutionError("Run 3 reservation lineage or quote differs")
+            if any(
+                key.startswith("forensic_closure") and value not in (None, "", {})
+                for key, value in row.items()
+            ):
+                raise ProductionExecutionError("Run 3 reservation has a forensic closure")
+            event: dict[str, object] = {
+                "audit_record_id": audit_id,
+                "timestamp": format_utc_timestamp(moment),
+                "reason_code": "LEGACY_UNKNOWN_STATE_DAILY_LIMIT_FALLBACK_CORRECTION",
+                "attempt_id": attempt_id,
+                "production_job_id": production_job_id,
+                "scene_job_id": scene_job_id,
+                "before_amount": "50",
+                "after_amount": "10",
+                "before_state": "UNKNOWN_SUBMISSION_STATE",
+                "after_state": "UNKNOWN_SUBMISSION_STATE",
+                "provider_billing_outcome": "UNKNOWN",
+                "generate_click_count": 1,
+                "quote_input_digest": quote_input_digest,
+                "quote_source_version": quote_source_version,
+                "before_row_sha256": expected_row_sha256,
+                "before_ledger_sha256": expected_ledger_sha256,
+            }
+            row["reserved_credits"] = "10"
+            row["reservation_correction_history"] = [*history, event]
+            return dict(row)
+
+        return self._mutate(update)
 
     def _mutate(
         self, operation: Callable[[dict[str, object]], dict[str, object]]

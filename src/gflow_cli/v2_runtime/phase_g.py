@@ -647,6 +647,7 @@ class GoogleFlowAgentOnlyGenerationExecutor:
                 request.d2_run_id, baseline
             )
             self.ledger.capture_baseline(request.d2_run_id, baseline)
+            progress.observer("PRE_CLICK_READY", project_id=baseline.project_id)
             await self.port.arm_submit_request_observer()
             progress.complete("SUBMISSION_BASELINE")
             progress.start("GENERATE_CHECKPOINT")
@@ -667,15 +668,20 @@ class GoogleFlowAgentOnlyGenerationExecutor:
             progress.complete("GENERATE_CHECKPOINT")
             observation_deadline = time.monotonic() + 240
             progress.start("GENERATE_CLICK")
+            progress.observer("GENERATE_CLICK_INTENT", project_id=baseline.project_id)
             await self.port.click_generate_once()
+            progress.observer("GENERATE_CLICK_DISPATCHED", project_id=baseline.project_id)
             progress.complete("GENERATE_CLICK")
             dispatch = await self.port.await_submit_dispatch()
             self.ledger.record_submit_transport_evidence(request.d2_run_id, dispatch)
             if dispatch.submission_surface == "AGENT_ONLY":
                 if dispatch.agent_turn_dispatched is not True:
+                    network = "YES" if dispatch.provider_submit_request_count else "NO"
                     raise PhaseGError(
                         "PHASE_G_AGENT_TURN_NOT_DISPATCHED",
-                        "the exact Agent prompt was not observed as a new project chat turn",
+                        "no new Agent turn was observed; "
+                        f"DOM=NO NETWORK={network} ASSET=NOT_YET_OBSERVED; "
+                        "submission remains ambiguous",
                     )
             elif dispatch.submission_surface == "CLASSIC_MIGRATED":
                 if dispatch.provider_submit_request_count == 0:

@@ -5,8 +5,9 @@
 `scripts/operations/deploy_v2_runtime.py` is the application deployment
 operator. It defaults to a read-only preflight and requires an exact clean
 `automation-v2` commit. It packages only `src/`, `schemas/`, the production F5
-operator, the legacy reconciliation, ambiguous-policy, and one-shot replacement operators,
-the read-only Flow pricing inspector, the runtime doctor, `pyproject.toml`, and `uv.lock` from Git; it never
+operator, the legacy reconciliation, ambiguous-policy, one-shot replacement, and guarded
+Run 3 reservation-correction operators, the read-only Flow pricing inspector, the runtime doctor,
+`pyproject.toml`, and `uv.lock` from Git; it never
 copies `.git`, tests, docs, ignored files, credentials, or a source virtualenv.
 The allowlisted `validate_v2_data_architecture.py` is included because the
 live Google Sheets snapshot source imports it for full schema and semantic
@@ -42,6 +43,11 @@ that exact verified backup:
 python3 /opt/gflow-v2-src/scripts/operations/deploy_v2_runtime.py \
   --rollback /opt/gflow-v2-backups/<exact-backup-directory>
 ```
+
+The Run 3 reservation correction operator is dry-run by default and accepts only the exact
+authorized attempt, job lineage, before-state ledger and row digests, and validated quote. Its
+single apply transition changes the reservation amount while preserving the unknown submission
+and billing states. It does not release or consume credits and is not a reconciliation operation.
 
 Deployment refuses a dirty/wrong source checkout, an unexpected runtime owner
 or mode, an active process using the application/profile, unsafe archive paths,

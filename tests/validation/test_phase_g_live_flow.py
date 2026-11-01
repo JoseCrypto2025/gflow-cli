@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +14,10 @@ from gflow_cli.api.transports.batchexecute import TEXT_TO_VIDEO_SUBMIT_RPC
 from gflow_cli.errors import WafRejectionError
 from gflow_cli.v2_runtime.errors import FlowPresubmitError
 from gflow_cli.v2_runtime.phase_g import FlowSubmissionBaseline, PhaseGError
+from gflow_cli.v2_runtime.phase_g_diagnostics import (
+    PhaseGDiagnosticRecorder,
+    PhaseGExecutionProgress,
+)
 from gflow_cli.v2_runtime.phase_g_live_flow import (
     GoogleFlowAgentOnlyGenerationPort,
     _finished_tile_hashes,
@@ -51,6 +56,7 @@ class _Locator:
 class _Page:
     def __init__(self, locator: _Locator) -> None:
         self._locator = locator
+        self.url = "https://flow.google.com/project/project"
 
     def locator(self, _selector: str) -> _Locator:
         return self._locator
@@ -136,7 +142,10 @@ def _port(gate_after_polls: int | None) -> GoogleFlowAgentOnlyGenerationPort:
     port._submit_observer_armed = False
     port._submit_dispatch_started_at = None
     port._submit_dispatch_deadline = None
+    port._submit_initial_deadline = None
     port._submit_dispatch_window_completed = False
+    port._agent_turn_stage_recorded = False
+    port._progress = None
     port._generate_click_dispatched = None
     port._submit_requests = []
     port._submit_observed_at = None
@@ -376,6 +385,7 @@ async def test_agent_turn_dispatch_does_not_wait_for_or_require_yhhmef(
     port._submission_surface = "AGENT_ONLY"
     port._provider_directive_sha256 = prompt_hash
     port._submit_dispatch_deadline = 15.0
+    port._submit_initial_deadline = 15.0
     monkeypatch.setattr(live_flow, "_monotonic", lambda: 0.0)
 
     evidence = await port.await_submit_dispatch()
@@ -384,6 +394,72 @@ async def test_agent_turn_dispatch_does_not_wait_for_or_require_yhhmef(
     assert evidence.agent_turn_dispatched is True
     assert evidence.provider_submit_request_count == 0
     assert evidence.provider_submit_rpc_id is None
+
+
+@pytest.mark.asyncio
+async def test_missing_initial_turn_uses_delayed_passive_window_without_provider_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directive = "approved provider directive"
+    directive_hash = hashlib.sha256(directive.encode()).hexdigest()
+    no_turn = _project_state(pending=0, media_ids=[], chat_count=0, chat_bubble_hashes=[])
+    new_turn = _project_state(
+        pending=0,
+        media_ids=[],
+        chat_count=1,
+        chat_bubble_hashes=[directive_hash],
+    )
+    port = _observation_port([no_turn], [])
+    port._submission_surface = "AGENT_ONLY"
+    port._baseline = FlowSubmissionBaseline(
+        "aafe9282-071f-4333-baa4-92b9f76a9c27",
+        frozenset(),
+        frozenset(),
+        0,
+        frozenset(),
+        "0:",
+    )
+    port._request.provider_project_id = "aafe9282-071f-4333-baa4-92b9f76a9c27"
+    port._page.url = "https://flow.google.com/project/aafe9282-071f-4333-baa4-92b9f76a9c27"
+    port._provider_directive_sha256 = directive_hash
+    port._submit_dispatch_started_at = 0.0
+    port._submit_initial_deadline = 15.0
+    port._submit_dispatch_deadline = 240.0
+    recorder = PhaseGDiagnosticRecorder(
+        tmp_path / "runtime",
+        attempt_id="D2_test-run-0001",
+        authorization_id="LRA_" + "A" * 24,
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+    )
+    port._progress = PhaseGExecutionProgress(recorder=recorder, strict=True)
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    async def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+        if now >= 18.0:
+            port._page.states = [new_turn]  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(live_flow, "_monotonic", monotonic)
+    monkeypatch.setattr(live_flow, "_async_sleep", advance)
+
+    evidence = await port.await_submit_dispatch()
+
+    assert evidence.agent_turn_dispatched is True
+    assert evidence.provider_submit_request_count == 0
+    assert port._generate_clicked is False
+    assert port._submit_requests == []
+    events = [json.loads(line) for line in recorder.path.read_text(encoding="utf-8").splitlines()]
+    stages = [event["stage"] for event in events]
+    assert "INITIAL_WINDOW_EXPIRED" in stages
+    assert "DELAYED_WINDOW_STARTED" in stages
+    assert "AGENT_TURN_OBSERVED" in stages
+    assert "POST_CLICK_PROJECT_SNAPSHOT" in stages
+    assert 15.0 <= now < 240.0
 
 
 def test_unrelated_batchexecute_request_does_not_count_as_submit(
