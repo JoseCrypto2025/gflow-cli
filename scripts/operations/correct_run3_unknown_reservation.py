@@ -101,7 +101,7 @@ def main() -> int:
         or target.get("scene_job_id") != _SCENE_JOB_ID
         or target.get("reserved_credits") != "50"
         or target.get("state") != "UNKNOWN_SUBMISSION_STATE"
-        or target.get("billing_outcome") != "UNKNOWN"
+        or target.get("billing_outcome") not in (None, "", "UNKNOWN")
         or target.get("generate_click_count") != 1
     ):
         raise SystemExit("HOLD: exact authorized Run 3 reservation proof does not match")
@@ -132,7 +132,7 @@ def main() -> int:
         changed != [_ATTEMPT_ID]
         or result.get("reserved_credits") != "10"
         or after_target.get("state") != "UNKNOWN_SUBMISSION_STATE"
-        or after_target.get("billing_outcome") != "UNKNOWN"
+        or after_target.get("billing_outcome") != target.get("billing_outcome")
     ):
         raise SystemExit("HOLD: post-correction invariants did not verify")
     history = cast(list[dict[str, object]], after_target["reservation_correction_history"])

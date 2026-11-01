@@ -1038,7 +1038,6 @@ class ProductionCreditGuard:
             "provider_project_id": _PROD_PROVIDER_PROJECT_ID,
             "reserved_credits": "50",
             "state": "UNKNOWN_SUBMISSION_STATE",
-            "billing_outcome": "UNKNOWN",
             "generate_click_count": 1,
             "max_reservation_credits": "10",
             "reservation_quote_input_digest": quote_input_digest,
@@ -1095,6 +1094,7 @@ class ProductionCreditGuard:
                     "before_state": "UNKNOWN_SUBMISSION_STATE",
                     "after_state": "UNKNOWN_SUBMISSION_STATE",
                     "provider_billing_outcome": "UNKNOWN",
+                    "credit_ledger_billing_outcome_before": row.get("billing_outcome"),
                     "generate_click_count": 1,
                     "quote_input_digest": quote_input_digest,
                     "quote_source_version": quote_source_version,
@@ -1106,7 +1106,7 @@ class ProductionCreditGuard:
                     or any(prior[0].get(key) != value for key, value in replay_event.items())
                     or row.get("reserved_credits") != "10"
                     or row.get("state") != "UNKNOWN_SUBMISSION_STATE"
-                    or row.get("billing_outcome") != "UNKNOWN"
+                    or row.get("billing_outcome") not in (None, "", "UNKNOWN")
                 ):
                     raise ProductionExecutionError("Run 3 correction replay differs")
                 return dict(row)
@@ -1117,6 +1117,8 @@ class ProductionCreditGuard:
                 raise ProductionExecutionError("Run 3 reservation changed since authorization")
             if any(row.get(key) != value for key, value in target.items()):
                 raise ProductionExecutionError("Run 3 reservation lineage or quote differs")
+            if row.get("billing_outcome") not in (None, "", "UNKNOWN"):
+                raise ProductionExecutionError("Run 3 billing outcome is not unresolved")
             if any(
                 key.startswith("forensic_closure") and value not in (None, "", {})
                 for key, value in row.items()
@@ -1134,6 +1136,7 @@ class ProductionCreditGuard:
                 "before_state": "UNKNOWN_SUBMISSION_STATE",
                 "after_state": "UNKNOWN_SUBMISSION_STATE",
                 "provider_billing_outcome": "UNKNOWN",
+                "credit_ledger_billing_outcome_before": row.get("billing_outcome"),
                 "generate_click_count": 1,
                 "quote_input_digest": quote_input_digest,
                 "quote_source_version": quote_source_version,

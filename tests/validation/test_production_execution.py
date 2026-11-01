@@ -119,7 +119,7 @@ def test_run3_legacy_unknown_reservation_correction_is_audited_and_idempotent(
         "state": "UNKNOWN_SUBMISSION_STATE",
         "generate_click_count": 1,
         "reserved_credits": "50",
-        "billing_outcome": "UNKNOWN",
+        "billing_outcome": None,
         "max_reservation_credits": "10",
         "reservation_quote_input_digest": _RUN3_QUOTE_DIGEST,
         "reservation_quote_source_version": _RUN3_QUOTE_VERSION,
@@ -164,7 +164,7 @@ def test_run3_legacy_unknown_reservation_correction_is_audited_and_idempotent(
     assert isinstance(after, list)
     assert corrected["reserved_credits"] == replay["reserved_credits"] == "10"
     assert corrected["state"] == replay["state"] == "UNKNOWN_SUBMISSION_STATE"
-    assert corrected["billing_outcome"] == replay["billing_outcome"] == "UNKNOWN"
+    assert corrected["billing_outcome"] is replay["billing_outcome"] is None
     assert after[0] == run1 and after[1] == run2
     assert len(after[2]["reservation_correction_history"]) == 1
     assert after[2]["reservation_correction_history"][0]["reason_code"] == (
@@ -191,7 +191,7 @@ def test_run3_legacy_unknown_reservation_correction_fails_closed_on_stale_digest
         "state": "UNKNOWN_SUBMISSION_STATE",
         "generate_click_count": 1,
         "reserved_credits": "50",
-        "billing_outcome": "UNKNOWN",
+        "billing_outcome": None,
         "max_reservation_credits": "10",
         "reservation_quote_input_digest": _RUN3_QUOTE_DIGEST,
         "reservation_quote_source_version": _RUN3_QUOTE_VERSION,
