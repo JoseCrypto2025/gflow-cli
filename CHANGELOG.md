@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Offline upstream-first video adapter V1.** Adds a disconnected, fake-runner-tested adapter pinned to
+  upstream `gflow-cli` v0.92.1 / source commit `63dd0081e117dc081ed7fc774d3dd19ac91ec9aa`. It builds
+  one `video t2v` invocation and normalizes a strict result without changing production routing; the
+  local Phase G path, credit guard, job identity, D2/D6, n8n, and deployment remain unchanged.
+
 - **PROD same-attempt reconciliation path and post-click diagnostics.** Reconciliation now resolves the
   PROD D2 ledger beneath the runtime root's `production/phase-g` directory. The replacement operator
   records redacted execution-interruption and reconciliation-failure details on the exact existing
