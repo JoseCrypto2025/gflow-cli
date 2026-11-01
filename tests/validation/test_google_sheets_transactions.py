@@ -316,12 +316,17 @@ def test_concurrent_distinct_intents_cannot_duplicate_production_run_no(tmp_path
             except SheetsTransactionError:
                 outcomes.append(None)
 
-    assert sum(result is not None for result in outcomes) == 1
-    assert len(transport.tables["PRODUCTION_JOBS"]) == 2
-    loser_request = requests[0] if outcomes[0] is None else requests[1]
-    retry_store = GoogleSheetsProductionJobStore(_store(tmp_path, transport))
-    retry = retry_store.claim(loser_request, "2026-10-18T00:01:00Z")
-    assert retry.production_job.production_run_no == 2
+    claims = [result for result in outcomes if result is not None]
+    assert claims
+    run_numbers = [result.production_job.production_run_no for result in claims]
+    assert len(run_numbers) == len(set(run_numbers))
+
+    for index, outcome in enumerate(outcomes):
+        if outcome is None:
+            retry_store = GoogleSheetsProductionJobStore(_store(tmp_path, transport))
+            claims.append(retry_store.claim(requests[index], "2026-10-18T00:01:00Z"))
+
+    assert sorted(result.production_job.production_run_no for result in claims) == [1, 2]
     assert len(transport.tables["PRODUCTION_JOBS"]) == 3
 
 

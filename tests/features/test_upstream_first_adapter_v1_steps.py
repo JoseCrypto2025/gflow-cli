@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -116,7 +117,7 @@ def runner_succeeds(adapter_state: dict[str, Any]) -> None:
 @when("the adapter generates once")
 def generate_once(adapter_state: dict[str, Any]) -> None:
     adapter = UpstreamGflowVideoAdapter(
-        python_executable=Path("C:/fake/upstream/.venv/Scripts/python.exe"),
+        python_executable=Path(sys.executable),
         pinned_version="0.92.1",
         runner=adapter_state["runner"],
     )

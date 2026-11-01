@@ -126,3 +126,22 @@ CHANGELOG.md
 - [x] Local result schema is documented and does not claim lineage absent from upstream JSON.
 - [x] Commit contains only intended implementation/test/docs files.
 - [x] Live generation E2E remains a separate canary gate, not reported as verified.
+
+## Linux validation follow-up
+
+The first VPS run exposed three validation portability defects: adapter tests used
+Windows-only fake interpreter paths, the concurrent distinct-intent test incorrectly
+required one of two claims to fail instead of checking unique run numbers, and full-source
+Pyright rejected a redundant cast in the POSIX file-lock branch. The follow-up changes use
+`sys.executable`, assert unique run numbers while allowing serialized success, and pass the
+already-typed file descriptor directly to `fcntl.flock`.
+
+Validation after the follow-up changes, in the isolated Ubuntu 24.04 checkout:
+
+- Adapter, BDD, and Google Sheets transaction tests: 53 passed.
+- Repository-wide Ruff check and format check: passed.
+- Full-source Pyright through `uv run --locked --no-sync`: 0 errors.
+- Broad offline suite with coverage: 6,129 passed, 24 skipped, 174 deselected, 0 failed,
+  3 warnings; total coverage 86.64%.
+- Locked dev dependency sync completed; `uv.lock` remained unchanged.
+- No browser, Flow, provider, production runtime, or production venv action was performed.

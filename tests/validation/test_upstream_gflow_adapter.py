@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -160,9 +161,7 @@ class FakeRunner:
 
 
 def _adapter(request: AdapterRequest, fake: FakeRunner) -> UpstreamGflowVideoAdapter:
-    return UpstreamGflowVideoAdapter(
-        python_executable=Path("C:/upstream-venv/Scripts/python.exe"), runner=fake
-    )
+    return UpstreamGflowVideoAdapter(python_executable=Path(sys.executable), runner=fake)
 
 
 def test_unauthorized_request_does_not_spawn_version_or_generation_process(tmp_path: Path) -> None:
@@ -182,7 +181,7 @@ def test_command_contains_exact_policy_and_prompt_is_not_in_process_argv(tmp_pat
     generation_command, stdin, cwd, _timeout = fake.calls[1]
     payload = json.loads(stdin)
     args = payload["args"]
-    assert Path(generation_command[0]) == Path("C:/upstream-venv/Scripts/python.exe")
+    assert Path(generation_command[0]) == Path(sys.executable)
     assert generation_command[1:2] == ("-c",)
     assert request.approved_prompt not in generation_command
     assert args[:3] == ["video", "t2v", request.approved_prompt]
@@ -354,7 +353,7 @@ def test_process_launch_failure_is_proven_pre_submit(tmp_path: Path) -> None:
         raise ProcessLaunchError("not launched")
 
     result = UpstreamGflowVideoAdapter(
-        python_executable=Path("C:/upstream-venv/Scripts/python.exe"), runner=runner
+        python_executable=Path(sys.executable), runner=runner
     ).generate_once(request)
     assert result.status is AdapterStatus.PRE_SUBMIT_FAILURE
     assert result.submit_may_have_occurred is False

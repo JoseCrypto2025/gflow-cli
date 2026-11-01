@@ -1195,7 +1195,7 @@ class _LegacyAuditLock:
         else:
             import fcntl
 
-            fcntl.flock(cast(int, self.fd), fcntl.LOCK_EX)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
         return self
 
     def __exit__(self, *_args: object) -> None:
