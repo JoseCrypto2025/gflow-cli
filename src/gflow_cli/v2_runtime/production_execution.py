@@ -22,7 +22,15 @@ from typing import cast
 from .timestamps import format_utc_timestamp
 
 _BANGKOK = timezone(timedelta(hours=7), name="Asia/Bangkok")
-_TERMINAL = frozenset({"SUCCESS", "PROVIDER_REJECTED", "FAILED_CONFIRMED", "WAF_REJECTION"})
+_TERMINAL = frozenset(
+    {
+        "SUCCESS",
+        "PROVIDER_REJECTED",
+        "FAILED_CONFIRMED",
+        "WAF_REJECTION",
+        "UPSTREAM_PRE_SUBMIT_FAILED",
+    }
+)
 _PROD_PROVIDER_ACCOUNT_ID = "PVA_0002"
 _PROD_PROVIDER_PROJECT_ID = "aafe9282-071f-4333-baa4-92b9f76a9c27"
 _PROD_AUTH_PROFILE = "GFLOW_PROD_AUTH"
@@ -332,6 +340,310 @@ class ProductionCreditGuard:
                 row["production_job_id"] = context.production_job_id
                 row["scene_job_id"] = context.scene_job_id
             records.append(row)
+            return dict(row)
+
+        return self._mutate(update)
+
+    def prepare_upstream_canary(
+        self,
+        context: ProductionExecutionContext,
+        *,
+        request_idempotency_key: str,
+        quoted_credits: Decimal | int | float | str,
+        budget: CreditBudgetContext,
+        binding: dict[str, str | int],
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        """Atomically reserve an exact quote and persist a one-shot canary checkpoint."""
+        try:
+            quote = Decimal(str(quoted_credits))
+        except InvalidOperation as exc:
+            raise ProductionExecutionError("upstream canary quote is invalid") from exc
+        if (
+            context.environment != "PROD"
+            or context.max_reservation_credits is None
+            or quote != context.max_reservation_credits
+            or not quote.is_finite()
+            or quote <= 0
+            or budget.authorized_run_ceiling is None
+            or quote > budget.authorized_run_ceiling
+            or not budget.is_free_quota
+            or budget.paid_fallback
+            or budget.provider_remaining_free is None
+            or quote > budget.provider_remaining_free
+            or not request_idempotency_key.strip()
+            or context.request_idempotency_key != request_idempotency_key
+            or not context.production_job_id
+            or not context.scene_job_id
+        ):
+            raise ProductionExecutionError("upstream canary quote or identity is not authorized")
+        required = {
+            "canary_invocation_id",
+            "authorization_id",
+            "prompt_id",
+            "prompt_sha256",
+            "profile_name",
+            "auth_profile",
+            "account_email",
+            "project_id",
+            "model",
+            "aspect_ratio",
+            "duration_seconds",
+            "output_count",
+            "adapter_commit",
+            "upstream_version",
+            "upstream_commit",
+            "output_path",
+            "verification_temp_dir",
+            "quote_read_at",
+        }
+        if not required.issubset(binding) or any(not str(binding[key]).strip() for key in required):
+            raise ProductionExecutionError("upstream canary checkpoint binding is incomplete")
+        if binding["canary_invocation_id"] != context.attempt_id:
+            raise ProductionExecutionError("upstream canary invocation identity differs")
+        duration_seconds = binding["duration_seconds"]
+        output_count = binding["output_count"]
+        if (
+            binding["prompt_id"] != context.scene_prompt_id
+            or binding["project_id"] != context.provider_project_id
+            or binding["auth_profile"] != context.auth_profile
+            or type(duration_seconds) is not int
+            or duration_seconds <= 0
+            or type(output_count) is not int
+            or output_count != 1
+            or binding["aspect_ratio"] not in {"9:16", "16:9"}
+            or not re.fullmatch(r"[0-9a-f]{64}", str(binding["prompt_sha256"]))
+            or not re.fullmatch(r"[0-9a-f]{40}", str(binding["adapter_commit"]))
+            or not re.fullmatch(r"[0-9a-f]{40}", str(binding["upstream_commit"]))
+        ):
+            raise ProductionExecutionError("upstream canary checkpoint binding is invalid")
+        moment = now or datetime.now(UTC)
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ProductionExecutionError("credit guard timestamp must be timezone-aware")
+        day = moment.astimezone(_BANGKOK).date().isoformat()
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            records = cast(list[dict[str, object]], payload["attempts"])
+            existing = next(
+                (row for row in records if row.get("attempt_id") == context.attempt_id), None
+            )
+            expected_binding = {f"upstream_{key}": value for key, value in binding.items()}
+            if existing is not None:
+                identity_binding = {
+                    "environment": context.environment,
+                    "provider_id": context.provider_id,
+                    "provider_account_id": context.provider_account_id,
+                    "provider_project_id": context.provider_project_id,
+                    "production_job_id": context.production_job_id,
+                    "scene_job_id": context.scene_job_id,
+                }
+                if any(existing.get(key) != value for key, value in identity_binding.items()):
+                    raise ProductionExecutionError("upstream canary replay identity differs")
+                if any(existing.get(key) != value for key, value in expected_binding.items()):
+                    raise ProductionExecutionError("upstream canary replay binding differs")
+                if existing.get("request_idempotency_key") != request_idempotency_key:
+                    raise ProductionExecutionError("upstream canary replay key differs")
+                if (
+                    existing.get("quoted_credits") != str(quote)
+                    or existing.get("reserved_credits")
+                    != (
+                        "0" if existing.get("state") == "UPSTREAM_PRE_SUBMIT_FAILED" else str(quote)
+                    )
+                    or existing.get("reservation_quote_input_digest")
+                    != context.reservation_quote_input_digest
+                    or existing.get("reservation_quote_source_version")
+                    != context.reservation_quote_source_version
+                    or existing.get("authorized_run_ceiling") != str(budget.authorized_run_ceiling)
+                ):
+                    raise ProductionExecutionError("upstream canary replay quote differs")
+                return dict(existing)
+            prior_key = next(
+                (
+                    row
+                    for row in records
+                    if row.get("upstream_canary") is True
+                    and row.get("request_idempotency_key") == request_idempotency_key
+                ),
+                None,
+            )
+            if prior_key is not None:
+                raise ProductionExecutionError("request key is bound to another canary invocation")
+            if any(
+                (row.get("provider_id"), row.get("date")) == (context.provider_id, day)
+                and row.get("state") not in _TERMINAL
+                for row in records
+            ):
+                raise ProductionExecutionError("an unresolved provider attempt already exists")
+            reserved = sum(
+                (
+                    Decimal(str(row.get("reserved_credits", "0")))
+                    for row in records
+                    if (row.get("provider_id"), row.get("date")) == (context.provider_id, day)
+                ),
+                Decimal(0),
+            )
+            if reserved + quote > budget.daily_user_ceiling:
+                raise ProductionExecutionError("upstream canary exceeds the shared daily ceiling")
+            row: dict[str, object] = {
+                "attempt_id": context.attempt_id,
+                "environment": "PROD",
+                "provider_id": context.provider_id,
+                "provider_account_id": context.provider_account_id,
+                "provider_project_id": context.provider_project_id,
+                "production_job_id": context.production_job_id,
+                "scene_job_id": context.scene_job_id,
+                "date": day,
+                "state": "UPSTREAM_READY",
+                "upstream_canary": True,
+                "request_idempotency_key": request_idempotency_key,
+                "upstream_invocation_count": 0,
+                "generate_click_count": 0,
+                "quoted_credits": str(quote),
+                "reserved_credits": str(quote),
+                "max_reservation_credits": str(context.max_reservation_credits),
+                "reservation_quote_input_digest": context.reservation_quote_input_digest,
+                "reservation_quote_source_version": context.reservation_quote_source_version,
+                "authorized_run_ceiling": str(budget.authorized_run_ceiling),
+                "checkpoint_state": "READY_FOR_UPSTREAM_INVOCATION",
+                "created_at": format_utc_timestamp(moment),
+                **expected_binding,
+            }
+            records.append(row)
+            return dict(row)
+
+        return self._mutate(update)
+
+    def start_upstream_invocation(self, attempt_id: str) -> dict[str, object]:
+        """Persist invocation-start before launch; a replay can never start twice."""
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            row = self._find(payload, attempt_id)
+            if row.get("upstream_canary") is not True:
+                raise ProductionExecutionError("attempt is not an upstream canary")
+            if row.get("state") != "UPSTREAM_READY" or row.get("upstream_invocation_count") != 0:
+                raise ProductionExecutionError("upstream canary invocation is already consumed")
+            row["state"] = "UPSTREAM_INVOCATION_STARTED"
+            row["checkpoint_state"] = "UPSTREAM_INVOCATION_STARTED"
+            row["upstream_invocation_count"] = 1
+            row["invocation_started_at"] = format_utc_timestamp(datetime.now(UTC))
+            return dict(row)
+
+        return self._mutate(update)
+
+    def upstream_canary_row(self, attempt_id: str) -> dict[str, object]:
+        """Read one durable canary row under the shared ledger lock."""
+        with self._file_lock():
+            row = self._find(self._read(), attempt_id)
+            if row.get("upstream_canary") is not True:
+                raise ProductionExecutionError("attempt is not an upstream canary")
+            return dict(row)
+
+    def record_upstream_result(
+        self,
+        attempt_id: str,
+        *,
+        status: str,
+        result_fields: dict[str, str | int | bool | None],
+    ) -> dict[str, object]:
+        """Persist an allowlisted normalized result without raw subprocess output."""
+        allowed = {
+            "UPSTREAM_GENERATION_COMPLETED",
+            "PRE_SUBMIT_FAILURE",
+            "AUTH_FAILURE",
+            "PROJECT_NAVIGATION_FAILURE",
+            "UNSUPPORTED_FLOW_STATE",
+            "INSUFFICIENT_CREDITS",
+            "POST_SUBMIT_UNKNOWN",
+            "DOWNLOAD_FAILURE_AFTER_GENERATION",
+        }
+        if status not in allowed:
+            status = "POST_SUBMIT_UNKNOWN"
+        allowed_fields = {
+            "upstream_operation_id",
+            "media_id",
+            "stdout_digest",
+            "stderr_digest",
+            "normalized_error_code",
+            "upstream_error_type",
+            "submit_may_have_occurred",
+            "exit_code",
+        }
+        safe_fields = {key: value for key, value in result_fields.items() if key in allowed_fields}
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            row = self._find(payload, attempt_id)
+            if row.get("upstream_canary") is not True:
+                raise ProductionExecutionError("attempt is not an upstream canary")
+            if row.get("normalized_status") is not None:
+                if (
+                    row.get("normalized_status") == status
+                    and row.get("normalized_result") == safe_fields
+                ):
+                    return dict(row)
+                raise ProductionExecutionError("upstream result replay differs")
+            if row.get("state") != "UPSTREAM_INVOCATION_STARTED":
+                raise ProductionExecutionError("upstream invocation has not been durably started")
+            row["normalized_status"] = status
+            row["normalized_result"] = safe_fields
+            proven_pre_submit = status in {
+                "PRE_SUBMIT_FAILURE",
+                "AUTH_FAILURE",
+                "UNSUPPORTED_FLOW_STATE",
+                "INSUFFICIENT_CREDITS",
+            }
+            if proven_pre_submit and safe_fields.get("submit_may_have_occurred") is False:
+                row["state"] = "UPSTREAM_PRE_SUBMIT_FAILED"
+                row["checkpoint_state"] = "PRE_SUBMIT_FAILURE"
+                row["reserved_credits"] = "0"
+            elif status == "UPSTREAM_GENERATION_COMPLETED":
+                row["state"] = "UPSTREAM_ARTIFACT_PENDING"
+                row["checkpoint_state"] = "UPSTREAM_ARTIFACT_PENDING"
+            elif status == "DOWNLOAD_FAILURE_AFTER_GENERATION":
+                row["state"] = "UPSTREAM_DOWNLOAD_RECOVERY_REQUIRED"
+                row["checkpoint_state"] = "UPSTREAM_DOWNLOAD_RECOVERY_REQUIRED"
+            else:
+                row["state"] = "UPSTREAM_UNKNOWN_HOLD"
+                row["checkpoint_state"] = "UPSTREAM_UNKNOWN_HOLD"
+            return dict(row)
+
+        return self._mutate(update)
+
+    def record_upstream_artifact(
+        self,
+        attempt_id: str,
+        *,
+        remote_file_id: str,
+        local_sha256: str,
+        remote_sha256: str,
+    ) -> dict[str, object]:
+        """Record Drive verification while leaving ordinary provider lineage unresolved."""
+        if (
+            not remote_file_id.strip()
+            or not re.fullmatch(r"[0-9a-f]{64}", local_sha256)
+            or remote_sha256 != local_sha256
+        ):
+            raise ProductionExecutionError("upstream artifact verification is incomplete")
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            row = self._find(payload, attempt_id)
+            if row.get("state") == "UPSTREAM_ARTIFACT_PERSISTED":
+                if (
+                    row.get("remote_file_id") != remote_file_id
+                    or row.get("local_sha256") != local_sha256
+                    or row.get("remote_sha256") != remote_sha256
+                ):
+                    raise ProductionExecutionError("persisted canary artifact replay differs")
+                return dict(row)
+            if row.get("state") not in {
+                "UPSTREAM_ARTIFACT_PENDING",
+                "UPSTREAM_DOWNLOAD_RECOVERY_REQUIRED",
+            }:
+                raise ProductionExecutionError("upstream artifact is not ready for persistence")
+            row["state"] = "UPSTREAM_ARTIFACT_PERSISTED"
+            row["checkpoint_state"] = "UPSTREAM_ARTIFACT_PERSISTED"
+            row["remote_file_id"] = remote_file_id
+            row["local_sha256"] = local_sha256
+            row["remote_sha256"] = remote_sha256
             return dict(row)
 
         return self._mutate(update)

@@ -149,6 +149,10 @@ class ProductionOrchestrator:
         speech: SpeechFinalizationPort | None = None,
     ) -> ProductionOrchestrationResult:
         """Execute or resume one scene without repeating ambiguous provider work."""
+        if request.request_idempotency_key.startswith("upstream-canary-v1:"):
+            raise ProductionOrchestrationError(
+                "upstream canary jobs are isolated from the Phase G production executor"
+            )
         prompt_id = approved_prompt.get("Scene_Prompt_ID")
         scene_id = scene.get("Scene_ID")
         if (

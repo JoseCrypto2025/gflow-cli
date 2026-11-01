@@ -103,7 +103,8 @@ not upstream JSON or this adapter directly.
 | `DOWNLOAD_FAILURE_AFTER_GENERATION` | Upstream media download error after media generation | Recover/download the same existing asset; never Generate again |
 
 `auto_retry` is always `false`. The adapter's in-memory key check is only defense in depth. Durable
-one-invocation-per-job enforcement remains the caller's Production Job/Scene Job responsibility.
+one-invocation-per-canary enforcement belongs to the caller's shared credit ledger, bound to its
+Production Job, Scene Job, request key, and invocation ID.
 Because upstream CLI does not expose a durable stage marker, V1 treats generic post-launch failures as
 unknown even if upstream labels an error retryable.
 
@@ -169,3 +170,38 @@ ID, media validity, local/remote artifact integrity, and Drive finalization. Onl
 parity result can authorize routing any production job through the adapter. Rollback means switching
 the **future caller** back to the already-supported local Phase G implementation; it cannot undo a
 Flow generation or credit charge already accepted by the provider.
+
+## Durable canary caller V1 (implemented, offline only)
+
+`v2_runtime.upstream_canary.UpstreamCanaryProductionCaller` is an injectable bridge for a later,
+separately authorized canary. It is not connected to a CLI/MCP entrypoint, `ProductionOrchestrator`,
+n8n, or the default PROD route. The ordinary Phase G orchestrator explicitly rejects its
+`upstream-canary-v1:` idempotency-key namespace, so a canary job cannot be resumed by the normal
+Generate path.
+
+Before preparing the durable checkpoint, the caller requires a fresh reader result with an approved
+prompt, exact prompt hash, locked Scene, `GPR_0002`, the verified `singleava508@gmail.com` account,
+the exact PROD project UUID, a released parent profile lease, and a quote read within five minutes.
+The reader is the integration port to canonical Master Data/account/quote sources; the caller
+rechecks these values and will stop if any binding or authorization differs. The quote must be
+positive, equal to the validated per-run cap, within the CEO ceiling, current free provider quota,
+and the shared 50-credit daily ceiling. The ledger reserves exactly the quote.
+
+The shared locked credit ledger stores the invocation ID, Production/Scene Job IDs, request key,
+prompt/profile/account/project/config bindings, source pins, output path, quote, reservation and
+`READY_FOR_UPSTREAM_INVOCATION` checkpoint before child launch. It atomically changes to
+`UPSTREAM_INVOCATION_STARTED` before calling the synchronous adapter. A process restart with that
+checkpoint or any later state never calls the adapter again. A proven pre-submit refusal releases
+the quote and becomes terminal. An uncertain result retains the reservation in HOLD. A generated
+but undownloaded result can use the dedicated `download_existing(media_id, destination)` port; it
+has no generation method.
+
+On adapter success, the caller runs the existing full MP4 validator and `persist_and_verify` path,
+including a remote re-download and SHA-256 comparison. It records a canary artifact result while
+leaving the ordinary Production Job and Scene Job incomplete. The upstream result still lacks
+provider execution/account/project readback and submit-stage evidence, so no `GeneratedSceneAsset`,
+provider execution ID, or normal job completion is synthesized.
+
+The caller implementation and its tests were exercised offline with fakes only. Before any future
+live canary, verify that the installed adapter and upstream artifact match their pinned source
+commits, use the approved one-shot authorization, and follow the separate live-verification gate.

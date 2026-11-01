@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Offline upstream-first canary caller V1.** Adds a narrow caller that fresh-reads approved PROD
+  evidence, claims idempotent Production/Scene Jobs, atomically reserves the exact quote and persists
+  a pre-invocation checkpoint in the shared credit ledger, then invokes the pinned adapter once.
+  Unknown outcomes remain held; validated artifacts reuse Phase G media verification and Drive
+  persistence without fabricating provider lineage or completing ordinary jobs. This is not wired to
+  a public CLI/MCP surface or the default production path.
+
 - **Offline upstream-first video adapter V1.** Adds a disconnected, fake-runner-tested adapter pinned to
   upstream `gflow-cli` v0.92.1 / source commit `63dd0081e117dc081ed7fc774d3dd19ac91ec9aa`. It builds
   one `video t2v` invocation and normalizes a strict result without changing production routing; the
