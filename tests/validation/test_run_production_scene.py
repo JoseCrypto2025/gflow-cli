@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sys
 from collections.abc import Coroutine
 from decimal import Decimal
 from pathlib import Path
@@ -452,3 +454,52 @@ def test_current_production_credits_fail_closed_when_balance_is_missing(monkeypa
 
     with pytest.raises(operator.ProductionSceneOperatorError, match="balance is unavailable"):
         operator._read_current_production_credits("singleava508@gmail.com")
+
+
+def test_operator_failure_output_preserves_redacted_stage_and_cause(monkeypatch, capsys) -> None:
+    def fail_run_once(**kwargs: object) -> dict[str, object]:
+        stage_journal = kwargs["stage_journal"]
+        stage_journal.start("BOUND_CONTEXT")  # type: ignore[attr-defined]
+        stage_journal.complete()  # type: ignore[attr-defined]
+        stage_journal.start("F5_PRESUBMIT")  # type: ignore[attr-defined]
+        try:
+            raise ValueError("access_token=inner-secret")
+        except ValueError as cause:
+            raise operator.ProductionSceneOperatorError(
+                "presubmit failed bearer outer-secret"
+            ) from cause
+
+    monkeypatch.setattr(operator, "run_once", fail_run_once)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_production_scene.py",
+            "--scene-id",
+            "SCN_000001",
+            "--profile-id",
+            "GPR_0002",
+            "--provider-account-id",
+            "PVA_0002",
+            "--provider-project-id",
+            "aafe9282-071f-4333-baa4-92b9f76a9c27",
+            "--expected-email",
+            "singleava508@gmail.com",
+            "--production-run-intent",
+            "d2-certification-run-4",
+            "--execute",
+        ],
+    )
+
+    assert operator.main() == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "HOLD"
+    assert result["failure_class"] == "ProductionSceneOperatorError"
+    assert result["failed_stage"] == "F5_PRESUBMIT"
+    assert result["last_completed_stage"] == "BOUND_CONTEXT"
+    assert result["failure_timestamp_utc"].endswith("Z")
+    assert result["inner_exception_type"] == "ValueError"
+    assert "inner-secret" not in result["inner_exception_message"]
+    assert "outer-secret" not in result["failure_message"]
+    assert result["causal_exception_classification"] == "ValueError"
+    assert len(result["traceback_digest"]) == 64

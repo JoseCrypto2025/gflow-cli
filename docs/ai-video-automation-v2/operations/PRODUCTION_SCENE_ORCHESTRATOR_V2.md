@@ -120,3 +120,10 @@ available; do not use this operator for speech-enabled scenes.
 The deployed archive allowlists this operator explicitly. It does not invoke
 n8n or the separate audio-enhancement endpoint; V2 merge runs locally through
 the validated FFmpeg pipeline.
+
+When the operator returns `HOLD`, its JSON diagnostic includes the failing and
+last completed operator stages, exception class, redacted exception and cause
+messages, a traceback SHA-256 digest, and a UTC timestamp. The raw traceback is
+not emitted, and credential-like assignments are redacted before messages are
+returned. This diagnostic does not change the job, attempt, or credit-reservation
+lifecycle.

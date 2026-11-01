@@ -8,13 +8,16 @@ import hashlib
 import json
 import os
 import re
+import traceback
 from collections.abc import Coroutine, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from gflow_cli.redaction import redact_sensitive_text
 from gflow_cli.services.credits import inspect_profile
 from gflow_cli.v2_runtime.config import load_runtime_settings
 from gflow_cli.v2_runtime.google_drive_storage import GoogleDriveStorageAdapter
@@ -69,10 +72,50 @@ _RUN_INTENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _PERSISTED_RUN_KEY_RE = re.compile(
     r"^PROD_SCENE_RUN_V2_[0-9a-f]{64}_[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 )
+_OPERATOR_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|"
+    r"secret|password|passcode|api[_-]?key|authorization|cookie|credential|private[_-]?key)"
+    r"\b[\"']?\s*[:=]\s*[\"']?[^\"'\s,;]+"
+)
 
 
 class ProductionSceneOperatorError(ValueError):
     """Safe, fail-closed production operator precondition failure."""
+
+
+@dataclass
+class OperatorStageJournal:
+    """In-memory stage context used only to report safe operator failures."""
+
+    current_stage: str = "INITIALIZATION"
+    last_completed_stage: str = "NONE"
+
+    def start(self, stage: str) -> None:
+        self.current_stage = stage
+
+    def complete(self) -> None:
+        self.last_completed_stage = self.current_stage
+
+
+def _failure_diagnostics(exc: Exception, stage_journal: OperatorStageJournal) -> dict[str, str]:
+    cause = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    formatted_traceback = "".join(traceback.format_exception(exc))
+
+    def safe_message(error: BaseException) -> str:
+        detail = redact_sensitive_text(str(error))
+        return _OPERATOR_SECRET_ASSIGNMENT_RE.sub("<redacted:secret>", detail)[:500]
+
+    return {
+        "failure_class": type(exc).__name__,
+        "failure_message": safe_message(exc),
+        "failure_timestamp_utc": format_utc_timestamp(datetime.now(UTC), timespec="milliseconds"),
+        "failed_stage": stage_journal.current_stage,
+        "last_completed_stage": stage_journal.last_completed_stage,
+        "traceback_digest": hashlib.sha256(formatted_traceback.encode("utf-8")).hexdigest(),
+        "inner_exception_type": type(cause).__name__ if cause is not None else "NONE",
+        "inner_exception_message": safe_message(cause) if cause is not None else "",
+        "causal_exception_classification": type(cause).__name__ if cause is not None else "NONE",
+    }
 
 
 def _unique_row(rows: list[Row], key: str, value: str, label: str) -> Row:
@@ -459,7 +502,10 @@ def run_once(
     expected_email: str,
     execute: bool,
     production_run_intent: str | None = None,
+    stage_journal: OperatorStageJournal | None = None,
 ) -> dict[str, object]:
+    stage_journal = stage_journal or OperatorStageJournal()
+    stage_journal.start("INPUT_VALIDATION")
     _require_production_profile_home()
     if execute and (
         production_run_intent is None
@@ -481,6 +527,8 @@ def run_once(
     ):
         raise ProductionSceneOperatorError("explicit production identity is required")
 
+    stage_journal.complete()
+    stage_journal.start("RUNTIME_CONFIGURATION")
     settings = load_runtime_settings()
     if settings.environment != "production" or settings.storage_provider != "google-drive":
         raise ProductionSceneOperatorError("production Google Drive runtime settings are required")
@@ -494,9 +542,11 @@ def run_once(
     )
     reader = GoogleSheetsApiTransport(token_provider)
     writer_transport = GoogleSheetsTransactionApiTransport(token_provider)
+    stage_journal.complete()
     try:
         schema_dir = repository_root / "schemas"
         snapshot_source = GoogleSheetsSnapshotSource(reader, schema_dir)
+        stage_journal.start("CANONICAL_SNAPSHOT_AND_PREFLIGHT")
         snapshot = snapshot_source.read()
         if snapshot.spreadsheet_id != APPROVED_SPREADSHEET_ID:
             raise ProductionSceneOperatorError("live snapshot spreadsheet identity differs")
@@ -569,7 +619,11 @@ def run_once(
             ),
             (prompt_id,),
         )
+        stage_journal.complete()
+        stage_journal.start("PROVIDER_PROFILE_READ")
         starting_credits = _read_current_production_credits(expected_email)
+        stage_journal.complete()
+        stage_journal.start("PRECLAIM_VALIDATION")
         _validate_preclaim(
             tables=tables,
             preflight=preflight,
@@ -625,9 +679,13 @@ def run_once(
             }
 
         digest_before_f5 = _snapshot_digest(tables)
+        stage_journal.complete()
+        stage_journal.start("RUN_INTENT_CLAIM")
         claim = ProductionJobCoordinator(jobs).submit_request(request, datetime.now(UTC))
         if len(claim.scene_jobs) != 1:
             raise ProductionSceneOperatorError("exactly one Scene Job must be claimed")
+        stage_journal.complete()
+        stage_journal.start("WORKSPACE_AND_BOUND_CONTEXT")
         scene_job = claim.scene_jobs[0]
         workspace = _workspace_for_job(
             settings.temp_root, scene_job.scene_job_id, scene_job.job_status
@@ -661,6 +719,8 @@ def run_once(
         )
         if phase_g_for_f5.output_count != 1:
             raise ProductionSceneOperatorError("production output count must be exactly one")
+        stage_journal.complete()
+        stage_journal.start("F5_PRESUBMIT")
         asyncio.run(
             _run_f5_after_bound_claim(
                 request,
@@ -669,6 +729,8 @@ def run_once(
                 expected_email=expected_email,
             )
         )
+        stage_journal.complete()
+        stage_journal.start("POST_F5_CANONICAL_REVALIDATION")
         refreshed = snapshot_source.read()
         refreshed_tables = {name: list(rows) for name, rows in refreshed.tables.items()}
         if _snapshot_digest(refreshed_tables) != digest_before_f5:
@@ -705,6 +767,8 @@ def run_once(
         ):
             raise ProductionSceneOperatorError("post-F5 Phase E or prompt binding changed")
         current_credits = _read_current_production_credits(expected_email)
+        stage_journal.complete()
+        stage_journal.start("PHASE_G_REQUEST_BINDING")
         phase_g_request = _build_bound_request(
             tables,
             scene_id=scene_id,
@@ -736,6 +800,7 @@ def run_once(
                 raise ProductionSceneOperatorError("D2 identity differs from claimed Scene Job")
             return phase_g_request
 
+        stage_journal.complete()
         drive = GoogleDriveStorageAdapter(
             token_provider,
             approved_folder_id=APPROVED_JOB_ARTIFACTS_FOLDER_ID,
@@ -746,6 +811,7 @@ def run_once(
             drive,
             temp_root=settings.temp_root,
         )
+        stage_journal.start("CANONICAL_EXECUTION")
         result = orchestrator.run_scene_once(
             request,
             scene=scene,
@@ -795,6 +861,7 @@ def main() -> int:
     )
     parser.add_argument("--execute", action="store_true", help="run F5 and the one-shot lifecycle")
     args = parser.parse_args()
+    stage_journal = OperatorStageJournal()
     try:
         result = run_once(
             scene_id=args.scene_id,
@@ -804,12 +871,15 @@ def main() -> int:
             expected_email=args.expected_email,
             execute=args.execute,
             production_run_intent=args.production_run_intent,
+            stage_journal=stage_journal,
         )
     except Exception as exc:
-        code = type(exc).__name__
+        diagnostics = _failure_diagnostics(exc, stage_journal)
+        code = diagnostics["failure_class"]
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", code):
             code = "ProductionSceneOperatorError"
-        print(json.dumps({"status": "HOLD", "failure_class": code}, sort_keys=True))
+        diagnostics["failure_class"] = code
+        print(json.dumps({"status": "HOLD", **diagnostics}, sort_keys=True))
         return 2
     print(json.dumps(result, sort_keys=True))
     return 0
