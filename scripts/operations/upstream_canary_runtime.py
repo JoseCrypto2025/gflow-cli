@@ -343,6 +343,8 @@ def verify_zero_generate_preflight(
     evidence = runtime.reader.read_fresh(request)
     runtime.transaction_rows.read_rows("PRODUCTION_JOBS")
     runtime.transaction_rows.read_rows("SCENE_JOBS")
+    upstream_env = os.environ.copy()
+    upstream_env.pop("PYTHONPATH", None)
     result = subprocess.run(
         [str(UPSTREAM_PYTHON_EXECUTABLE), "-m", "gflow_cli", "--version"],
         cwd=runtime.settings.temp_root,
@@ -350,6 +352,7 @@ def verify_zero_generate_preflight(
         capture_output=True,
         text=True,
         timeout=15,
+        env=upstream_env,
     )
     if result.returncode != 0 or not result.stdout.strip().endswith("version 0.92.1"):
         raise ProductionSceneOperatorError("isolated upstream version preflight failed")

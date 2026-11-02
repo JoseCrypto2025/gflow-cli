@@ -39,7 +39,8 @@ The pinned `gflow video t2v` surface includes:
 | Timeout | No CLI timeout flag. The transport has an internal 600-second poll timeout; V1 applies a 900-second outer process deadline by default |
 | Transport selection | No stable explicit transport selector for migrated Flow. Routing follows the host/composer observed by upstream; `--ui-mode` is not used by V1 |
 
-The CLI version command is checked first. Generation then runs the upstream Click entry point through
+The CLI version command is checked first with inherited `PYTHONPATH` removed, so the automation
+package cannot shadow the pinned upstream module. Generation then runs the upstream Click entry point through
 the pinned interpreter with the same Click argument vector as `gflow video t2v`, supplied to a fixed
 bootstrap over stdin. The prompt is therefore not part of the OS process command line. The child
 receives only platform essentials and the explicit `GFLOW_CLI_HOME`; there is no shell string or

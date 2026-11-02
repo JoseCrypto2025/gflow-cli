@@ -6,6 +6,7 @@ import subprocess
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -371,3 +372,34 @@ def test_upstream_pin_uses_scoped_git_safe_directory(
     git_commands = [command for command in commands if command[0] == "git"]
     assert len(git_commands) == 3
     assert all(command[1:3] == ["-c", f"safe.directory={source_root}"] for command in git_commands)
+
+
+def test_read_only_preflight_version_probe_does_not_inherit_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", "/opt/gflow-v2/src:/opt/gflow-v2-src")
+    monkeypatch.setattr(runtime, "_verify_upstream_runtime_pin", lambda: None)
+    reader = _reader(monkeypatch, tmp_path)
+    transaction_rows = SimpleNamespace(read_rows=lambda _tab: ())
+    runtime_context = cast(
+        runtime.ProductionCanaryRuntime,
+        SimpleNamespace(
+            settings=SimpleNamespace(temp_root=tmp_path),
+            reader=reader,
+            transaction_rows=transaction_rows,
+        ),
+    )
+    observed: dict[str, object] = {}
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(
+            command, 0, stdout="gflow-cli, version 0.92.1", stderr=""
+        )
+
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+
+    evidence = runtime.verify_zero_generate_preflight(runtime_context, _request(tmp_path))
+
+    assert evidence.prompt_id == "SPV_000007"
+    assert "PYTHONPATH" not in cast(dict[str, str], observed["env"])
