@@ -23,6 +23,7 @@ from gflow_cli.v2_runtime.google_sheets_transactions import (
     GoogleSheetsTransactionApiTransport,
     OptimisticGoogleSheetsJobStore,
 )
+from gflow_cli.v2_runtime.phase_e import sha256_json
 from gflow_cli.v2_runtime.phase_g_artifacts import validate_video
 from gflow_cli.v2_runtime.production_execution import ProductionCreditGuard
 from gflow_cli.v2_runtime.upstream_canary import CanaryRequest
@@ -65,11 +66,10 @@ def _reader(
     tmp_path: Path,
     prompt_text: str = "A quiet cinematic scene.",
 ) -> runtime.ProductionCanaryFreshReader:
-    import hashlib
-
     from gflow_cli.v2_runtime.legacy_replacement import ReplacementQuote, ReplacementQuoteStatus
 
-    prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    negative_prompt_text = ""
+    prompt_sha = sha256_json({"prompt": prompt_text, "negative_prompt": negative_prompt_text})
     snapshot = GoogleSheetsSnapshot(
         spreadsheet_id="approved",
         read_at=datetime.now(UTC).isoformat(),
@@ -97,6 +97,7 @@ def _reader(
                     "Generation_Profile_ID": "GPR_0002",
                     "Prompt_Status": "APPROVED",
                     "Compiled_Prompt_Text": prompt_text,
+                    "Compiled_Negative_Prompt": negative_prompt_text,
                     "Prompt_SHA256": prompt_sha,
                 }
             ],
@@ -118,6 +119,9 @@ def _reader(
                     "output_count": 1,
                     "aspect_ratio": "9:16",
                 },
+                "compiled_prompt": prompt_text,
+                "compiled_negative_prompt": negative_prompt_text,
+                "prompt_sha256": prompt_sha,
             },
         )(),
     )
@@ -169,14 +173,28 @@ def test_production_reader_returns_fresh_bound_evidence(
 def test_production_reader_rejects_prompt_text_sha_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import hashlib
-
     reader = _reader(monkeypatch, tmp_path, prompt_text="A changed prompt.")
     snapshot = reader._snapshot_source.snapshot  # type: ignore[attr-defined]
-    snapshot.tables["SCENE_PROMPT_VERSION"][0]["Prompt_SHA256"] = hashlib.sha256(
-        b"different prompt"
-    ).hexdigest()
-    with pytest.raises(runtime.ProductionSceneOperatorError, match="prompt text and SHA"):
+    snapshot.tables["SCENE_PROMPT_VERSION"][0]["Prompt_SHA256"] = "d" * 64
+    with pytest.raises(runtime.ProductionSceneOperatorError, match="canonical prompt payload"):
+        reader.read_fresh(_request(tmp_path))
+
+
+def test_production_reader_rejects_negative_prompt_different_from_phase_e(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader = _reader(monkeypatch, tmp_path)
+    snapshot = reader._snapshot_source.snapshot  # type: ignore[attr-defined]
+    row = snapshot.tables["SCENE_PROMPT_VERSION"][0]
+    row["Compiled_Negative_Prompt"] = "Avoid subtitles."
+    row["Prompt_SHA256"] = sha256_json(
+        {
+            "prompt": str(row["Compiled_Prompt_Text"]),
+            "negative_prompt": "Avoid subtitles.",
+        }
+    )
+
+    with pytest.raises(runtime.ProductionSceneOperatorError, match="canonical prompt payload"):
         reader.read_fresh(_request(tmp_path))
 
 

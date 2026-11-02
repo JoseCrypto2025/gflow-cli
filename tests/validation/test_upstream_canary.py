@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from gflow_cli.v2_runtime.assets import AssetReference
+from gflow_cli.v2_runtime.phase_e import sha256_json
 from gflow_cli.v2_runtime.phase_g_artifacts import (
     PersistedArtifact,
     ValidatedVideo,
@@ -108,7 +109,7 @@ def _evidence(tmp_path: Path) -> FreshCanaryEvidence:
     return FreshCanaryEvidence(
         prompt_status="APPROVED",
         prompt_text="A quiet cinematic scene.",
-        prompt_sha256=hashlib.sha256(b"A quiet cinematic scene.").hexdigest(),
+        prompt_sha256=sha256_json({"prompt": "A quiet cinematic scene.", "negative_prompt": ""}),
         scene_id="SCN_000001",
         prompt_id="SPV_000007",
         generation_profile_id="GPR_0002",

@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol, cast
 
+from .phase_e import sha256_json
 from .phase_g_artifacts import (
     PersistedArtifact,
     PhaseGStoragePort,
@@ -107,6 +108,7 @@ class FreshCanaryEvidence:
     adapter_commit: str
     upstream_version: str = UPSTREAM_VERSION
     upstream_commit: str = UPSTREAM_COMMIT
+    negative_prompt_text: str = ""
 
 
 class FreshCanaryReader(Protocol):
@@ -517,7 +519,12 @@ class UpstreamCanaryProductionCaller:
             evidence.prompt_status != "APPROVED"
             or not evidence.prompt_text.strip()
             or not _SHA256_RE.fullmatch(evidence.prompt_sha256)
-            or hashlib.sha256(evidence.prompt_text.encode("utf-8")).hexdigest()
+            or sha256_json(
+                {
+                    "prompt": evidence.prompt_text,
+                    "negative_prompt": evidence.negative_prompt_text,
+                }
+            )
             != evidence.prompt_sha256
             or evidence.scene_id != request.scene_id
             or evidence.prompt_id != request.prompt_id

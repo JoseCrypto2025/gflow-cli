@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero-Generate preflight. The legacy `gflow-cli 0.79.1` installation and default Phase G route are
   unchanged.
 
+- **Use the canonical Phase E prompt digest for canary evidence.** The production reader verifies
+  both compiled prompt fields and their canonical JSON digest against fresh Phase E. It no longer
+  compares `Prompt_SHA256` with a raw UTF-8 hash of only the positive prompt text.
+
 - **Offline upstream-first video adapter V1.** Adds a disconnected, fake-runner-tested adapter pinned to
   upstream `gflow-cli` v0.92.1 / source commit `63dd0081e117dc081ed7fc774d3dd19ac91ec9aa`. It builds
   one `video t2v` invocation and normalizes a strict result without changing production routing; the

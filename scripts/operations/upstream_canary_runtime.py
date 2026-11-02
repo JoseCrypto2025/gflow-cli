@@ -28,7 +28,7 @@ from gflow_cli.v2_runtime.google_sheets_transactions import (
     GoogleSheetsTransactionApiTransport,
     OptimisticGoogleSheetsJobStore,
 )
-from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, Row, preflight_scene
+from gflow_cli.v2_runtime.phase_e import InMemorySceneCatalog, Row, preflight_scene, sha256_json
 from gflow_cli.v2_runtime.production_execution import CreditBudgetContext, ProductionCreditGuard
 from gflow_cli.v2_runtime.production_jobs import ProductionRequest
 from gflow_cli.v2_runtime.upstream_canary import (
@@ -129,13 +129,22 @@ class ProductionCanaryFreshReader(FreshCanaryReader):
         if request.prompt_id != _REQUIRED_PROMPT_ID:
             raise ProductionSceneOperatorError("canary prompt ID differs from the approved target")
         prompt_text = str(prompt.get("Compiled_Prompt_Text", ""))
+        negative_prompt_text = str(prompt.get("Compiled_Negative_Prompt", ""))
         prompt_sha256 = str(prompt.get("Prompt_SHA256", ""))
+        recomputed_prompt_sha256 = sha256_json(
+            {"prompt": prompt_text, "negative_prompt": negative_prompt_text}
+        )
         if (
             not prompt_text.strip()
             or not re.fullmatch(r"[0-9a-f]{64}", prompt_sha256)
-            or hashlib.sha256(prompt_text.encode("utf-8")).hexdigest() != prompt_sha256
+            or prompt_text != (preflight.compiled_prompt or "")
+            or negative_prompt_text != (preflight.compiled_negative_prompt or "")
+            or recomputed_prompt_sha256 != prompt_sha256
+            or preflight.prompt_sha256 != prompt_sha256
         ):
-            raise ProductionSceneOperatorError("canonical prompt text and SHA-256 do not match")
+            raise ProductionSceneOperatorError(
+                "canonical prompt payload or SHA-256 differs from fresh Phase E"
+            )
 
         _validate_prod_account(tables, _PROD_ACCOUNT_ID, request.project_id)
         quote = _validated_quote(
@@ -184,6 +193,7 @@ class ProductionCanaryFreshReader(FreshCanaryReader):
             prompt_status="APPROVED",
             prompt_text=prompt_text,
             prompt_sha256=prompt_sha256,
+            negative_prompt_text=negative_prompt_text,
             scene_id=request.scene_id,
             prompt_id=request.prompt_id,
             generation_profile_id=request.generation_profile_id,

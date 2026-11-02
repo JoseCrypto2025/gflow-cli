@@ -212,7 +212,9 @@ commits, use the approved one-shot authorization, and follow the separate live-v
 Google Sheets snapshot and transaction adapters, `GoogleSheetsProductionJobStore`,
 `ProductionCreditGuard`, Google Drive storage, and Phase G media validator. Its fresh reader reuses
 the canonical production operator's Phase E, quote, account/project checks, and profile credit read;
-it also verifies the stored compiled prompt text against its canonical SHA-256. The factory passes
+it compares both stored compiled prompt fields and `Prompt_SHA256` with fresh Phase E. The digest
+uses Phase E's canonical JSON contract over the positive and negative prompt texts, encoded as UTF-8;
+the reader does not hash only the positive text as raw UTF-8. The factory passes
 the absolute interpreter `/opt/gflow-upstream/0.92.1/venv/bin/python` to the adapter, which runs
 `python -m gflow_cli`; it does not use PATH or the legacy global CLI. This keeps the adapter's
 fixed stdin bootstrap and avoids placing prompt text in process arguments.
