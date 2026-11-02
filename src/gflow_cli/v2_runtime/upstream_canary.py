@@ -517,6 +517,8 @@ class UpstreamCanaryProductionCaller:
             evidence.prompt_status != "APPROVED"
             or not evidence.prompt_text.strip()
             or not _SHA256_RE.fullmatch(evidence.prompt_sha256)
+            or hashlib.sha256(evidence.prompt_text.encode("utf-8")).hexdigest()
+            != evidence.prompt_sha256
             or evidence.scene_id != request.scene_id
             or evidence.prompt_id != request.prompt_id
             or evidence.generation_profile_id != request.generation_profile_id

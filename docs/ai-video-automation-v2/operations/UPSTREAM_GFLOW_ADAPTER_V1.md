@@ -205,3 +205,22 @@ provider execution ID, or normal job completion is synthesized.
 The caller implementation and its tests were exercised offline with fakes only. Before any future
 live canary, verify that the installed adapter and upstream artifact match their pinned source
 commits, use the approved one-shot authorization, and follow the separate live-verification gate.
+
+## Isolated production bindings (preparation only)
+
+`scripts/operations/upstream_canary_runtime.py` binds the caller to the existing production
+Google Sheets snapshot and transaction adapters, `GoogleSheetsProductionJobStore`,
+`ProductionCreditGuard`, Google Drive storage, and Phase G media validator. Its fresh reader reuses
+the canonical production operator's Phase E, quote, account/project checks, and profile credit read;
+it also verifies the stored compiled prompt text against its canonical SHA-256. The factory passes
+the absolute interpreter `/opt/gflow-upstream/0.92.1/venv/bin/python` to the adapter, which runs
+`python -m gflow_cli`; it does not use PATH or the legacy global CLI. This keeps the adapter's
+fixed stdin bootstrap and avoids placing prompt text in process arguments.
+
+The isolated source checkout, wheel, venv, and `runtime-manifest.json` live under
+`/opt/gflow-upstream/0.92.1`. The manifest records the upstream commit/tree, built wheel SHA-256,
+CLI launcher SHA-256, and exact paths. `run_upstream_canary_preflight.py` checks that evidence,
+reads canonical workload/quote/profile evidence and the existing job tables, and checks the CLI
+version/help contract. It does not claim a job, write a reservation, launch the adapter, or invoke
+Generate. This preparation does not activate a production route and does not change n8n or the
+legacy `/root/.local/share/uv/tools/gflow-cli` installation.

@@ -108,7 +108,7 @@ def _evidence(tmp_path: Path) -> FreshCanaryEvidence:
     return FreshCanaryEvidence(
         prompt_status="APPROVED",
         prompt_text="A quiet cinematic scene.",
-        prompt_sha256="b" * 64,
+        prompt_sha256=hashlib.sha256(b"A quiet cinematic scene.").hexdigest(),
         scene_id="SCN_000001",
         prompt_id="SPV_000007",
         generation_profile_id="GPR_0002",
@@ -438,6 +438,8 @@ def test_download_failure_recovers_existing_media_without_invocation(tmp_path: P
     "changes",
     [
         {"prompt_status": "DRAFT"},
+        {"prompt_text": "different prompt"},
+        {"prompt_sha256": "d" * 64},
         {"account_email": "wrong@example.com"},
         {"project_id": "wrong-project"},
         {"identity_verified": False},

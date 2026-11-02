@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persistence without fabricating provider lineage or completing ordinary jobs. This is not wired to
   a public CLI/MCP surface or the default production path.
 
+- **Pinned upstream canary runtime bindings.** Adds an isolated runtime under
+  `/opt/gflow-upstream/0.92.1`, a source/tree/wheel/executable manifest, production port bindings that
+  reuse the existing Sheets, credit guard, job, Drive and media implementations, and a read-only
+  zero-Generate preflight. The legacy `gflow-cli 0.79.1` installation and default Phase G route are
+  unchanged.
+
 - **Offline upstream-first video adapter V1.** Adds a disconnected, fake-runner-tested adapter pinned to
   upstream `gflow-cli` v0.92.1 / source commit `63dd0081e117dc081ed7fc774d3dd19ac91ec9aa`. It builds
   one `video t2v` invocation and normalizes a strict result without changing production routing; the
