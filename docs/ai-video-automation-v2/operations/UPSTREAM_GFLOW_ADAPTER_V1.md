@@ -88,9 +88,35 @@ ID, D2 ID, authorization/reservation evidence, and submit-click stage. The adapt
 upstream operation/media IDs; requested project plus binding provenance; profile, Production Job,
 Scene Job, and caller idempotency IDs; local output path; stdout/stderr SHA-256 digests; elapsed time;
 normalized error code/type; whether submission may have occurred; `auto_retry`; safe message and
-remediation; and empty Drive/D2 fields. It excludes the approved prompt, account email, raw stdout,
-raw stderr, cookies, provider bodies, and tokens. n8n must consume a later orchestration contract,
-not upstream JSON or this adapter directly.
+remediation; and empty Drive/D2 fields. The result also carries process timestamps, elapsed process
+duration, raw exit code, POSIX signal when applicable, timeout/caller-kill flags, full stream byte
+counts and SHA-256 hashes, truncation, parser diagnostics, and safe prefix/suffix excerpts. A missing
+Generate action, submit marker, timestamp, or provider request ID is `UNKNOWN`; a result does not infer
+submission from credit balance or absent media. The upstream CLI currently does not expose those
+facts, so they usually remain unknown unless an observed event supplies them.
+
+The canary caller persists evidence events in the same locked credit-ledger row for the exact
+invocation. `PROCESS_STARTED` is written immediately after process creation and before request stdin
+is sent. Submit/provider observations are written when surfaced. `PROCESS_ENDED` is recorded after
+process termination and both pipes drain, before result parsing. A `PARSE_DIAGNOSTIC` event follows
+only when strict result parsing fails. Events contain only allowlisted scalar fields and are ordered
+with a monotonically increasing sequence. Each stream is hashed and counted in full while the parser
+capture remains capped at 1 MiB. Diagnostic excerpts are sanitized before clipping to 256 characters;
+if sanitization fails, the excerpt is omitted. Raw stream content is never written to the ledger.
+The normalized outcome is appended as the final evidence event in the same atomic ledger update that
+stores its allowlisted result fields. When an explicit upstream status is available, the result can
+also distinguish `SUBMITTED_PENDING` and `SUBMITTED_PROVIDER_FAILURE`; absent such evidence, the
+submission facts stay `UNKNOWN` or `POST_SUBMIT_UNKNOWN` according to whether the launched result is
+ambiguous.
+
+The parser contract is unchanged: decode the captured stdout as UTF-8, parse the entire output as
+JSON, and accept only a top-level object. Wrapped JSON, arrays, empty output, and malformed JSON stay
+unreadable results. Diagnostics do not relax acceptance or enable retry. `auto_retry` remains false.
+If persisting `PROCESS_STARTED` fails, the child is terminated before request stdin is sent. If a
+later evidence write fails, the caller stops and leaves the durable invocation unresolved.
+The result excludes the approved prompt, account email, raw stdout, raw stderr, cookies, provider
+bodies, and tokens. n8n must consume a later orchestration contract, not upstream JSON or this adapter
+directly.
 
 ### Status mapping
 

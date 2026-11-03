@@ -103,7 +103,7 @@ def redact_metadata(value: Any) -> Any:
     return value
 
 
-def redact_error_detail(detail: str) -> str:
+def redact_error_detail(detail: str, *, max_chars: int | None = ERROR_DETAIL_MAX_CHARS) -> str:
     """Scrub a free-text error detail before it is persisted to the DB (#341).
 
     Applied to ``GFlowError.to_problem_details()['detail']`` on the FAILED
@@ -111,7 +111,29 @@ def redact_error_detail(detail: str) -> str:
     URLs carrying signed-query material, and truncates post-redaction as
     defense-in-depth against a scrub bypass.
     """
-    for pattern, replacement in _SECRET_TEXT_PATTERNS:
-        detail = pattern.sub(replacement, detail)
-    detail = _SIGNED_QUERY_TOKEN_PATTERN.sub("<redacted:url>", detail)
-    return detail[:ERROR_DETAIL_MAX_CHARS]
+    lowered = detail.lower()
+    if "bearer " in lowered:
+        detail = _SECRET_TEXT_PATTERNS[0][0].sub(_SECRET_TEXT_PATTERNS[0][1], detail)
+    if "sapisidhash " in lowered:
+        detail = _SECRET_TEXT_PATTERNS[1][0].sub(_SECRET_TEXT_PATTERNS[1][1], detail)
+    if any(
+        marker in lowered
+        for marker in (
+            "__secure-",
+            "sapisidhash=",
+            "sapisid=",
+            "apisid=",
+            "ssid=",
+            "hsid=",
+            "osid=",
+            "lsid=",
+            "sid=",
+        )
+    ):
+        detail = _SECRET_TEXT_PATTERNS[2][0].sub(_SECRET_TEXT_PATTERNS[2][1], detail)
+    if "@" in detail:
+        detail = _SECRET_TEXT_PATTERNS[3][0].sub(_SECRET_TEXT_PATTERNS[3][1], detail)
+        lowered = detail.lower()
+    if any(marker in lowered for marker in SENSITIVE_QUERY_KEYS):
+        detail = _SIGNED_QUERY_TOKEN_PATTERN.sub("<redacted:url>", detail)
+    return detail if max_chars is None else detail[:max_chars]

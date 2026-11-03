@@ -19,3 +19,11 @@ Feature: Offline upstream video adapter
     When the adapter generates once
     Then the adapter reports upstream generation completed
     And the result does not claim production finalization
+
+  Scenario: Submit evidence is preserved before malformed output is classified
+    Given an authorized upstream video request
+    And the upstream command runner emits submission evidence then malformed output
+    When the adapter generates once
+    Then the adapter reports post-submit unknown
+    And submission evidence is persisted before the parse diagnostic
+    And the upstream video command was invoked once

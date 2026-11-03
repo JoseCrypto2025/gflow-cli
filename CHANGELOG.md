@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Offline upstream invocation observability V1.** Adds bounded process lifecycle metadata, full
+  stream byte counts and hashes, redacted parse diagnostics, `UNKNOWN` defaults for unavailable
+  submission facts, and ordered evidence events in the existing canary credit ledger. Strict JSON
+  acceptance and one-shot/no-retry behavior remain unchanged; no live Flow or provider call is added.
+
 - **Offline upstream-first canary caller V1.** Adds a narrow caller that fresh-reads approved PROD
   evidence, claims idempotent Production/Scene Jobs, atomically reserves the exact quote and persists
   a pre-invocation checkpoint in the shared credit ledger, then invokes the pinned adapter once.

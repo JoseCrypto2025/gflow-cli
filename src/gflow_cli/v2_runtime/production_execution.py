@@ -12,7 +12,7 @@ import os
 import re
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -543,7 +543,7 @@ class ProductionCreditGuard:
         attempt_id: str,
         *,
         status: str,
-        result_fields: dict[str, str | int | bool | None],
+        result_fields: Mapping[str, object],
     ) -> dict[str, object]:
         """Persist an allowlisted normalized result without raw subprocess output."""
         allowed = {
@@ -567,8 +567,42 @@ class ProductionCreditGuard:
             "upstream_error_type",
             "submit_may_have_occurred",
             "exit_code",
+            "submission_state",
+            "generate_action_observed",
+            "generate_action_count",
+            "submit_action_observed",
+            "submit_transport_observed",
+            "submit_timestamp",
+            "provider_request_id",
+            "provider_operation_id",
+            "provider_media_id",
+            "process_started_at",
+            "process_ended_at",
+            "process_duration_ms",
+            "process_return_code",
+            "process_signal",
+            "process_timed_out",
+            "process_killed_by_caller",
+            "process_stdout_byte_count",
+            "process_stderr_byte_count",
+            "process_stdout_sha256",
+            "process_stderr_sha256",
+            "process_output_truncated",
+            "parse_error_type",
+            "parse_error_message",
+            "output_top_level_type",
+            "safe_stdout_prefix",
+            "safe_stdout_suffix",
+            "safe_stderr_prefix",
+            "safe_stderr_suffix",
         }
-        safe_fields = {key: value for key, value in result_fields.items() if key in allowed_fields}
+        safe_fields = {
+            key: value
+            for key, value in result_fields.items()
+            if key in allowed_fields
+            and isinstance(value, (str, int, bool, type(None)))
+            and not (isinstance(value, str) and len(value) > 512)
+        }
 
         def update(payload: dict[str, object]) -> dict[str, object]:
             row = self._find(payload, attempt_id)
@@ -604,6 +638,116 @@ class ProductionCreditGuard:
             else:
                 row["state"] = "UPSTREAM_UNKNOWN_HOLD"
                 row["checkpoint_state"] = "UPSTREAM_UNKNOWN_HOLD"
+            events_value = row.get("upstream_evidence_events")
+            if events_value is None:
+                events: list[dict[str, object]] = []
+                row["upstream_evidence_events"] = events
+            elif isinstance(events_value, list):
+                events = cast(list[dict[str, object]], events_value)
+            else:
+                raise ProductionExecutionError("upstream evidence event ledger is invalid")
+            events.append(
+                {
+                    "sequence": len(events) + 1,
+                    "event_type": "NORMALIZED_OUTCOME",
+                    "recorded_at": format_utc_timestamp(datetime.now(UTC)),
+                    "evidence": {
+                        "normalized_status": status,
+                        "submission_state": safe_fields.get("submission_state", "UNKNOWN"),
+                        "normalized_error_code": safe_fields.get("normalized_error_code"),
+                    },
+                }
+            )
+            return dict(row)
+
+        return self._mutate(update)
+
+    def record_upstream_evidence(
+        self,
+        attempt_id: str,
+        *,
+        event_type: str,
+        evidence: dict[str, object],
+    ) -> dict[str, object]:
+        """Append one bounded, allowlisted observation to the started invocation row."""
+        event_fields = {
+            "PROCESS_STARTED": {"process_started_at"},
+            "SUBMIT_OBSERVATION": {
+                "generate_action_observed",
+                "generate_action_count",
+                "submit_action_observed",
+                "submit_transport_observed",
+                "submit_timestamp",
+                "provider_request_id",
+                "operation_id",
+                "media_id",
+                "provider_status",
+                "submission_state",
+            },
+            "PROCESS_ENDED": {
+                "process_ended_at",
+                "process_duration_ms",
+                "process_return_code",
+                "process_signal",
+                "process_timed_out",
+                "process_killed_by_caller",
+                "process_stdout_byte_count",
+                "process_stderr_byte_count",
+                "process_stdout_sha256",
+                "process_stderr_sha256",
+                "process_output_truncated",
+            },
+            "PROVIDER_IDENTIFIED": {
+                "provider_request_id",
+                "operation_id",
+                "media_id",
+                "provider_status",
+                "submission_state",
+            },
+            "PARSER_RESULT": {"parse_result", "output_top_level_type"},
+            "PARSE_DIAGNOSTIC": {
+                "parse_error_type",
+                "parse_error_message",
+                "output_top_level_type",
+                "safe_stdout_prefix",
+                "safe_stdout_suffix",
+                "safe_stderr_prefix",
+                "safe_stderr_suffix",
+            },
+        }
+        allowed = event_fields.get(event_type)
+        if allowed is None:
+            raise ProductionExecutionError("upstream evidence event type is not allowlisted")
+        safe_evidence = {
+            key: value
+            for key, value in evidence.items()
+            if key in allowed
+            and isinstance(value, (str, int, bool, type(None)))
+            and not (isinstance(value, str) and len(value) > 512)
+        }
+
+        def update(payload: dict[str, object]) -> dict[str, object]:
+            row = self._find(payload, attempt_id)
+            if row.get("upstream_canary") is not True:
+                raise ProductionExecutionError("attempt is not an upstream canary")
+            if row.get("state") != "UPSTREAM_INVOCATION_STARTED":
+                raise ProductionExecutionError("upstream invocation is not active")
+            events_value = row.get("upstream_evidence_events")
+            if events_value is None:
+                events: list[dict[str, object]] = []
+                row["upstream_evidence_events"] = events
+            elif isinstance(events_value, list):
+                events = cast(list[dict[str, object]], events_value)
+            else:
+                raise ProductionExecutionError("upstream evidence event ledger is invalid")
+            events.append(
+                {
+                    "sequence": len(events) + 1,
+                    "event_type": event_type,
+                    "recorded_at": format_utc_timestamp(datetime.now(UTC)),
+                    "evidence": safe_evidence,
+                }
+            )
             return dict(row)
 
         return self._mutate(update)

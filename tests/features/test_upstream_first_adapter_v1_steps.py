@@ -29,12 +29,26 @@ def adapter_state(tmp_path: Path) -> dict[str, Any]:
         cwd: Path,
         env: dict[str, str],
         timeout_seconds: float,
+        *,
+        event_callback=None,
     ) -> CommandResult:
         state["calls"].append((command, stdin, timeout_seconds))
         if "--version" in command:
-            return CommandResult(0, b"gflow, version 0.92.1\n", b"")
+            return CommandResult(0, b"python -m gflow_cli, version 0.92.1\n", b"")
+        if event_callback is not None:
+            event_callback("PROCESS_STARTED", {"process_started_at": "2026-11-03T00:00:00Z"})
         if state["mode"] == "timeout":
             return CommandResult(None, b"", b"", timed_out=True)
+        if state["mode"] == "submit-before-malformed":
+            assert event_callback is not None
+            event_callback(
+                "SUBMIT_OBSERVATION",
+                {
+                    "submit_transport_observed": True,
+                    "provider_request_id": "bdd-request-1",
+                },
+            )
+            return CommandResult(0, b"not-json", b"")
         output = tmp_path / "staging" / "episode.mp4"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"not-a-validated-production-video")
@@ -114,6 +128,11 @@ def runner_succeeds(adapter_state: dict[str, Any]) -> None:
     adapter_state["mode"] = "success"
 
 
+@given("the upstream command runner emits submission evidence then malformed output")
+def runner_emits_submit_then_malformed(adapter_state: dict[str, Any]) -> None:
+    adapter_state["mode"] = "submit-before-malformed"
+
+
 @when("the adapter generates once")
 def generate_once(adapter_state: dict[str, Any]) -> None:
     adapter = UpstreamGflowVideoAdapter(
@@ -122,7 +141,11 @@ def generate_once(adapter_state: dict[str, Any]) -> None:
         runner=adapter_state["runner"],
     )
     adapter_state["adapter"] = adapter
-    adapter_state["result"] = adapter.generate_once(adapter_state["request"])
+    adapter_state["events"] = []
+    adapter_state["result"] = adapter.generate_once(
+        adapter_state["request"],
+        evidence_callback=lambda kind, data: adapter_state["events"].append((kind, dict(data))),
+    )
 
 
 @then("the adapter reports a pre-submit failure")
@@ -155,3 +178,14 @@ def no_production_finalization(adapter_state: dict[str, Any]) -> None:
     result = adapter_state["result"]
     assert result.drive_file_id is None
     assert result.d2_run_id is None
+
+
+@then("submission evidence is persisted before the parse diagnostic")
+def submit_evidence_precedes_parse_diagnostic(adapter_state: dict[str, Any]) -> None:
+    kinds = [kind for kind, _ in adapter_state["events"]]
+    assert kinds.index("SUBMIT_OBSERVATION") < kinds.index("PARSE_DIAGNOSTIC")
+
+
+@then("the upstream video command was invoked once")
+def upstream_video_invoked_once(adapter_state: dict[str, Any]) -> None:
+    assert sum("-c" in call[0] for call in adapter_state["calls"]) == 1

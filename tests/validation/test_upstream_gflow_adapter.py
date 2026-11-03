@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from gflow_cli.v2_runtime.upstream_gflow_adapter import (
     CommandResult,
     ProcessLaunchError,
     UpstreamGflowVideoAdapter,
+    _run_bounded_process,
 )
 
 _MEDIA_ID = "01234567-89ab-cdef-0123-456789abcdef"
@@ -96,6 +98,8 @@ class FakeRunner:
         cwd: Path,
         env: dict[str, str],
         timeout_seconds: float,
+        *,
+        event_callback=None,
     ) -> CommandResult:
         self.calls.append((command, stdin, cwd, timeout_seconds))
         self.environments.append(dict(env))
@@ -118,6 +122,44 @@ class FakeRunner:
             return CommandResult(0, b"", b"", output_truncated=True)
         if self.mode == "malformed":
             return CommandResult(0, b"not-json", b"")
+        if self.mode in {"wrapped-json", "json-array", "empty-output", "large-output"}:
+            body = {
+                "wrapped-json": b"informational prefix\n{}\nsuffix",
+                "json-array": b"[]",
+                "empty-output": b"",
+                "large-output": b"x" * (2 * 1024 * 1024),
+            }[self.mode]
+            return CommandResult(0, body, b"", output_truncated=self.mode == "large-output")
+        if self.mode in {
+            "submit-before-malformed",
+            "pending-before-malformed",
+            "provider-failure-before-malformed",
+            "timeout-after-submit",
+        }:
+            assert event_callback is not None
+            observation: dict[str, object] = {
+                "submit_transport_observed": True,
+                "provider_request_id": "request-123",
+                "submit_timestamp": "2026-11-03T00:00:00Z",
+            }
+            if self.mode == "pending-before-malformed":
+                observation["provider_status"] = "PENDING"
+            elif self.mode == "provider-failure-before-malformed":
+                observation["provider_status"] = "FAILED"
+            event_callback(
+                "SUBMIT_OBSERVATION",
+                observation,
+            )
+            if self.mode == "timeout-after-submit":
+                return CommandResult(None, b"", b"", timed_out=True)
+            self.last_stdout = b"not-json-after-submit"
+            return CommandResult(0, self.last_stdout, b"")
+        if self.mode == "secret-malformed":
+            self.last_stdout = (
+                b"Authorization: Bearer ya29.secret-value "
+                b"api_key=AIzaSyD_SECRET opaque=" + b"A" * 64 + b" tail-not-json"
+            )
+            return CommandResult(0, self.last_stdout, b"")
         if self.mode == "stderr-only":
             self.last_stdout = b""
             self.last_stderr = _SECRET_SENTINEL.encode()
@@ -262,6 +304,144 @@ def test_success_requires_strict_json_and_returns_hashes_not_production_proof(
     assert "expected_account" not in normalized
     assert result.stdout_digest == hashlib.sha256(fake.last_stdout).hexdigest()
     assert len(result.stderr_digest) == 64
+    assert result.submission_state == "SUCCESS"
+    assert result.provider_media_id == _MEDIA_ID
+    assert result.provider_operation_id == "UNKNOWN"
+    assert result.generate_action_observed == "UNKNOWN"
+    assert result.submit_transport_observed == "UNKNOWN"
+
+
+@pytest.mark.parametrize("mode", ["malformed", "wrapped-json", "json-array", "empty-output"])
+def test_parse_failure_is_diagnostic_without_relaxing_json_contract(
+    tmp_path: Path, mode: str
+) -> None:
+    request = _request(tmp_path)
+    fake = FakeRunner(request, mode=mode)
+    result = _adapter(request, fake).generate_once(request)
+
+    assert result.status is AdapterStatus.POST_SUBMIT_UNKNOWN
+    assert result.normalized_error_code == "UPSTREAM_RESULT_UNREADABLE"
+    assert result.auto_retry is False
+    assert result.parse_error_type is not None
+    assert result.safe_stdout_prefix is not None
+    assert len(result.safe_stdout_prefix) <= 256
+    assert len(result.safe_stdout_suffix or "") <= 256
+    assert result.submission_state == "POST_SUBMIT_UNKNOWN"
+    assert len(fake.calls) == 2  # version probe plus exactly one upstream invocation
+
+
+def test_output_diagnostics_redact_secrets_before_clipping(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    fake = FakeRunner(request, mode="secret-malformed")
+    result = _adapter(request, fake).generate_once(request)
+
+    assert result.status is AdapterStatus.POST_SUBMIT_UNKNOWN
+    diagnostic = " ".join([result.safe_stdout_prefix or "", result.safe_stdout_suffix or ""])
+    for secret in ("ya29.secret-value", "AIzaSyD_SECRET", "A" * 64):
+        assert secret not in diagnostic
+
+
+def test_submit_evidence_is_delivered_before_parser_diagnostic(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    fake = FakeRunner(request, mode="submit-before-malformed")
+    persisted: list[tuple[str, dict[str, object]]] = []
+    result = _adapter(request, fake).generate_once(
+        request,
+        evidence_callback=lambda kind, evidence: persisted.append((kind, dict(evidence))),
+    )
+
+    kinds = [kind for kind, _ in persisted]
+    assert kinds.index("SUBMIT_OBSERVATION") < kinds.index("PARSE_DIAGNOSTIC")
+    assert result.status is AdapterStatus.POST_SUBMIT_UNKNOWN
+    assert result.provider_request_id == "request-123"
+    assert result.submission_state == "POST_SUBMIT_UNKNOWN"
+    assert sum("-c" in call[0] for call in fake.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("pending-before-malformed", "SUBMITTED_PENDING"),
+        ("provider-failure-before-malformed", "SUBMITTED_PROVIDER_FAILURE"),
+    ],
+)
+def test_explicit_provider_status_is_preserved_for_classification(
+    tmp_path: Path, mode: str, expected: str
+) -> None:
+    request = _request(tmp_path)
+    result = _adapter(request, FakeRunner(request, mode=mode)).generate_once(request)
+    assert result.status is AdapterStatus.POST_SUBMIT_UNKNOWN
+    assert result.submission_state == expected
+
+
+def test_timeout_after_submit_keeps_provider_evidence_and_never_retries(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    fake = FakeRunner(request, mode="timeout-after-submit")
+    events: list[str] = []
+    result = _adapter(request, fake).generate_once(
+        request, evidence_callback=lambda kind, _evidence: events.append(kind)
+    )
+
+    assert result.status is AdapterStatus.POST_SUBMIT_UNKNOWN
+    assert result.provider_request_id == "request-123"
+    assert result.submit_transport_observed is True
+    assert result.submission_state == "POST_SUBMIT_UNKNOWN"
+    assert events.index("SUBMIT_OBSERVATION") < events.index("PROCESS_ENDED")
+    assert sum("-c" in call[0] for call in fake.calls) == 1
+
+
+def test_timeout_and_posix_signal_lifecycle_are_preserved(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    timeout = _adapter(request, FakeRunner(request, mode="timeout")).generate_once(request)
+    assert timeout.process_timed_out is True
+    assert timeout.process_killed_by_caller is True
+    assert timeout.submission_state == "POST_SUBMIT_UNKNOWN"
+
+    signalled_request = _request(tmp_path / "signal")
+    signalled = _adapter(
+        signalled_request, FakeRunner(signalled_request, mode="terminated")
+    ).generate_once(signalled_request)
+    assert signalled.process_return_code == -9
+    assert signalled.process_signal == (9 if os.name != "nt" else None)
+    assert signalled.process_timed_out is False
+
+
+def test_full_stream_hash_and_byte_count_survive_diagnostic_truncation(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    fake = FakeRunner(request, mode="large-output")
+    result = _adapter(request, fake).generate_once(request)
+
+    assert result.process_stdout_byte_count == 2 * 1024 * 1024
+    assert result.process_output_truncated is True
+    assert len(result.stdout_digest) == 64
+    assert result.parse_error_type is not None
+
+
+def test_real_runner_records_lifecycle_and_hashes_full_local_stream(tmp_path: Path) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    result = _run_bounded_process(
+        (
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('alpha'); sys.stderr.write('beta')",
+        ),
+        b"",
+        tmp_path,
+        {},
+        10,
+        event_callback=lambda kind, evidence: events.append((kind, dict(evidence))),
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == b"alpha"
+    assert result.stderr == b"beta"
+    assert result.stdout_byte_count == 5
+    assert result.stderr_byte_count == 4
+    assert result.stdout_sha256 == hashlib.sha256(b"alpha").hexdigest()
+    assert result.stderr_sha256 == hashlib.sha256(b"beta").hexdigest()
+    assert result.process_started_at is not None
+    assert result.process_ended_at is not None
+    assert [event[0] for event in events] == ["PROCESS_STARTED"]
 
 
 @pytest.mark.parametrize(
@@ -291,6 +471,14 @@ def test_upstream_error_normalization_is_conservative(
     assert result.status is expected
     assert result.submit_may_have_occurred is may_have_submitted
     assert result.auto_retry is False
+    expected_submission_state = {
+        AdapterStatus.AUTH_FAILURE: "PRE_SUBMIT_FAILURE",
+        AdapterStatus.PROJECT_NAVIGATION_FAILURE: "POST_SUBMIT_UNKNOWN",
+        AdapterStatus.INSUFFICIENT_CREDITS: "PRE_SUBMIT_FAILURE",
+        AdapterStatus.DOWNLOAD_FAILURE_AFTER_GENERATION: "DOWNLOAD_FAILURE_AFTER_GENERATION",
+        AdapterStatus.POST_SUBMIT_UNKNOWN: "POST_SUBMIT_UNKNOWN",
+    }[expected]
+    assert result.submission_state == expected_submission_state
     assert _SECRET_SENTINEL not in result.safe_message
     assert _SECRET_SENTINEL not in result.remediation
     assert _SECRET_SENTINEL not in str(result)
@@ -409,6 +597,8 @@ def test_process_launch_failure_is_proven_pre_submit(tmp_path: Path) -> None:
         cwd: Path,
         env: dict[str, str],
         timeout_seconds: float,
+        *,
+        event_callback=None,
     ) -> CommandResult:
         nonlocal calls
         calls += 1

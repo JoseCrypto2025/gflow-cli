@@ -58,7 +58,12 @@ class FakeAdapter:
         self.checkpoint: dict[str, object] | None = None
         self.guard: ProductionCreditGuard | None = None
 
-    def generate_once(self, request: AdapterRequest) -> AdapterResult:
+    def generate_once(
+        self,
+        request: AdapterRequest,
+        *,
+        evidence_callback=None,
+    ) -> AdapterResult:
         self.calls += 1
         assert self.guard is not None
         invocation_id = (
@@ -67,13 +72,31 @@ class FakeAdapter:
         )
         row = self.guard.upstream_canary_row(invocation_id)
         self.checkpoint = row
+        if evidence_callback is not None:
+            evidence_callback("PROCESS_STARTED", {"process_started_at": "2026-11-03T00:00:00Z"})
+            if self.status is AdapterStatus.POST_SUBMIT_UNKNOWN:
+                evidence_callback(
+                    "SUBMIT_OBSERVATION",
+                    {
+                        "submit_transport_observed": True,
+                        "provider_request_id": "offline-provider-request",
+                    },
+                )
         if self.status is AdapterStatus.UPSTREAM_GENERATION_COMPLETED:
             request.staging_output_path.parent.mkdir(parents=True, exist_ok=True)
             request.staging_output_path.write_bytes(b"offline fake mp4")
             path = request.staging_output_path
         else:
             path = None
-        return _adapter_result(request, self.status, path)
+        result = _adapter_result(request, self.status, path)
+        if self.status is AdapterStatus.POST_SUBMIT_UNKNOWN:
+            result = replace(
+                result,
+                provider_request_id="offline-provider-request",
+                submit_transport_observed=True,
+                submission_state="POST_SUBMIT_UNKNOWN",
+            )
+        return result
 
 
 class FakeRecovery:
@@ -231,6 +254,15 @@ def test_success_persists_checkpoint_before_one_shot_and_artifact(tmp_path: Path
         == result.persisted_artifact.verification.remote_sha256
     )
     assert guard.upstream_canary_row(result.canary_invocation_id)["generate_click_count"] == 0
+    evidence_events = guard.upstream_canary_row(result.canary_invocation_id)[
+        "upstream_evidence_events"
+    ]
+    assert isinstance(evidence_events, list)
+    assert evidence_events[0]["event_type"] == "PROCESS_STARTED"
+    assert evidence_events[-1]["event_type"] == "NORMALIZED_OUTCOME"
+    assert [event["sequence"] for event in evidence_events] == list(
+        range(1, len(evidence_events) + 1)
+    )
 
 
 def test_success_replay_reuses_job_and_invocation_without_adapter_call(tmp_path: Path) -> None:
@@ -243,6 +275,23 @@ def test_success_replay_reuses_job_and_invocation_without_adapter_call(tmp_path:
     assert first.scene_job_id == second.scene_job_id
     assert adapter.calls == 1
     assert guard.upstream_canary_row(first.canary_invocation_id)["upstream_invocation_count"] == 1
+
+
+def test_submit_evidence_is_durable_before_unknown_normalized_outcome(tmp_path: Path) -> None:
+    caller, adapter, guard = _make_caller(tmp_path, status=AdapterStatus.POST_SUBMIT_UNKNOWN)
+    result = caller.run(_request(tmp_path))
+    row = guard.upstream_canary_row(result.canary_invocation_id)
+    events = row["upstream_evidence_events"]
+
+    assert adapter.calls == 1
+    assert result.state == "UPSTREAM_UNKNOWN_HOLD"
+    assert isinstance(events, list)
+    kinds = [event["event_type"] for event in events]
+    assert kinds.index("SUBMIT_OBSERVATION") < kinds.index("NORMALIZED_OUTCOME")
+    submit_event = next(event for event in events if event["event_type"] == "SUBMIT_OBSERVATION")
+    assert submit_event["evidence"]["provider_request_id"] == "offline-provider-request"
+    normalized = row["normalized_result"]
+    assert normalized["provider_request_id"] == "offline-provider-request"
 
 
 def test_crash_after_success_result_recovers_artifact_without_invoking_again(
@@ -278,7 +327,7 @@ def test_crash_after_success_result_recovers_artifact_without_invoking_again(
 def test_malformed_adapter_result_is_held_without_replay(tmp_path: Path) -> None:
     caller, adapter, guard = _make_caller(tmp_path)
 
-    def malformed(_request: AdapterRequest) -> AdapterResult:
+    def malformed(_request: AdapterRequest, *, evidence_callback=None) -> AdapterResult:
         adapter.calls += 1
         return None  # type: ignore[return-value]
 
@@ -342,7 +391,7 @@ def test_restart_after_durable_start_never_launches_adapter_again(tmp_path: Path
     caller, adapter, guard = _make_caller(tmp_path)
     adapter_error = RuntimeError("simulated process interruption after invocation-start")
 
-    def interrupted(_request: AdapterRequest) -> AdapterResult:
+    def interrupted(_request: AdapterRequest, *, evidence_callback=None) -> AdapterResult:
         adapter.calls += 1
         raise adapter_error
 

@@ -1,4 +1,5 @@
 from gflow_cli.data.redaction import prompt_fields, redact_error_detail, redact_metadata
+from gflow_cli.redaction import redact_sensitive_diagnostic
 
 
 def test_prompt_fields_store_mode_stores_text_and_hash() -> None:
@@ -56,6 +57,16 @@ def test_session_id_is_redacted() -> None:
     # The project id is a plain resource identifier and stays readable — it is
     # what makes a bundle diagnosable at all.
     assert ctx["projectId"] == "7d3d6bd9-a39f-4c2d-b772-146e73e539cf"
+
+
+def test_sensitive_diagnostic_redacts_full_text_before_caller_clips() -> None:
+    value = "prefix " + "x" * 600 + " Bearer ya29.secret-value " + "y" * 600 + " suffix"
+    redacted = redact_sensitive_diagnostic(value)
+
+    assert "ya29.secret-value" not in redacted
+    assert len(redacted) > 500
+    assert redacted.startswith("prefix")
+    assert redacted.endswith("suffix")
 
 
 class TestEmailRedactionScope:

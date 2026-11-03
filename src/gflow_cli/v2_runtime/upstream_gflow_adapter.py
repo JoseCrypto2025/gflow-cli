@@ -17,10 +17,14 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 from uuid import UUID
+
+from gflow_cli.redaction import redact_sensitive_diagnostic
 
 UPSTREAM_VERSION = "0.92.1"
 UPSTREAM_COMMIT = "63dd0081e117dc081ed7fc774d3dd19ac91ec9aa"
@@ -28,9 +32,15 @@ RESULT_SCHEMA_VERSION = "UPSTREAM_GFLOW_ADAPTER_RESULT_V1"
 DEFAULT_TIMEOUT_SECONDS = 900.0
 _MAX_PROMPT_CHARS = 65_536
 _MAX_CAPTURE_BYTES = 1_048_576
+_MAX_DIAGNOSTIC_CHARS = 256
 _MAX_IDEMPOTENCY_KEYS = 10_000
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_OPAQUE_SECRET_RE = re.compile(
+    r"(?i)(?:\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token)\s*[=:]\s*"
+    r"[\"']?[^\s,;\"']+|(?<![A-Za-z0-9])[A-Za-z0-9_~+/-]{40,}={0,2}|"
+    r"\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+){2,}\b)"
+)
 _MODEL_MAP = {
     "omni-flash": "omni_flash",
     "veo-lite": "veo_3_1_lite",
@@ -103,6 +113,18 @@ class CommandResult:
     stderr: bytes
     timed_out: bool = False
     output_truncated: bool = False
+    process_started_at: str | None = None
+    process_ended_at: str | None = None
+    process_duration_ms: int | None = None
+    process_signal: int | None = None
+    process_killed_by_caller: bool | None = None
+    stdout_byte_count: int | None = None
+    stderr_byte_count: int | None = None
+    stdout_sha256: str | None = None
+    stderr_sha256: str | None = None
+
+
+EvidenceCallback = Callable[[str, Mapping[str, object]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +154,34 @@ class AdapterResult:
     remediation: str
     drive_file_id: str | None = None
     d2_run_id: str | None = None
+    submission_state: str = "UNKNOWN"
+    generate_action_observed: bool | str = "UNKNOWN"
+    generate_action_count: int | str = "UNKNOWN"
+    submit_action_observed: bool | str = "UNKNOWN"
+    submit_transport_observed: bool | str = "UNKNOWN"
+    submit_timestamp: str = "UNKNOWN"
+    provider_request_id: str = "UNKNOWN"
+    provider_operation_id: str = "UNKNOWN"
+    provider_media_id: str = "UNKNOWN"
+    process_started_at: str | None = None
+    process_ended_at: str | None = None
+    process_duration_ms: int | None = None
+    process_return_code: int | None = None
+    process_signal: int | None = None
+    process_timed_out: bool | None = None
+    process_killed_by_caller: bool | None = None
+    process_stdout_byte_count: int | None = None
+    process_stderr_byte_count: int | None = None
+    process_stdout_sha256: str | None = None
+    process_stderr_sha256: str | None = None
+    process_output_truncated: bool | None = None
+    parse_error_type: str | None = None
+    parse_error_message: str | None = None
+    output_top_level_type: str | None = None
+    safe_stdout_prefix: str | None = None
+    safe_stdout_suffix: str | None = None
+    safe_stderr_prefix: str | None = None
+    safe_stderr_suffix: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return the stable local schema without prompt, account, or raw streams."""
@@ -161,10 +211,60 @@ class AdapterResult:
             "remediation": self.remediation,
             "drive_file_id": self.drive_file_id,
             "d2_run_id": self.d2_run_id,
+            "submission_state": self.submission_state,
+            "generate_action_observed": self.generate_action_observed,
+            "generate_action_count": self.generate_action_count,
+            "submit_action_observed": self.submit_action_observed,
+            "submit_transport_observed": self.submit_transport_observed,
+            "submit_timestamp": self.submit_timestamp,
+            "provider_request_id": self.provider_request_id,
+            "provider_operation_id": self.provider_operation_id,
+            "provider_media_id": self.provider_media_id,
+            "process_started_at": self.process_started_at or "UNKNOWN",
+            "process_ended_at": self.process_ended_at or "UNKNOWN",
+            "process_duration_ms": self.process_duration_ms
+            if self.process_duration_ms is not None
+            else "UNKNOWN",
+            "process_return_code": self.process_return_code
+            if self.process_return_code is not None
+            else "UNKNOWN",
+            "process_signal": self.process_signal if self.process_signal is not None else "UNKNOWN",
+            "process_timed_out": self.process_timed_out
+            if self.process_timed_out is not None
+            else "UNKNOWN",
+            "process_killed_by_caller": self.process_killed_by_caller
+            if self.process_killed_by_caller is not None
+            else "UNKNOWN",
+            "process_stdout_byte_count": self.process_stdout_byte_count
+            if self.process_stdout_byte_count is not None
+            else "UNKNOWN",
+            "process_stderr_byte_count": self.process_stderr_byte_count
+            if self.process_stderr_byte_count is not None
+            else "UNKNOWN",
+            "process_stdout_sha256": self.process_stdout_sha256 or "UNKNOWN",
+            "process_stderr_sha256": self.process_stderr_sha256 or "UNKNOWN",
+            "process_output_truncated": self.process_output_truncated
+            if self.process_output_truncated is not None
+            else "UNKNOWN",
+            "parse_error_type": self.parse_error_type or "UNKNOWN",
+            "parse_error_message": self.parse_error_message or "UNKNOWN",
+            "output_top_level_type": self.output_top_level_type or "UNKNOWN",
+            "safe_stdout_prefix": self.safe_stdout_prefix
+            if self.safe_stdout_prefix is not None
+            else "UNKNOWN",
+            "safe_stdout_suffix": self.safe_stdout_suffix
+            if self.safe_stdout_suffix is not None
+            else "UNKNOWN",
+            "safe_stderr_prefix": self.safe_stderr_prefix
+            if self.safe_stderr_prefix is not None
+            else "UNKNOWN",
+            "safe_stderr_suffix": self.safe_stderr_suffix
+            if self.safe_stderr_suffix is not None
+            else "UNKNOWN",
         }
 
 
-Runner = Callable[[tuple[str, ...], bytes, Path, Mapping[str, str], float], CommandResult]
+Runner = Callable[..., CommandResult]
 
 
 class ProcessLaunchError(OSError):
@@ -192,7 +292,12 @@ class UpstreamGflowVideoAdapter:
         self._seen_keys: set[str] = set()
         self._seen_lock = threading.Lock()
 
-    def generate_once(self, request: AdapterRequest) -> AdapterResult:
+    def generate_once(
+        self,
+        request: AdapterRequest,
+        *,
+        evidence_callback: EvidenceCallback | None = None,
+    ) -> AdapterResult:
         """Run one generation; any post-launch uncertainty is non-retryable."""
         started = time.monotonic()
         base = _result_base(request)
@@ -318,6 +423,13 @@ class UpstreamGflowVideoAdapter:
         payload = json.dumps({"args": cli_args}, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
+        observed: dict[str, object] = {}
+
+        def on_evidence(kind: str, data: Mapping[str, object]) -> None:
+            if kind in {"SUBMIT_OBSERVATION", "PROVIDER_IDENTIFIED"}:
+                observed.update(data)
+            _emit_evidence(evidence_callback, kind, data)
+
         try:
             result = self._runner(
                 (str(self._python), "-c", _CLI_LAUNCHER),
@@ -325,6 +437,7 @@ class UpstreamGflowVideoAdapter:
                 request.profile_home,
                 environment,
                 request.timeout_seconds,
+                event_callback=on_evidence,
             )
         except ProcessLaunchError:
             return _failure(
@@ -357,7 +470,39 @@ class UpstreamGflowVideoAdapter:
             stdout_digest=_digest(result.stdout),
             stderr_digest=_digest(result.stderr),
             elapsed_ms=_elapsed_ms(started),
+            generate_action_observed=observed.get("generate_action_observed", "UNKNOWN"),
+            generate_action_count=observed.get("generate_action_count", "UNKNOWN"),
+            process_started_at=result.process_started_at,
+            process_ended_at=result.process_ended_at,
+            process_duration_ms=result.process_duration_ms,
+            process_return_code=result.returncode,
+            process_signal=result.process_signal
+            if result.process_signal is not None
+            else -result.returncode
+            if os.name != "nt" and result.returncode is not None and result.returncode < 0
+            else None,
+            process_timed_out=result.timed_out,
+            process_killed_by_caller=result.process_killed_by_caller
+            if result.process_killed_by_caller is not None
+            else result.timed_out,
+            process_stdout_byte_count=result.stdout_byte_count
+            if result.stdout_byte_count is not None
+            else len(result.stdout),
+            process_stderr_byte_count=result.stderr_byte_count
+            if result.stderr_byte_count is not None
+            else len(result.stderr),
+            process_stdout_sha256=result.stdout_sha256 or _digest(result.stdout),
+            process_stderr_sha256=result.stderr_sha256 or _digest(result.stderr),
+            process_output_truncated=result.output_truncated,
+            submit_action_observed=observed.get("submit_action_observed", "UNKNOWN"),
+            submit_transport_observed=observed.get("submit_transport_observed", "UNKNOWN"),
+            submit_timestamp=str(observed.get("submit_timestamp", "UNKNOWN")),
+            provider_request_id=str(observed.get("provider_request_id", "UNKNOWN")),
+            provider_operation_id=str(observed.get("operation_id", "UNKNOWN")),
+            provider_media_id=str(observed.get("media_id", "UNKNOWN")),
+            submission_state=_submission_state(None, observed),
         )
+        _emit_process_ended(evidence_callback, result)
         if result.timed_out:
             return _failure(
                 common,
@@ -370,8 +515,11 @@ class UpstreamGflowVideoAdapter:
                 remediation=(
                     "Inspect and reconcile this same project/job before any further invocation."
                 ),
+                submission_state="POST_SUBMIT_UNKNOWN",
             )
         if result.output_truncated:
+            diagnostic = _parse_diagnostic(result.stdout, result.stderr)
+            _emit_evidence(evidence_callback, "PARSE_DIAGNOSTIC", diagnostic)
             return _failure(
                 common,
                 status=AdapterStatus.POST_SUBMIT_UNKNOWN,
@@ -381,9 +529,12 @@ class UpstreamGflowVideoAdapter:
                 remediation=(
                     "Inspect and reconcile this same project/job; do not invoke Generate again."
                 ),
+                **cast(Any, diagnostic),
             )
         payload_obj = _parse_json_object(result.stdout)
         if payload_obj is None:
+            diagnostic = _parse_diagnostic(result.stdout, result.stderr)
+            _emit_evidence(evidence_callback, "PARSE_DIAGNOSTIC", diagnostic)
             return _failure(
                 common,
                 status=AdapterStatus.POST_SUBMIT_UNKNOWN,
@@ -393,9 +544,50 @@ class UpstreamGflowVideoAdapter:
                 remediation=(
                     "Inspect and reconcile this same project/job before any further invocation."
                 ),
+                submission_state=_submission_state(AdapterStatus.POST_SUBMIT_UNKNOWN, observed),
+                **cast(Any, diagnostic),
             )
+        _emit_evidence(
+            evidence_callback,
+            "PARSER_RESULT",
+            {"parse_result": "JSON_OBJECT_ACCEPTED", "output_top_level_type": "dict"},
+        )
+        explicit_ids = {
+            "provider_request_id": _first_string(payload_obj, "provider_request_id", "request_id"),
+            "operation_id": _first_string(payload_obj, "operation_id", "upstream_operation_id"),
+            "media_id": _first_string(payload_obj, "media_id"),
+        }
+        explicit_ids = {key: value for key, value in explicit_ids.items() if value is not None}
+        if explicit_ids:
+            _emit_evidence(evidence_callback, "PROVIDER_IDENTIFIED", explicit_ids)
+            observed.update(explicit_ids)
+        common = replace(
+            common,
+            provider_request_id=str(observed.get("provider_request_id", "UNKNOWN")),
+            provider_operation_id=str(observed.get("operation_id", "UNKNOWN")),
+            provider_media_id=str(observed.get("media_id", "UNKNOWN")),
+            submission_state=_submission_state(
+                None,
+                {
+                    **observed,
+                    "provider_status": _first_string(
+                        payload_obj, "provider_status", "submission_status"
+                    ),
+                },
+            ),
+        )
         if result.returncode != 0 or payload_obj.get("status") != "ok":
             return _normalize_failure(common, payload_obj)
+
+        if common.submission_state in {"SUBMITTED_PENDING", "SUBMITTED_PROVIDER_FAILURE"}:
+            return _failure(
+                common,
+                status=AdapterStatus.POST_SUBMIT_UNKNOWN,
+                error_code="UPSTREAM_PROVIDER_STATUS_NOT_TERMINAL_SUCCESS",
+                submit_may_have_occurred=True,
+                message="The upstream provider status does not confirm a completed generation.",
+                remediation="Reconcile the same invocation before any further action.",
+            )
 
         validated = _validate_success_payload(payload_obj, request)
         if validated is None:
@@ -424,6 +616,9 @@ class UpstreamGflowVideoAdapter:
             remediation=(
                 "Continue with the existing media validator and canonical storage workflow."
             ),
+            submission_state="SUCCESS",
+            generate_action_observed="UNKNOWN",
+            generate_action_count="UNKNOWN",
         )
 
 
@@ -670,7 +865,29 @@ def _failure(
     stdout: bytes | None = None,
     stderr: bytes | None = None,
     elapsed_ms: int | None = None,
+    **diagnostics: object,
 ) -> AdapterResult:
+    submission_state = (
+        "PRE_SUBMIT_FAILURE"
+        if status
+        in {
+            AdapterStatus.PRE_SUBMIT_FAILURE,
+            AdapterStatus.AUTH_FAILURE,
+            AdapterStatus.UNSUPPORTED_FLOW_STATE,
+            AdapterStatus.INSUFFICIENT_CREDITS,
+        }
+        else "DOWNLOAD_FAILURE_AFTER_GENERATION"
+        if status is AdapterStatus.DOWNLOAD_FAILURE_AFTER_GENERATION
+        else "POST_SUBMIT_UNKNOWN"
+    )
+    if base.submission_state in {
+        "SUBMITTED_PENDING",
+        "SUBMITTED_PROVIDER_FAILURE",
+        "SUCCESS",
+        "DOWNLOAD_FAILURE_AFTER_GENERATION",
+    }:
+        submission_state = base.submission_state
+    submission_state = str(diagnostics.pop("submission_state", submission_state))
     return replace(
         base,
         status=status,
@@ -684,6 +901,8 @@ def _failure(
         stdout_digest=_digest(stdout) if stdout is not None else base.stdout_digest,
         stderr_digest=_digest(stderr) if stderr is not None else base.stderr_digest,
         elapsed_ms=elapsed_ms if elapsed_ms is not None else base.elapsed_ms,
+        submission_state=submission_state,
+        **diagnostics,
     )
 
 
@@ -736,12 +955,14 @@ def _run_bounded_process(
     cwd: Path,
     env: Mapping[str, str],
     timeout_seconds: float,
+    *,
+    event_callback: EvidenceCallback | None = None,
 ) -> CommandResult:
     """Run one command with bounded capture and process-tree termination."""
     if not command or not Path(command[0]).is_absolute():
         raise OSError("pinned executable must be absolute")
-    stdout_buffer = bytearray()
-    stderr_buffer = bytearray()
+    stdout_capture = _StreamCapture()
+    stderr_capture = _StreamCapture()
     truncated = threading.Event()
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     try:
@@ -760,11 +981,26 @@ def _run_bounded_process(
         raise ProcessLaunchError("pinned upstream process did not start") from exc
     assert process.stdout is not None and process.stderr is not None and process.stdin is not None
 
+    process_started = datetime.now(UTC)
+    started_monotonic = time.monotonic()
+    try:
+        _emit_evidence(
+            event_callback,
+            "PROCESS_STARTED",
+            {"process_started_at": _utc_string(process_started)},
+        )
+    except BaseException:
+        _terminate_process_tree(process)
+        process.stdin.close()
+        process.stdout.close()
+        process.stderr.close()
+        raise
+
     out_thread = threading.Thread(
-        target=_drain_pipe, args=(process.stdout, stdout_buffer, truncated), daemon=True
+        target=_drain_pipe, args=(process.stdout, stdout_capture, truncated), daemon=True
     )
     err_thread = threading.Thread(
-        target=_drain_pipe, args=(process.stderr, stderr_buffer, truncated), daemon=True
+        target=_drain_pipe, args=(process.stderr, stderr_capture, truncated), daemon=True
     )
     out_thread.start()
     err_thread.start()
@@ -790,23 +1026,45 @@ def _run_bounded_process(
         err_thread.join(timeout=5)
         process.stdout.close()
         process.stderr.close()
+    ended = datetime.now(UTC)
+    returncode = process.returncode
     return CommandResult(
-        returncode=process.returncode,
-        stdout=bytes(stdout_buffer),
-        stderr=bytes(stderr_buffer),
+        returncode=returncode,
+        stdout=bytes(stdout_capture.buffer),
+        stderr=bytes(stderr_capture.buffer),
         timed_out=timed_out,
         output_truncated=truncated.is_set(),
+        process_started_at=_utc_string(process_started),
+        process_ended_at=_utc_string(ended),
+        process_duration_ms=max(0, int((time.monotonic() - started_monotonic) * 1000)),
+        process_signal=-returncode
+        if os.name != "nt" and returncode is not None and returncode < 0
+        else None,
+        process_killed_by_caller=timed_out,
+        stdout_byte_count=stdout_capture.byte_count,
+        stderr_byte_count=stderr_capture.byte_count,
+        stdout_sha256=stdout_capture.digest.hexdigest(),
+        stderr_sha256=stderr_capture.digest.hexdigest(),
     )
 
 
-def _drain_pipe(stream: BinaryIO, target: bytearray, truncated: threading.Event) -> None:
+@dataclass(slots=True)
+class _StreamCapture:
+    buffer: bytearray = dataclass_field(default_factory=bytearray)
+    digest: Any = dataclass_field(default_factory=hashlib.sha256)
+    byte_count: int = 0
+
+
+def _drain_pipe(stream: BinaryIO, target: _StreamCapture, truncated: threading.Event) -> None:
     while True:
         chunk = stream.read(64 * 1024)
         if not chunk:
             return
-        remaining = _MAX_CAPTURE_BYTES - len(target)
+        target.byte_count += len(chunk)
+        target.digest.update(chunk)
+        remaining = _MAX_CAPTURE_BYTES - len(target.buffer)
         if remaining > 0:
-            target.extend(chunk[:remaining])
+            target.buffer.extend(chunk[:remaining])
         if len(chunk) > remaining:
             truncated.set()
 
@@ -845,6 +1103,146 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _emit_evidence(
+    callback: EvidenceCallback | None, event_type: str, evidence: Mapping[str, object]
+) -> None:
+    if callback is not None:
+        callback(event_type, evidence)
+
+
+def _emit_process_ended(callback: EvidenceCallback | None, result: CommandResult) -> None:
+    _emit_evidence(
+        callback,
+        "PROCESS_ENDED",
+        {
+            "process_ended_at": result.process_ended_at or "UNKNOWN",
+            "process_duration_ms": result.process_duration_ms
+            if result.process_duration_ms is not None
+            else "UNKNOWN",
+            "process_return_code": result.returncode
+            if result.returncode is not None
+            else "UNKNOWN",
+            "process_signal": result.process_signal
+            if result.process_signal is not None
+            else "UNKNOWN",
+            "process_timed_out": result.timed_out,
+            "process_killed_by_caller": result.process_killed_by_caller
+            if result.process_killed_by_caller is not None
+            else "UNKNOWN",
+            "process_stdout_byte_count": result.stdout_byte_count
+            if result.stdout_byte_count is not None
+            else len(result.stdout),
+            "process_stderr_byte_count": result.stderr_byte_count
+            if result.stderr_byte_count is not None
+            else len(result.stderr),
+            "process_stdout_sha256": result.stdout_sha256 or _digest(result.stdout),
+            "process_stderr_sha256": result.stderr_sha256 or _digest(result.stderr),
+            "process_output_truncated": result.output_truncated,
+        },
+    )
+
+
+def _parse_diagnostic(stdout: bytes, stderr: bytes) -> dict[str, object]:
+    error_type = "JSONDecodeError"
+    error_message = "output is not a JSON object"
+    top_level_type = "UNKNOWN"
+    try:
+        decoded = stdout.decode("utf-8")
+        value = json.loads(decoded)
+        top_level_type = type(value).__name__
+        if isinstance(value, dict):
+            error_type = "UNKNOWN"
+            error_message = "JSON object failed strict result parsing"
+        else:
+            error_type = "UnexpectedTopLevelType"
+            error_message = f"expected object; received {top_level_type}"
+    except UnicodeDecodeError as exc:
+        error_type = "UnicodeDecodeError"
+        error_message = str(exc)
+    except json.JSONDecodeError as exc:
+        error_type = "JSONDecodeError"
+        error_message = exc.msg
+    try:
+        safe_error_message = _safe_text(error_message, _MAX_DIAGNOSTIC_CHARS)
+        safe_stdout_prefix = _safe_excerpt(stdout, prefix=True)
+        safe_stdout_suffix = _safe_excerpt(stdout, prefix=False)
+        safe_stderr_prefix = _safe_excerpt(stderr, prefix=True)
+        safe_stderr_suffix = _safe_excerpt(stderr, prefix=False)
+    except Exception:
+        safe_error_message = "diagnostic redaction failed; omitted"
+        safe_stdout_prefix = None
+        safe_stdout_suffix = None
+        safe_stderr_prefix = None
+        safe_stderr_suffix = None
+    return {
+        "parse_error_type": error_type,
+        "parse_error_message": safe_error_message,
+        "output_top_level_type": top_level_type,
+        "safe_stdout_prefix": safe_stdout_prefix,
+        "safe_stdout_suffix": safe_stdout_suffix,
+        "safe_stderr_prefix": safe_stderr_prefix,
+        "safe_stderr_suffix": safe_stderr_suffix,
+    }
+
+
+def _safe_excerpt(raw: bytes, *, prefix: bool) -> str | None:
+    try:
+        text = raw.decode("utf-8", errors="replace")
+        safe = _safe_text(text, None)
+        excerpt = safe[:_MAX_DIAGNOSTIC_CHARS] if prefix else safe[-_MAX_DIAGNOSTIC_CHARS:]
+        return _OPAQUE_SECRET_RE.sub("[REDACTED]", excerpt)
+    except Exception:
+        return None
+
+
+def _safe_text(value: str, max_chars: int | None) -> str:
+    safe = redact_sensitive_diagnostic(value)
+    safe = _OPAQUE_SECRET_RE.sub("[REDACTED]", safe)
+    return safe if max_chars is None else safe[:max_chars]
+
+
+def _first_string(payload: Mapping[str, object], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _submission_state(status: AdapterStatus | None, observed: Mapping[str, object]) -> str:
+    explicit = observed.get("submission_state")
+    if explicit in {"SUBMITTED_PENDING", "SUBMITTED_PROVIDER_FAILURE"}:
+        return str(explicit)
+    provider_status = observed.get("provider_status")
+    if isinstance(provider_status, str):
+        if provider_status.upper() in {"PENDING", "RUNNING", "IN_PROGRESS"}:
+            return "SUBMITTED_PENDING"
+        if provider_status.upper() in {"FAILED", "ERROR", "REJECTED"}:
+            return "SUBMITTED_PROVIDER_FAILURE"
+    if status is AdapterStatus.UPSTREAM_GENERATION_COMPLETED:
+        return "SUCCESS"
+    if status is AdapterStatus.DOWNLOAD_FAILURE_AFTER_GENERATION:
+        return "DOWNLOAD_FAILURE_AFTER_GENERATION"
+    if status in {
+        AdapterStatus.PRE_SUBMIT_FAILURE,
+        AdapterStatus.AUTH_FAILURE,
+        AdapterStatus.UNSUPPORTED_FLOW_STATE,
+        AdapterStatus.INSUFFICIENT_CREDITS,
+    }:
+        return "PRE_SUBMIT_FAILURE"
+    if (
+        observed.get("submit_action_observed") is True
+        or observed.get("submit_transport_observed") is True
+        or status is AdapterStatus.POST_SUBMIT_UNKNOWN
+    ):
+        return "POST_SUBMIT_UNKNOWN"
+    return "UNKNOWN"
+
+
+def _utc_string(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _elapsed_ms(started: float) -> int:

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -120,7 +120,12 @@ class FreshCanaryReader(Protocol):
 class CanaryAdapter(Protocol):
     """The one-shot adapter port; production callers inject the audited adapter."""
 
-    def generate_once(self, request: AdapterRequest) -> AdapterResult: ...
+    def generate_once(
+        self,
+        request: AdapterRequest,
+        *,
+        evidence_callback: Callable[[str, Mapping[str, object]], None] | None = None,
+    ) -> AdapterResult: ...
 
 
 class CanaryArtifactRecovery(Protocol):
@@ -310,8 +315,16 @@ class UpstreamCanaryProductionCaller:
             request_idempotency_key=request.request_idempotency_key,
             generation_authorized=True,
         )
+
+        def persist_evidence(event_type: str, event_data: Mapping[str, object]) -> None:
+            self._credit_guard.record_upstream_evidence(
+                invocation_id, event_type=event_type, evidence=dict(event_data)
+            )
+
         try:
-            result = self._adapter.generate_once(adapter_request)
+            result = self._adapter.generate_once(
+                adapter_request, evidence_callback=persist_evidence
+            )
         except BaseException:
             # The durable started checkpoint remains unresolved; never invoke again.
             raise
@@ -469,6 +482,23 @@ class UpstreamCanaryProductionCaller:
                 "upstream_error_type": typed_result.upstream_error_type,
                 "submit_may_have_occurred": typed_result.submit_may_have_occurred,
                 "exit_code": typed_result.exit_code,
+                **{
+                    key: value
+                    for key, value in typed_result.to_dict().items()
+                    if key.startswith(
+                        (
+                            "submission_",
+                            "generate_",
+                            "submit_",
+                            "provider_",
+                            "process_",
+                            "parse_",
+                            "output_",
+                            "safe_",
+                        )
+                    )
+                    and isinstance(value, (str, int, bool, type(None)))
+                },
             }
         self._credit_guard.record_upstream_result(
             invocation_id, status=status.value, result_fields=fields
