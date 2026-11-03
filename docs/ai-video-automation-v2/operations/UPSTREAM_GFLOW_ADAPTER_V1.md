@@ -18,10 +18,12 @@ validation, Drive persistence, or production finalization.
 
 V1 is pinned to release `gflow-cli==0.92.1`, tag source commit
 `63dd0081e117dc081ed7fc774d3dd19ac91ec9aa` (annotated tag `v0.92.1`). The adapter requires an
-absolute Python interpreter and checks `python -m gflow_cli --version` returns exactly `0.92.1` before
-building the generation request. The release tag/commit is a source pin; the version probe alone does
-not prove the installed wheel's source hash. A future canary must install a separately verified
-artifact built from this pin.
+absolute Python interpreter and checks the exact output of `python -m gflow_cli --version` before
+building the generation request. The read-only preflight and invocation guard share the command,
+working directory, allowlisted subprocess environment, and version parser. The production adapter
+also reruns the runtime-manifest, source checkout, wheel hash, and CLI launcher hash checks before
+its version probe. The release tag/commit is a source pin; a version probe alone does not prove the
+installed wheel's source hash. A canary must use the separately verified artifact built from this pin.
 
 The pinned `gflow video t2v` surface includes:
 

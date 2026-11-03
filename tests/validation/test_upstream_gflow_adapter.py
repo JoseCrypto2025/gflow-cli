@@ -84,6 +84,7 @@ class FakeRunner:
         self.request = request
         self.mode = mode
         self.calls: list[tuple[tuple[str, ...], bytes, Path, float]] = []
+        self.environments: list[dict[str, str]] = []
         self.output = request.staging_output_path
         self.last_stdout = b""
         self.last_stderr = b""
@@ -97,13 +98,17 @@ class FakeRunner:
         timeout_seconds: float,
     ) -> CommandResult:
         self.calls.append((command, stdin, cwd, timeout_seconds))
+        self.environments.append(dict(env))
         if "--version" in command:
             if self.mode == "version-timeout":
                 return CommandResult(None, b"", b"", timed_out=True)
             if self.mode == "version-mismatch":
-                self.last_stdout = b"gflow, version 0.91.0\n"
+                self.last_stdout = b"python -m gflow_cli, version 0.91.0\n"
                 return CommandResult(0, self.last_stdout, b"")
-            self.last_stdout = b"gflow, version 0.92.1\n"
+            if self.mode == "legacy-version":
+                self.last_stdout = b"python -m gflow_cli, version 0.79.1\n"
+                return CommandResult(0, self.last_stdout, b"")
+            self.last_stdout = b"python -m gflow_cli, version 0.92.1\n"
             return CommandResult(0, self.last_stdout, b"")
         if self.mode == "timeout":
             return CommandResult(None, b"", b"", timed_out=True)
@@ -326,6 +331,65 @@ def test_pinned_version_mismatch_stops_before_generation(tmp_path: Path) -> None
     assert len(fake.calls) == 1
 
 
+def test_module_version_probe_accepts_pinned_version_and_rejects_legacy(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    pinned = FakeRunner(request)
+    accepted = _adapter(request, pinned).generate_once(request)
+    assert accepted.status is AdapterStatus.UPSTREAM_GENERATION_COMPLETED
+
+    legacy_request = _request(tmp_path / "legacy")
+    legacy = FakeRunner(legacy_request, mode="legacy-version")
+    rejected = _adapter(legacy_request, legacy).generate_once(legacy_request)
+    assert rejected.status is AdapterStatus.PRE_SUBMIT_FAILURE
+    assert rejected.normalized_error_code == "UPSTREAM_VERSION_MISMATCH"
+    assert len(legacy.calls) == 1
+
+
+def test_absolute_python_and_clean_environment_ignore_legacy_path_and_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _request(tmp_path)
+    fake = FakeRunner(request)
+    monkeypatch.setenv("PATH", "/legacy/0.79.1/bin")
+    monkeypatch.setenv("PYTHONPATH", "/opt/gflow-v2/src:/opt/gflow-v2-src")
+    monkeypatch.setenv("PYTHONHOME", "/wrong/python-home")
+    monkeypatch.setenv("VIRTUAL_ENV", "/opt/gflow-v2/.venv")
+
+    result = _adapter(request, fake).generate_once(request)
+
+    assert result.status is AdapterStatus.UPSTREAM_GENERATION_COMPLETED
+    command, _stdin, cwd, _timeout = fake.calls[0]
+    env = fake.environments[0]
+    assert command == (str(Path(sys.executable)), "-m", "gflow_cli", "--version")
+    assert cwd == request.profile_home.resolve()
+    assert env["PATH"] == "/legacy/0.79.1/bin"
+    assert "PYTHONPATH" not in env
+    assert "PYTHONHOME" not in env
+    assert "VIRTUAL_ENV" not in env
+
+
+def test_runtime_pin_mismatch_stops_before_version_or_generation(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    fake = FakeRunner(request)
+
+    def reject_wrong_pin() -> None:
+        raise ValueError("wrong pinned source")
+
+    adapter = UpstreamGflowVideoAdapter(
+        python_executable=Path(sys.executable),
+        runner=fake,
+        runtime_pin_verifier=reject_wrong_pin,
+    )
+    result = adapter.generate_once(request)
+
+    assert result.status is AdapterStatus.PRE_SUBMIT_FAILURE
+    assert result.normalized_error_code == "UPSTREAM_RUNTIME_PIN_MISMATCH"
+    assert result.submit_may_have_occurred is False
+    assert fake.calls == []
+
+
 def test_pre_submit_version_timeout_does_not_run_generation(tmp_path: Path) -> None:
     request = _request(tmp_path)
     fake = FakeRunner(request, mode="version-timeout")
@@ -349,7 +413,7 @@ def test_process_launch_failure_is_proven_pre_submit(tmp_path: Path) -> None:
         nonlocal calls
         calls += 1
         if "--version" in command:
-            return CommandResult(0, b"gflow, version 0.92.1\n", b"")
+            return CommandResult(0, b"python -m gflow_cli, version 0.92.1\n", b"")
         raise ProcessLaunchError("not launched")
 
     result = UpstreamGflowVideoAdapter(

@@ -28,6 +28,14 @@ from gflow_cli.v2_runtime.phase_e import sha256_json
 from gflow_cli.v2_runtime.phase_g_artifacts import validate_video
 from gflow_cli.v2_runtime.production_execution import ProductionCreditGuard
 from gflow_cli.v2_runtime.upstream_canary import CanaryRequest
+from gflow_cli.v2_runtime.upstream_gflow_adapter import (
+    AdapterRequest,
+    AdapterStatus,
+    CommandResult,
+    UpstreamGflowVideoAdapter,
+    upstream_version_probe_command,
+    upstream_version_probe_environment,
+)
 from scripts.operations import upstream_canary_runtime as runtime
 
 
@@ -280,6 +288,7 @@ def test_caller_binding_uses_only_pinned_absolute_interpreter(
     assert isinstance(caller, runtime.UpstreamCanaryProductionCaller)
     assert adapter._python == executable
     assert adapter._python.is_absolute()
+    assert adapter._runtime_pin_verifier is runtime._verify_upstream_runtime_pin
 
 
 def test_missing_port_fails_before_adapter_is_built(tmp_path: Path) -> None:
@@ -373,13 +382,29 @@ def test_upstream_pin_uses_scoped_git_safe_directory(
     assert len(git_commands) == 3
     assert all(command[1:3] == ["-c", f"safe.directory={source_root}"] for command in git_commands)
 
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_commit"] = "f" * 40
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    commands.clear()
+    with pytest.raises(
+        runtime.ProductionSceneOperatorError, match="upstream runtime source pin differs"
+    ):
+        runtime._verify_upstream_runtime_pin()
+    assert commands == []
+
 
 def test_read_only_preflight_version_probe_does_not_inherit_pythonpath(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("PYTHONPATH", "/opt/gflow-v2/src:/opt/gflow-v2-src")
     monkeypatch.setattr(runtime, "_verify_upstream_runtime_pin", lambda: None)
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
     reader = _reader(monkeypatch, tmp_path)
+    monkeypatch.setattr(runtime, "profile_dir", lambda _name: profile_home)
+    pinned_python = tmp_path / "pinned-python.exe"
+    pinned_python.write_bytes(b"test interpreter placeholder")
+    monkeypatch.setattr(runtime, "UPSTREAM_PYTHON_EXECUTABLE", pinned_python)
     transaction_rows = SimpleNamespace(read_rows=lambda _tab: ())
     runtime_context = cast(
         runtime.ProductionCanaryRuntime,
@@ -393,8 +418,9 @@ def test_read_only_preflight_version_probe_does_not_inherit_pythonpath(
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         observed.update(kwargs)
+        observed["args"] = tuple(command)
         return subprocess.CompletedProcess(
-            command, 0, stdout="gflow-cli, version 0.92.1", stderr=""
+            command, 0, stdout="python -m gflow_cli, version 0.92.1", stderr=""
         )
 
     monkeypatch.setattr(runtime.subprocess, "run", run)
@@ -402,4 +428,89 @@ def test_read_only_preflight_version_probe_does_not_inherit_pythonpath(
     evidence = runtime.verify_zero_generate_preflight(runtime_context, _request(tmp_path))
 
     assert evidence.prompt_id == "SPV_000007"
-    assert "PYTHONPATH" not in cast(dict[str, str], observed["env"])
+    assert observed["args"] == upstream_version_probe_command(runtime.UPSTREAM_PYTHON_EXECUTABLE)
+    assert observed["cwd"] == profile_home.resolve()
+    assert observed["env"] == upstream_version_probe_environment(profile_home)
+
+
+def test_preflight_and_adapter_use_identical_version_probe_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", "/opt/gflow-v2/src:/opt/gflow-v2-src")
+    monkeypatch.setattr(runtime, "_verify_upstream_runtime_pin", lambda: None)
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    reader = _reader(monkeypatch, tmp_path)
+    monkeypatch.setattr(runtime, "profile_dir", lambda _name: profile_home)
+    pinned_python = tmp_path / "pinned-python.exe"
+    pinned_python.write_bytes(b"test interpreter placeholder")
+    monkeypatch.setattr(runtime, "UPSTREAM_PYTHON_EXECUTABLE", pinned_python)
+    preflight_observed: dict[str, object] = {}
+
+    def preflight_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        preflight_observed.update(kwargs)
+        preflight_observed["args"] = tuple(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout="python -m gflow_cli, version 0.92.1", stderr=""
+        )
+
+    monkeypatch.setattr(runtime.subprocess, "run", preflight_run)
+    context = cast(
+        runtime.ProductionCanaryRuntime,
+        SimpleNamespace(
+            settings=SimpleNamespace(temp_root=tmp_path / "ignored-temp-root"),
+            reader=reader,
+            transaction_rows=SimpleNamespace(read_rows=lambda _tab: ()),
+        ),
+    )
+    evidence = runtime.verify_zero_generate_preflight(context, _request(tmp_path))
+
+    class AdapterProbe:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[str, ...], Path, dict[str, str]]] = []
+
+        def __call__(
+            self,
+            command: tuple[str, ...],
+            _stdin: bytes,
+            cwd: Path,
+            env: dict[str, str],
+            _timeout: float,
+        ) -> CommandResult:
+            self.calls.append((command, cwd, env))
+            if "--version" in command:
+                return CommandResult(0, b"python -m gflow_cli, version 0.79.1", b"")
+            raise AssertionError("generation subprocess must not run in identity parity test")
+
+    adapter_probe = AdapterProbe()
+    adapter = UpstreamGflowVideoAdapter(
+        python_executable=runtime.UPSTREAM_PYTHON_EXECUTABLE,
+        runner=adapter_probe,
+    )
+    staging_root = tmp_path / "adapter-stage"
+    staging_root.mkdir()
+    request = AdapterRequest(
+        approved_prompt="approved prompt fixture",
+        profile_id="GPR_0002",
+        profile_name="gflow-prod",
+        expected_account="singleava508@gmail.com",
+        profile_home=evidence.profile_home,
+        project_id="aafe9282-071f-4333-baa4-92b9f76a9c27",
+        model="veo-lite",
+        aspect_ratio="9:16",
+        duration_seconds=8,
+        output_count=1,
+        staging_root=staging_root,
+        staging_output_path=staging_root / "output.mp4",
+        production_job_id="PRD_000001",
+        scene_job_id="SJB_000001",
+        request_idempotency_key="UPSTREAM_PARITY_TEST_0001",
+        generation_authorized=True,
+    )
+    result = adapter.generate_once(request)
+    assert result.status is AdapterStatus.PRE_SUBMIT_FAILURE
+
+    command, cwd, env = adapter_probe.calls[0]
+    assert command == preflight_observed["args"]
+    assert cwd == preflight_observed["cwd"]
+    assert env == preflight_observed["env"]

@@ -41,6 +41,10 @@ from gflow_cli.v2_runtime.upstream_gflow_adapter import (
     UPSTREAM_COMMIT,
     UPSTREAM_VERSION,
     UpstreamGflowVideoAdapter,
+    upstream_version_matches,
+    upstream_version_probe_command,
+    upstream_version_probe_cwd,
+    upstream_version_probe_environment,
 )
 from scripts.operations.run_production_scene import (
     _PROD_BROWSER_STATE_ROOT,
@@ -265,7 +269,10 @@ def bind_upstream_canary_caller(
         or not executable.is_file()
     ):
         raise ProductionSceneOperatorError("isolated upstream Python executable is unavailable")
-    adapter = UpstreamGflowVideoAdapter(python_executable=executable)
+    adapter = UpstreamGflowVideoAdapter(
+        python_executable=executable,
+        runtime_pin_verifier=_verify_upstream_runtime_pin,
+    )
     caller = UpstreamCanaryProductionCaller(
         reader=reader,
         jobs=jobs,
@@ -343,18 +350,16 @@ def verify_zero_generate_preflight(
     evidence = runtime.reader.read_fresh(request)
     runtime.transaction_rows.read_rows("PRODUCTION_JOBS")
     runtime.transaction_rows.read_rows("SCENE_JOBS")
-    upstream_env = os.environ.copy()
-    upstream_env.pop("PYTHONPATH", None)
     result = subprocess.run(
-        [str(UPSTREAM_PYTHON_EXECUTABLE), "-m", "gflow_cli", "--version"],
-        cwd=runtime.settings.temp_root,
+        list(upstream_version_probe_command(UPSTREAM_PYTHON_EXECUTABLE)),
+        cwd=upstream_version_probe_cwd(evidence.profile_home),
         check=False,
         capture_output=True,
         text=True,
         timeout=15,
-        env=upstream_env,
+        env=upstream_version_probe_environment(evidence.profile_home),
     )
-    if result.returncode != 0 or not result.stdout.strip().endswith("version 0.92.1"):
+    if result.returncode != 0 or not upstream_version_matches(result.stdout):
         raise ProductionSceneOperatorError("isolated upstream version preflight failed")
     return evidence
 

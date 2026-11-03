@@ -180,6 +180,7 @@ class UpstreamGflowVideoAdapter:
         python_executable: Path,
         pinned_version: str = UPSTREAM_VERSION,
         runner: Runner | None = None,
+        runtime_pin_verifier: Callable[[], None] | None = None,
     ) -> None:
         if not python_executable.is_absolute():
             raise ValueError("the pinned upstream Python executable must be absolute")
@@ -187,6 +188,7 @@ class UpstreamGflowVideoAdapter:
             raise ValueError("adapter V1 only supports the audited upstream CLI version")
         self._python = python_executable
         self._runner = _run_bounded_process if runner is None else runner
+        self._runtime_pin_verifier = runtime_pin_verifier
         self._seen_keys: set[str] = set()
         self._seen_lock = threading.Lock()
 
@@ -255,13 +257,28 @@ class UpstreamGflowVideoAdapter:
                     elapsed_ms=_elapsed_ms(started),
                 )
 
-        environment = _child_environment(request.profile_home)
+        if self._runtime_pin_verifier is not None:
+            try:
+                self._runtime_pin_verifier()
+            except Exception:
+                return _failure(
+                    base,
+                    status=AdapterStatus.PRE_SUBMIT_FAILURE,
+                    error_code="UPSTREAM_RUNTIME_PIN_MISMATCH",
+                    message="The installed upstream runtime does not match its pinned source.",
+                    remediation=(
+                        "Verify the isolated runtime manifest, source commit, and artifact hashes."
+                    ),
+                    elapsed_ms=_elapsed_ms(started),
+                )
+
+        environment = upstream_version_probe_environment(request.profile_home)
         version_result: CommandResult
         try:
             version_result = self._runner(
-                (str(self._python), "-m", "gflow_cli", "--version"),
+                upstream_version_probe_command(self._python),
                 b"",
-                request.profile_home,
+                upstream_version_probe_cwd(request.profile_home),
                 environment,
                 min(15.0, request.timeout_seconds),
             )
@@ -280,7 +297,7 @@ class UpstreamGflowVideoAdapter:
             version_result.timed_out
             or version_result.returncode != 0
             or version_result.output_truncated
-            or not _version_matches(version_result.stdout)
+            or not upstream_version_matches(version_result.stdout)
         ):
             return _failure(
                 base,
@@ -681,12 +698,28 @@ def _parse_json_object(output: bytes) -> dict[str, object] | None:
     return cast(dict[str, object], value)
 
 
-def _version_matches(output: bytes) -> bool:
+def upstream_version_probe_command(python_executable: Path) -> tuple[str, ...]:
+    """Return the single module-version command shared by preflight and runtime."""
+    return (str(python_executable), "-m", "gflow_cli", "--version")
+
+
+def upstream_version_probe_cwd(profile_home: Path) -> Path:
+    """Use the exact profile working directory for preflight and invocation probes."""
+    return profile_home.resolve(strict=True)
+
+
+def upstream_version_probe_environment(profile_home: Path) -> dict[str, str]:
+    """Build the deterministic subprocess environment used by both version probes."""
+    return _child_environment(profile_home)
+
+
+def upstream_version_matches(output: bytes | str) -> bool:
+    """Require the exact Click label emitted by ``python -m gflow_cli --version``."""
     try:
-        text = output.decode("utf-8").strip()
+        text = output.decode("utf-8").strip() if isinstance(output, bytes) else output.strip()
     except UnicodeDecodeError:
         return False
-    return text == f"gflow, version {UPSTREAM_VERSION}"
+    return text == f"python -m gflow_cli, version {UPSTREAM_VERSION}"
 
 
 def _child_environment(profile_home: Path) -> dict[str, str]:
