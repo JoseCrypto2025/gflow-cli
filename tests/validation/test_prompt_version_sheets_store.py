@@ -92,6 +92,10 @@ class FakePromptTransport:
             self.fail_append_after_write = False
             raise SheetsTransactionError("write acknowledgement was lost")
 
+    def update_prompt_row(self, row_number: int, values: Sequence[Sequence[object]]) -> None:
+        self.update_count += 1
+        self.rows[row_number - 1] = list(values[0])
+
     def update_prompt_values(self, a1_range: str, values: Sequence[Sequence[object]]) -> None:
         self.update_count += 1
         row_number = int(a1_range.split("A")[1].split(":")[0])
@@ -195,6 +199,33 @@ def test_prompt_store_validation_updates_only_lifecycle_cells(tmp_path: Path) ->
     assert transport.rows[1][7] == "a" * 64
 
 
+def test_prompt_store_refreshes_only_a_draft_and_verifies_full_row(tmp_path: Path) -> None:
+    transport = FakePromptTransport()
+    stale = _row("SPV_000009", "DRAFT", version=1, text="manual", source="c" * 64, prompt="d" * 64)
+    transport.rows.append([stale[name] for name in _FIELDS])
+    store = _store(tmp_path, transport)
+    refreshed = {
+        **stale,
+        "Compiled_Prompt_Text": "fresh",
+        "Source_Context_SHA256": "a" * 64,
+        "Prompt_SHA256": "b" * 64,
+        "Validation_Message": "AWAITING_FRESH_PHASE_E_VALIDATION",
+        "Updated_At": "2026-10-18T01:00:00Z",
+    }
+
+    result = store.refresh_draft(
+        refreshed,
+        expected_row_sha256=prompt_row_sha256(stale),
+        fresh_phase_e=_phase_e(),
+    )
+
+    assert result == refreshed
+    assert transport.update_count == 1
+    assert transport.rows[1][4] == "fresh"
+    assert transport.rows[1][9] == "DRAFT"
+    assert transport.rows[1][11] == ""
+
+
 def test_prompt_store_approval_batches_both_rows_and_verifies(tmp_path: Path) -> None:
     transport = FakePromptTransport()
     old = _row("SPV_000006", "APPROVED", version=6, text="old", source="c" * 64, prompt="d" * 64)
@@ -219,6 +250,31 @@ def test_prompt_store_approval_batches_both_rows_and_verifies(tmp_path: Path) ->
     )
     assert result_old == superseded
     assert result_new == approved
+    assert transport.batch_count == 1
+    assert sum(row[9] == "APPROVED" for row in transport.rows[1:]) == 1
+
+
+def test_prompt_store_approves_first_validated_version_and_verifies(tmp_path: Path) -> None:
+    transport = FakePromptTransport()
+    validated = _row(
+        "SPV_000009", "VALIDATED", version=1, text="fresh", source="a" * 64, prompt="b" * 64
+    )
+    transport.rows.append([validated[name] for name in _FIELDS])
+    store = _store(tmp_path, transport)
+    approved = {
+        **validated,
+        "Prompt_Status": "APPROVED",
+        "Approved_At": "2026-10-18T01:00:00Z",
+        "Updated_At": "2026-10-18T01:00:00Z",
+    }
+
+    result = store.approve_initial(
+        approved,
+        expected_candidate_sha256=prompt_row_sha256(validated),
+        fresh_phase_e=_phase_e(),
+    )
+
+    assert result == approved
     assert transport.batch_count == 1
     assert sum(row[9] == "APPROVED" for row in transport.rows[1:]) == 1
 

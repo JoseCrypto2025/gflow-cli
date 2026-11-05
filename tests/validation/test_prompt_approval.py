@@ -172,6 +172,58 @@ def test_validated_row_approval_requires_exact_fresh_phase_e() -> None:
         guard_scene_prompt_version_update(before, after, fresh_phase_e=stale)
 
 
+def test_draft_refresh_accepts_only_exact_fresh_phase_e_payload() -> None:
+    before = {
+        **_approved_row(),
+        "Prompt_Status": "DRAFT",
+        "Compiled_Prompt_Text": "manual draft",
+        "Compiled_Negative_Prompt": "old negative",
+        "Source_Context_SHA256": "a" * 64,
+        "Prompt_SHA256": "b" * 64,
+        "Approved_At": "",
+    }
+    after = {
+        **before,
+        "Compiled_Prompt_Text": "new prompt",
+        "Compiled_Negative_Prompt": "",
+        "Source_Context_SHA256": "c" * 64,
+        "Prompt_SHA256": "d" * 64,
+        "Validation_Message": "AWAITING_FRESH_PHASE_E_VALIDATION",
+        "Updated_At": "2026-10-18T01:00:00Z",
+    }
+
+    guard_scene_prompt_version_update(
+        before,
+        after,
+        fresh_phase_e=_fresh_result(
+            compiled_negative_prompt="",
+            source_context_sha256="c" * 64,
+            prompt_sha256="d" * 64,
+        ),
+    )
+
+    stale = _fresh_result(compiled_prompt="different prompt")
+    with pytest.raises(PromptApprovalIntegrityError, match="candidate differs"):
+        guard_scene_prompt_version_update(before, after, fresh_phase_e=stale)
+
+
+def test_draft_refresh_cannot_change_identity_or_approve() -> None:
+    before = {
+        **_approved_row(),
+        "Prompt_Status": "DRAFT",
+        "Approved_At": "",
+    }
+    after = {
+        **before,
+        "Scene_Prompt_ID": "SPV_000002",
+        "Prompt_Status": "APPROVED",
+        "Approved_At": "2026-10-18T01:00:00Z",
+    }
+
+    with pytest.raises(PromptApprovalIntegrityError):
+        guard_scene_prompt_version_update(before, after, fresh_phase_e=_fresh_result())
+
+
 def test_row_schema_is_required_for_guard() -> None:
     with pytest.raises(PromptApprovalIntegrityError):
         guard_scene_prompt_version_update(None, {"Prompt_Status": "APPROVED"})

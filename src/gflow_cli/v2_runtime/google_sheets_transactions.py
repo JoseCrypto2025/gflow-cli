@@ -408,6 +408,7 @@ class PromptVersionSheetsTransport(Protocol):
 
     def read_prompt_values(self) -> Sequence[Sequence[object]]: ...
     def append_prompt_values(self, values: Sequence[Sequence[object]]) -> None: ...
+    def update_prompt_row(self, row_number: int, values: Sequence[Sequence[object]]) -> None: ...
     def batch_update_prompt_cells(self, cells: Sequence[tuple[int, str, object]]) -> None: ...
 
 
@@ -452,6 +453,14 @@ class GoogleSheetsPromptVersionApiTransport:
             raise SheetsTransactionError("prompt-version append must contain one exact schema row")
         url = self._values_url("'SCENE_PROMPT_VERSION'!A1:N1001:append")
         self._write("POST", url, {"values": values}, params={"insertDataOption": "INSERT_ROWS"})
+
+    def update_prompt_row(self, row_number: int, values: Sequence[Sequence[object]]) -> None:
+        if type(row_number) is not int or not 2 <= row_number <= 1001:
+            raise SheetsTransactionError("prompt-version update row is outside the bounded tab")
+        if len(values) != 1 or len(values[0]) != 14:
+            raise SheetsTransactionError("prompt-version update must contain one exact schema row")
+        a1_range = f"'SCENE_PROMPT_VERSION'!A{row_number}:N{row_number}"
+        self._write("PUT", self._values_url(a1_range), {"values": values})
 
     def batch_update_prompt_cells(self, cells: Sequence[tuple[int, str, object]]) -> None:
         if len(cells) not in (3, 6):
@@ -721,6 +730,47 @@ class OptimisticGoogleSheetsPromptVersionStore:
                 raise SheetsTransactionError("prompt validation readback is missing or different")
             return updated[0]
 
+    def refresh_draft(
+        self,
+        row: dict[str, object],
+        *,
+        expected_row_sha256: str,
+        fresh_phase_e: object,
+    ) -> dict[str, object]:
+        from .phase_e import PreflightResult
+        from .prompt_approval import PromptApprovalIntegrityError, guard_scene_prompt_version_update
+        from .prompt_version_lifecycle import prompt_row_sha256
+
+        if not isinstance(fresh_phase_e, PreflightResult):
+            raise SheetsTransactionError("fresh Phase E evidence is required for draft refresh")
+        self._validate_row(row)
+        if row.get("Prompt_Status") != "DRAFT":
+            raise SheetsTransactionError("draft refresh target must remain DRAFT")
+        with _SheetWriterLock(self):
+            _headers, rows = self._read_table()
+            located = self._locate(rows, str(row["Scene_Prompt_ID"]))
+            if len(located) != 1:
+                raise SheetsTransactionError("prompt draft is missing or duplicated")
+            row_number, current = located[0]
+            if prompt_row_sha256(current) != expected_row_sha256:
+                raise SheetsTransactionError("prompt draft changed since refresh preflight")
+            try:
+                guard_scene_prompt_version_update(current, row, fresh_phase_e=fresh_phase_e)
+            except PromptApprovalIntegrityError as exc:
+                raise SheetsTransactionError("prompt draft refresh transition is invalid") from exc
+            values = [[row[name] for name in self._HEADERS]]
+            try:
+                self._transport.update_prompt_row(row_number, values)
+            except SheetsTransactionError:
+                pass
+            _new_headers, new_rows = self._read_table()
+            readback = self._locate(new_rows, str(row["Scene_Prompt_ID"]))
+            if len(readback) != 1 or prompt_row_sha256(readback[0][1]) != prompt_row_sha256(row):
+                raise SheetsTransactionError(
+                    "prompt draft refresh readback is missing or different"
+                )
+            return readback[0][1]
+
     def approve_pair(
         self,
         previous: dict[str, object],
@@ -808,6 +858,75 @@ class OptimisticGoogleSheetsPromptVersionStore:
             except PromptApprovalIntegrityError as exc:
                 raise SheetsTransactionError("prompt approval readback is ambiguous") from exc
             return old_readback[0][1], new_readback[0][1]
+
+    def approve_initial(
+        self,
+        candidate: dict[str, object],
+        *,
+        expected_candidate_sha256: str,
+        fresh_phase_e: object,
+    ) -> dict[str, object]:
+        from .phase_e import PreflightResult
+        from .prompt_approval import (
+            PromptApprovalIntegrityError,
+            guard_scene_prompt_version_update,
+            require_single_current_approval,
+        )
+        from .prompt_version_lifecycle import prompt_row_sha256
+
+        if not isinstance(fresh_phase_e, PreflightResult):
+            raise SheetsTransactionError("fresh Phase E evidence is required for approval")
+        self._validate_row(candidate)
+        if candidate.get("Prompt_Status") != "APPROVED":
+            raise SheetsTransactionError("initial approval target must be APPROVED")
+        with _SheetWriterLock(self):
+            _headers, rows = self._read_table()
+            located = self._locate(rows, str(candidate["Scene_Prompt_ID"]))
+            if len(located) != 1:
+                raise SheetsTransactionError("initial approval candidate is missing or duplicated")
+            row_number, current = located[0]
+            if prompt_row_sha256(current) != expected_candidate_sha256:
+                raise SheetsTransactionError("prompt lifecycle changed since approval preflight")
+            if any(
+                row.get("Scene_ID") == candidate["Scene_ID"]
+                and row.get("Generation_Profile_ID") == candidate["Generation_Profile_ID"]
+                and row.get("Prompt_Status") == "APPROVED"
+                for row in rows
+            ):
+                raise SheetsTransactionError(
+                    "an approved prompt already exists for this Scene/profile"
+                )
+            try:
+                guard_scene_prompt_version_update(current, candidate, fresh_phase_e=fresh_phase_e)
+            except PromptApprovalIntegrityError as exc:
+                raise SheetsTransactionError(
+                    "initial prompt approval transition is invalid"
+                ) from exc
+            cells = [
+                (row_number, "J", str(candidate["Prompt_Status"])),
+                (row_number, "K", str(candidate["Validation_Message"])),
+                (row_number, "L", str(candidate["Approved_At"])),
+                (row_number, "N", str(candidate["Updated_At"])),
+            ]
+            try:
+                self._transport.batch_update_prompt_cells(cells)
+            except SheetsTransactionError:
+                pass
+            _new_headers, new_rows = self._read_table()
+            readback = self._locate(new_rows, str(candidate["Scene_Prompt_ID"]))
+            if len(readback) != 1 or prompt_row_sha256(readback[0][1]) != prompt_row_sha256(
+                candidate
+            ):
+                raise SheetsTransactionError("initial approval readback is missing or different")
+            try:
+                require_single_current_approval(
+                    new_rows,
+                    scene_id=str(candidate["Scene_ID"]),
+                    generation_profile_id=str(candidate["Generation_Profile_ID"]),
+                )
+            except PromptApprovalIntegrityError as exc:
+                raise SheetsTransactionError("initial approval readback is ambiguous") from exc
+            return readback[0][1]
 
     def _read_table(self) -> tuple[tuple[str, ...], list[dict[str, object]]]:
         values = self._transport.read_prompt_values()

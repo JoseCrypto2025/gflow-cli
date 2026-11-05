@@ -66,9 +66,7 @@ def _profile_environment(
         )
     profile = profiles[0]
     if profile.get("Status") != "ACTIVE":
-        raise PromptVersionLifecycleError(
-            "PROFILE_INACTIVE", "generation profile is not ACTIVE"
-        )
+        raise PromptVersionLifecycleError("PROFILE_INACTIVE", "generation profile is not ACTIVE")
     raw_environment = profile.get("Environment")
     if not isinstance(raw_environment, str) or not raw_environment.strip():
         raise PromptVersionLifecycleError(
@@ -86,9 +84,7 @@ def _profile_environment(
 def _fresh_phase_e(credential_path: Path, schema_dir: Path, scene_id: str, profile_id: str):
     snapshot = _read_snapshot(credential_path, schema_dir)
     environment = _profile_environment(snapshot.tables, profile_id)
-    return preflight_scene(
-        InMemorySceneCatalog(snapshot.tables), scene_id, profile_id, environment
-    )
+    return preflight_scene(InMemorySceneCatalog(snapshot.tables), scene_id, profile_id, environment)
 
 
 def _safe_preview(preview) -> dict[str, object]:
@@ -117,7 +113,9 @@ def main() -> int:
         description="Create, validate, or approve an immutable V2 prompt version"
     )
     parser.add_argument(
-        "--action", choices=("preview", "create", "validate", "approve", "verify"), required=True
+        "--action",
+        choices=("preview", "create", "refresh", "validate", "approve", "verify"),
+        required=True,
     )
     parser.add_argument("--scene-id")
     parser.add_argument("--profile-id")
@@ -133,11 +131,11 @@ def main() -> int:
 
     if args.action in {"preview", "create", "verify"} and not (args.scene_id and args.profile_id):
         parser.error("--scene-id and --profile-id are required for preview/create/verify")
-    if args.action in {"validate", "approve"} and not args.prompt_id:
-        parser.error("--prompt-id is required for validate/approve")
-    if args.action in {"preview", "create", "approve"} and not args.expected_current_id:
+    if args.action in {"refresh", "validate", "approve"} and not args.prompt_id:
+        parser.error("--prompt-id is required for refresh/validate/approve")
+    if args.action in {"preview", "create", "approve"} and args.expected_current_id is None:
         parser.error("--expected-current-id is required to guard the current approval")
-    if args.action in {"create", "validate", "approve"} and not args.execute:
+    if args.action in {"create", "refresh", "validate", "approve"} and not args.execute:
         parser.error("write actions require --execute; preview and verify never write")
     if args.action == "verify" and args.execute:
         parser.error("verify is read-only and does not accept --execute")
@@ -211,6 +209,16 @@ def main() -> int:
             )
             result = {
                 "created": True,
+                "prompt_id": row["Scene_Prompt_ID"],
+                "version": row["Prompt_Version"],
+                "status": row["Prompt_Status"],
+                "prompt_sha256": row["Prompt_SHA256"],
+                "source_context_sha256": row["Source_Context_SHA256"],
+            }
+        elif args.action == "refresh":
+            row = service.refresh_draft_prompt_version(args.prompt_id)
+            result = {
+                "refreshed": True,
                 "prompt_id": row["Scene_Prompt_ID"],
                 "version": row["Prompt_Version"],
                 "status": row["Prompt_Status"],

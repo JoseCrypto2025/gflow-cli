@@ -57,8 +57,12 @@ remains unchanged and the phase ends before provider execution.
 Persisting a candidate is a separate operator action implemented by
 `scripts/operations/reconcile_prompt_version.py`. It creates a new immutable
 `DRAFT`, validates it against fresh Phase E, and approves only after another
-fresh exact match. Approval switches the prior/current status cells through one
-atomic Sheets batch and verifies readback. In the approved 14-column schema,
+fresh exact match. For a Scene/profile with no current approval, the operator
+may explicitly approve a `VALIDATED` first version with an empty
+`--expected-current-id`; the lifecycle still requires the fresh exact match.
+Later approvals must identify the current prompt and switch prior/current
+status cells through one atomic Sheets batch. Both paths verify readback. In
+the approved 14-column schema,
 `Prompt_Status=APPROVED` is the current marker; there is no `Is_Current` column.
 The operator resolves `TEST` or `PROD` from the selected ACTIVE generation
 profile in its fresh live snapshot and rejects missing, duplicate, inactive, or

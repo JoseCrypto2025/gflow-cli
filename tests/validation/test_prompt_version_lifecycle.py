@@ -87,6 +87,28 @@ class FakePromptStore:
                 return dict(row)
         raise PromptVersionLifecycleError("PROMPT_NOT_FOUND", "prompt row missing")
 
+    def refresh_draft(
+        self,
+        row: dict[str, object],
+        *,
+        expected_row_sha256: str,
+        fresh_phase_e: PreflightResult,
+    ) -> dict[str, object]:
+        from gflow_cli.v2_runtime.prompt_version_lifecycle import prompt_row_sha256
+
+        index = next(
+            i
+            for i, item in enumerate(self.rows)
+            if item["Scene_Prompt_ID"] == row["Scene_Prompt_ID"]
+        )
+        current = self.rows[index]
+        if prompt_row_sha256(current) != expected_row_sha256:
+            raise PromptVersionLifecycleError("CONCURRENT_MODIFICATION", "candidate changed")
+        guard_scene_prompt_version_update(current, row, fresh_phase_e=fresh_phase_e)
+        self.rows[index] = dict(row)
+        self.mutations.append("refresh")
+        return dict(row)
+
     def approve_pair(
         self,
         previous: dict[str, object],
@@ -117,6 +139,32 @@ class FakePromptStore:
         if self.fail_readback:
             raise PromptVersionLifecycleError("READBACK_MISMATCH", "approval readback failed")
         return dict(previous), dict(candidate)
+
+    def approve_initial(
+        self,
+        candidate: dict[str, object],
+        *,
+        expected_candidate_sha256: str,
+        fresh_phase_e: PreflightResult,
+    ) -> dict[str, object]:
+        from gflow_cli.v2_runtime.prompt_version_lifecycle import prompt_row_sha256
+
+        index = next(
+            i
+            for i, row in enumerate(self.rows)
+            if row["Scene_Prompt_ID"] == candidate["Scene_Prompt_ID"]
+        )
+        current = self.rows[index]
+        if prompt_row_sha256(current) != expected_candidate_sha256:
+            raise PromptVersionLifecycleError("CONCURRENT_MODIFICATION", "candidate changed")
+        if any(row["Prompt_Status"] == "APPROVED" for row in self.rows):
+            raise PromptVersionLifecycleError("CURRENT_APPROVAL_INVALID", "approval exists")
+        guard_scene_prompt_version_update(current, candidate, fresh_phase_e=fresh_phase_e)
+        self.rows[index] = dict(candidate)
+        self.mutations.append("approve_initial")
+        if self.fail_readback:
+            raise PromptVersionLifecycleError("READBACK_MISMATCH", "approval readback failed")
+        return dict(candidate)
 
 
 def _service(
@@ -177,6 +225,30 @@ def test_exact_fresh_validation_transitions_draft_to_validated() -> None:
     validated = service.validate_prompt_version(str(candidate["Scene_Prompt_ID"]))
     assert validated["Prompt_Status"] == "VALIDATED"
     assert validated["Prompt_SHA256"] == "b" * 64
+
+
+def test_refresh_rebuilds_only_draft_payload_and_keeps_identity() -> None:
+    stale = {
+        **_row(prompt_id="SPV_000009", version=1, status="DRAFT"),
+        "Compiled_Prompt_Text": "manual text",
+        "Compiled_Negative_Prompt": "duplicate negative",
+        "Compiler_Version": "",
+        "Source_Context_SHA256": "",
+        "Prompt_SHA256": "",
+        "Validation_Message": "MANUAL_DRAFT",
+    }
+    store = FakePromptStore([stale])
+
+    refreshed = _service(store).refresh_draft_prompt_version("SPV_000009")
+
+    assert refreshed["Scene_Prompt_ID"] == "SPV_000009"
+    assert refreshed["Prompt_Version"] == 1
+    assert refreshed["Prompt_Status"] == "DRAFT"
+    assert refreshed["Compiled_Prompt_Text"] == "fresh prompt"
+    assert refreshed["Compiled_Negative_Prompt"] == ""
+    assert refreshed["Prompt_SHA256"] == "b" * 64
+    assert refreshed["Approved_At"] == ""
+    assert store.mutations == ["refresh"]
 
 
 @pytest.mark.parametrize(
@@ -243,6 +315,27 @@ def test_approval_supersedes_previous_and_leaves_one_approved() -> None:
     assert store.rows[0]["Prompt_Status"] == "SUPERSEDED"
     assert result["Prompt_Status"] == "APPROVED"
     assert sum(row["Prompt_Status"] == "APPROVED" for row in store.rows) == 1
+
+
+def test_initial_approval_works_when_scene_profile_has_no_prior_approval() -> None:
+    store = FakePromptStore([_row(prompt_id="SPV_000009", version=1, status="VALIDATED")])
+
+    result = _service(store).approve_prompt_version("SPV_000009", expected_previous_id="")
+
+    assert result["Prompt_Status"] == "APPROVED"
+    assert result["Approved_At"] == "2026-10-18T00:00:00Z"
+    assert sum(row["Prompt_Status"] == "APPROVED" for row in store.rows) == 1
+    assert store.mutations == ["approve_initial"]
+
+
+def test_initial_approval_does_not_promote_draft_without_validation() -> None:
+    store = FakePromptStore([_row(prompt_id="SPV_000009", version=1, status="DRAFT")])
+
+    with pytest.raises(PromptVersionLifecycleError, match="VALIDATED"):
+        _service(store).approve_prompt_version("SPV_000009", expected_previous_id="")
+
+    assert store.rows[0]["Prompt_Status"] == "DRAFT"
+    assert store.mutations == []
 
 
 def test_current_approval_is_derived_from_approved_status() -> None:

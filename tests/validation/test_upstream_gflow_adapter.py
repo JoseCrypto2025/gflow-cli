@@ -427,7 +427,7 @@ def test_real_runner_records_lifecycle_and_hashes_full_local_stream(tmp_path: Pa
         ),
         b"",
         tmp_path,
-        {},
+        os.environ.copy(),
         10,
         event_callback=lambda kind, evidence: events.append((kind, dict(evidence))),
     )

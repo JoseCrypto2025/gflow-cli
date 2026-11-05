@@ -37,6 +37,15 @@ _IMMUTABLE_FIELDS = _ROW_FIELDS - {
     "Approved_At",
     "Updated_At",
 }
+_REFRESHABLE_DRAFT_FIELDS = frozenset(
+    {
+        "Compiled_Prompt_Text",
+        "Compiled_Negative_Prompt",
+        "Compiler_Version",
+        "Source_Context_SHA256",
+        "Prompt_SHA256",
+    }
+)
 
 
 class PromptApprovalIntegrityError(ValueError):
@@ -77,6 +86,20 @@ def guard_scene_prompt_version_update(
         return
     if frozenset(previous) != _ROW_FIELDS:
         raise PromptApprovalIntegrityError("existing prompt row is incomplete")
+    if prior_status == _DRAFT_STATUS and next_status == _DRAFT_STATUS:
+        stable_fields = _IMMUTABLE_FIELDS - _REFRESHABLE_DRAFT_FIELDS
+        if any(previous.get(field) != proposed.get(field) for field in stable_fields):
+            raise PromptApprovalIntegrityError("draft refresh cannot change prompt identity")
+        if proposed.get("Approved_At"):
+            raise PromptApprovalIntegrityError("unapproved prompt cannot have Approved_At")
+        if proposed.get("Validation_Message") != "AWAITING_FRESH_PHASE_E_VALIDATION":
+            raise PromptApprovalIntegrityError("refreshed draft must remain unvalidated")
+        if fresh_phase_e is None:
+            raise PromptApprovalIntegrityError("draft refresh requires fresh Phase E")
+        _require_exact_fresh_phase_e(proposed, fresh_phase_e)
+        if not proposed.get("Compiler_Version"):
+            raise PromptApprovalIntegrityError("refreshed draft requires a compiler version")
+        return
     if any(previous.get(field) != proposed.get(field) for field in _IMMUTABLE_FIELDS):
         raise PromptApprovalIntegrityError("persisted prompt payload and hashes are immutable")
     if dict(previous) == dict(proposed):

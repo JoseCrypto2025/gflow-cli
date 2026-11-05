@@ -206,6 +206,57 @@ def test_preflight_pass_is_deterministic_and_provider_neutral() -> None:
     assert result.prompt_sha256 and len(result.prompt_sha256) == 64
 
 
+def test_negative_template_does_not_duplicate_negative_constraints() -> None:
+    tables = _fixtures()
+    constraint = "No subtitles or text overlays."
+    tables["SCENES"][0]["Negative_Constraints_Override"] = constraint
+
+    result = _compile(tables)
+
+    assert result.status == "PREFLIGHT_PASS", result.errors
+    assert result.compiled_negative_prompt == constraint
+
+
+def test_scene_continuity_without_source_pointer_keeps_scene_specific_beat() -> None:
+    tables = _fixtures()
+    tables["SCENES"][0]["Scene_End_State"] = (
+        "Sri asks the governor how many keys the storehouse has."
+    )
+    tables["SCENES"].append(
+        {
+            "Scene_ID": "SCN_000002",
+            "Script_ID": "SCR_000001",
+            "Scene_No": 2,
+            "Scene_Type": "GENERATED_VIDEO",
+            "Scene_Summary": "Sri presents the recovered key and the governor is shocked.",
+            "Action_Description": "Sri asks whose key it is; the governor becomes visibly shocked.",
+            "Location_ID": "LOC_0001",
+            "Scene_Start_State": "Sri already holds the recovered key opposite the governor.",
+            "Continuity_Notes": "Keep the same characters, costumes, courtyard, and daylight.",
+            "Continuity_Source_Scene_ID": "",
+            "Duration_Target_Sec": 8,
+            "Aspect_Ratio_Override": "16:9",
+            "Scene_Definition_Status": "LOCKED",
+        }
+    )
+    tables["SCENE_CHARACTER_MAP"].append(
+        {
+            "Scene_Character_ID": "SCH_000002",
+            "Scene_ID": "SCN_000002",
+            "Character_ID": "CHR_0001",
+            "Sort_Order": 1,
+            "Status": "ACTIVE",
+        }
+    )
+
+    result = preflight_scene(InMemorySceneCatalog(tables), "SCN_000002", "GPR_0001", "development")
+
+    assert result.status == "PREFLIGHT_PASS", result.errors
+    assert "how many keys" not in (result.compiled_prompt or "")
+    assert "asks whose key it is" in (result.compiled_prompt or "")
+    assert "visibly shocked" in (result.compiled_prompt or "")
+
+
 @pytest.mark.parametrize("duration", [4, 6, 8])
 def test_phase_e_duration_is_structured_and_drives_distinct_agent_directives(duration: int) -> None:
     tables = _fixtures()

@@ -62,6 +62,14 @@ class PromptVersionStore(Protocol):
         fresh_phase_e: PreflightResult,
     ) -> dict[str, object]: ...
 
+    def refresh_draft(
+        self,
+        row: dict[str, object],
+        *,
+        expected_row_sha256: str,
+        fresh_phase_e: PreflightResult,
+    ) -> dict[str, object]: ...
+
     def approve_pair(
         self,
         previous: dict[str, object],
@@ -71,6 +79,14 @@ class PromptVersionStore(Protocol):
         expected_candidate_sha256: str,
         fresh_phase_e: PreflightResult,
     ) -> tuple[dict[str, object], dict[str, object]]: ...
+
+    def approve_initial(
+        self,
+        candidate: dict[str, object],
+        *,
+        expected_candidate_sha256: str,
+        fresh_phase_e: PreflightResult,
+    ) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,10 +295,68 @@ class PromptVersionLifecycle:
             )
         return updated
 
+    def refresh_draft_prompt_version(self, scene_prompt_id: str) -> dict[str, object]:
+        """Refresh an existing DRAFT from fresh Phase E without validating or approving it."""
+        rows = self.store.read_prompt_rows()
+        row = self._find_one(rows, scene_prompt_id)
+        if row.get("Prompt_Status") != "DRAFT":
+            raise PromptVersionLifecycleError(
+                "INVALID_TRANSITION", "only a DRAFT prompt can be refreshed"
+            )
+        scene_id = str(row["Scene_ID"])
+        profile_id = str(row["Generation_Profile_ID"])
+        result = self._fresh_phase_e(scene_id, profile_id)
+        created_at = row.get("Created_At")
+        if not isinstance(created_at, str) or not created_at:
+            raise PromptVersionLifecycleError(
+                "CANDIDATE_INVALID", "draft prompt has no creation timestamp"
+            )
+        candidate = build_scene_prompt_payload(
+            result,
+            scene_prompt_id,
+            self._version_number(row.get("Prompt_Version")),
+            compiler_version=self.compiler_version,
+            created_at=created_at,
+            updated_at=format_utc_timestamp(
+                self.clock() if self.clock else None, timespec="seconds"
+            ),
+        )
+        candidate = {field: candidate.get(field, "") for field in PROMPT_VERSION_FIELDS}
+        candidate.update(
+            {
+                "Prompt_Version": row["Prompt_Version"],
+                "Prompt_Status": "DRAFT",
+                "Validation_Message": "AWAITING_FRESH_PHASE_E_VALIDATION",
+                "Approved_At": "",
+                "Created_At": created_at,
+            }
+        )
+        try:
+            guard_scene_prompt_version_update(row, candidate, fresh_phase_e=result)
+        except PromptApprovalIntegrityError as exc:
+            raise PromptVersionLifecycleError("REFRESH_GUARD_FAILED", str(exc)) from exc
+        try:
+            refreshed = self.store.refresh_draft(
+                candidate,
+                expected_row_sha256=prompt_row_sha256(row),
+                fresh_phase_e=result,
+            )
+        except Exception as exc:
+            if isinstance(exc, PromptVersionLifecycleError):
+                raise
+            raise PromptVersionLifecycleError(
+                "REFRESH_WRITE_FAILED", "prompt draft refresh failed safely"
+            ) from exc
+        if refreshed != candidate:
+            raise PromptVersionLifecycleError(
+                "REFRESH_READBACK_MISMATCH", "refreshed draft readback differed"
+            )
+        return refreshed
+
     def approve_prompt_version(
         self, scene_prompt_id: str, *, expected_previous_id: str
     ) -> dict[str, object]:
-        """Revalidate, atomically switch the two status rows, and verify one approval."""
+        """Revalidate and approve a first version or atomically supersede its predecessor."""
         rows = self.store.read_prompt_rows()
         candidate = self._find_one(rows, scene_prompt_id)
         if candidate.get("Prompt_Status") != "VALIDATED":
@@ -296,23 +370,12 @@ class PromptVersionLifecycle:
             for row in rows
             if row.get("Scene_ID") == scene_id and row.get("Generation_Profile_ID") == profile_id
         ]
-        try:
-            require_single_current_approval(
-                matching, scene_id=scene_id, generation_profile_id=profile_id
-            )
-        except PromptApprovalIntegrityError as exc:
-            raise PromptVersionLifecycleError("CURRENT_APPROVAL_INVALID", str(exc)) from exc
-        previous = current_approved_rows(
+        approved_rows = current_approved_rows(
             matching, scene_id=scene_id, generation_profile_id=profile_id
-        )[0]
-        if previous.get("Scene_Prompt_ID") != expected_previous_id:
-            raise PromptVersionLifecycleError(
-                "CONCURRENT_MODIFICATION", "current approved prompt changed"
-            )
+        )
         result = self._fresh_phase_e(scene_id, profile_id)
         self._require_payload(candidate, result)
         now = format_utc_timestamp(self.clock() if self.clock else None, timespec="seconds")
-        superseded = {**previous, "Prompt_Status": "SUPERSEDED", "Updated_At": now}
         approved = {
             **candidate,
             "Prompt_Status": "APPROVED",
@@ -320,6 +383,51 @@ class PromptVersionLifecycle:
             "Approved_At": now,
             "Updated_At": now,
         }
+        if not approved_rows:
+            if expected_previous_id:
+                raise PromptVersionLifecycleError(
+                    "CONCURRENT_MODIFICATION", "expected current approval is missing"
+                )
+            try:
+                guard_scene_prompt_version_update(candidate, approved, fresh_phase_e=result)
+            except PromptApprovalIntegrityError as exc:
+                raise PromptVersionLifecycleError("APPROVAL_GUARD_FAILED", str(exc)) from exc
+            try:
+                verified_candidate = self.store.approve_initial(
+                    approved,
+                    expected_candidate_sha256=prompt_row_sha256(candidate),
+                    fresh_phase_e=result,
+                )
+            except Exception as exc:
+                if isinstance(exc, PromptVersionLifecycleError):
+                    raise
+                raise PromptVersionLifecycleError(
+                    "APPROVAL_WRITE_FAILED", "prompt approval write failed safely"
+                ) from exc
+            if verified_candidate != approved:
+                raise PromptVersionLifecycleError(
+                    "APPROVAL_READBACK_MISMATCH", "initial approval readback differed"
+                )
+            final_rows = self.store.read_prompt_rows()
+            try:
+                require_single_current_approval(
+                    final_rows, scene_id=scene_id, generation_profile_id=profile_id
+                )
+            except PromptApprovalIntegrityError as exc:
+                raise PromptVersionLifecycleError("CURRENT_APPROVAL_INVALID", str(exc)) from exc
+            return verified_candidate
+        try:
+            require_single_current_approval(
+                matching, scene_id=scene_id, generation_profile_id=profile_id
+            )
+        except PromptApprovalIntegrityError as exc:
+            raise PromptVersionLifecycleError("CURRENT_APPROVAL_INVALID", str(exc)) from exc
+        previous = approved_rows[0]
+        if previous.get("Scene_Prompt_ID") != expected_previous_id:
+            raise PromptVersionLifecycleError(
+                "CONCURRENT_MODIFICATION", "current approved prompt changed"
+            )
+        superseded = {**previous, "Prompt_Status": "SUPERSEDED", "Updated_At": now}
         try:
             guard_scene_prompt_version_update(previous, superseded)
             guard_scene_prompt_version_update(candidate, approved, fresh_phase_e=result)

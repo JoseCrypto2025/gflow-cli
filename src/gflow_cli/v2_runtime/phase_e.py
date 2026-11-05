@@ -1373,7 +1373,7 @@ def preflight_scene(
     )
     if not compiled:
         errors.append(PreflightIssue("COMPILED_PROMPT_EMPTY", "compiled positive prompt is empty"))
-    if negatives:
+    if negatives and "{NEGATIVE_CONSTRAINTS}" not in negative_template:
         compiled_negative = _join([compiled_negative, _join(negatives)])
     if "{" in compiled or "}" in compiled:
         if _PLACEHOLDER_RE.search(compiled):
